@@ -1,0 +1,2548 @@
+import {
+  applyEdgeChanges,
+  applyNodeChanges,
+  Background,
+  BackgroundVariant,
+  Controls,
+  MarkerType,
+  MiniMap,
+  ReactFlow,
+  type Connection,
+  type Edge,
+  type EdgeChange,
+  type NodeChange,
+  type OnSelectionChangeFunc,
+  type Viewport,
+} from '@xyflow/react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import yaml from 'js-yaml'
+import {
+  Activity,
+  Bot,
+  Braces,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
+  CircleAlert,
+  CirclePlay,
+  Code2,
+  FileCode2,
+  Folder,
+  FolderPlus,
+  GitBranch,
+  KeyRound,
+  LoaderCircle,
+  PanelBottomClose,
+  PanelBottomOpen,
+  Play,
+  Plus,
+  RefreshCw,
+  Save,
+  Settings2,
+  Square,
+  Terminal,
+  Trash2,
+  Unplug,
+  Workflow,
+  X,
+} from 'lucide-react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import { api, ApiError } from './api'
+import {
+  AgentNode,
+  type AgentFlowNode,
+  type NodeRunStatus,
+} from './AgentNode'
+import type {
+  Agent,
+  ApiProfile,
+  CanvasNode,
+  ConditionNode,
+  EdgeType,
+  Port,
+  PortType,
+  ProjectDetail,
+  RunDetail,
+  RunEvent,
+  RunSummary,
+  SDL,
+  SecretStatus,
+  ValidationIssue,
+  WorkflowEdge,
+} from './types'
+import {
+  useUiStore,
+  type DrawerTab,
+  type InspectorTab,
+} from './uiStore'
+import {
+  conditionPaths,
+  defaultCondition,
+  firstCompatibleMapping,
+  uniqueId,
+} from './workflow-utils'
+
+const nodeTypes = { agent: AgentNode }
+const PORT_TYPES: PortType[] = ['TEXT', 'DATA', 'FILE', 'MIXED']
+const EDGE_TYPES: EdgeType[] = ['PIPE', 'CONDITIONAL', 'FEEDBACK']
+const EVENT_TYPES = [
+  'run_started',
+  'node_enter',
+  'node_exit',
+  'edge_traversed',
+  'token_usage',
+  'artifact_written',
+  'error',
+  'run_finished',
+]
+const TERMINAL_RUN_STATUSES = new Set(['succeeded', 'failed', 'cancelled'])
+
+type Selection =
+  | { kind: 'node'; id: string }
+  | { kind: 'edge'; id: string }
+  | null
+
+interface Notice {
+  tone: 'error' | 'success' | 'info'
+  message: string
+}
+
+interface EventState {
+  nodeStatuses: Record<string, NodeRunStatus>
+  edgeTraversals: Record<string, number>
+  tokenUsage: number
+}
+
+function classNames(...values: Array<string | false | null | undefined>) {
+  return values.filter(Boolean).join(' ')
+}
+
+function issueFromError(error: unknown): ValidationIssue[] {
+  if (!(error instanceof ApiError)) return []
+  const issues = error.payload.issues
+  return Array.isArray(issues) ? (issues as ValidationIssue[]) : []
+}
+
+function parseEvent(message: MessageEvent): RunEvent | null {
+  try {
+    const value = JSON.parse(message.data)
+    if (
+      value &&
+      typeof value === 'object' &&
+      typeof value.seq === 'number' &&
+      typeof value.type === 'string'
+    ) {
+      return value as RunEvent
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+function makeCanvasNodes(sdl: SDL, canvas: ProjectDetail['canvas']) {
+  const byId = new Map(canvas.nodes.map((node) => [node.id, node]))
+  return sdl.agents.map((agent, index) => {
+    const existing = byId.get(agent.id)
+    return (
+      existing ?? {
+        id: agent.id,
+        x: 80 + (index % 3) * 360,
+        y: 120 + Math.floor(index / 3) * 210,
+        width: 238,
+        height: 132,
+      }
+    )
+  })
+}
+
+function formatTime(value: string | null | undefined) {
+  if (!value) return '—'
+  return new Intl.DateTimeFormat('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date(value))
+}
+
+function runStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    queued: '排队',
+    running: '运行中',
+    succeeded: '成功',
+    failed: '失败',
+    cancelled: '已取消',
+  }
+  return labels[status] ?? status
+}
+
+function JsonLiteralInput({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: unknown
+  onChange: (value: unknown) => void
+  placeholder?: string
+}) {
+  const [text, setText] = useState(() => JSON.stringify(value) ?? 'null')
+  const [invalid, setInvalid] = useState(false)
+
+  useEffect(() => {
+    setText(JSON.stringify(value) ?? 'null')
+    setInvalid(false)
+  }, [value])
+
+  return (
+    <input
+      className={invalid ? 'field-invalid' : ''}
+      value={text}
+      placeholder={placeholder}
+      onChange={(event) => {
+        const next = event.target.value
+        setText(next)
+        try {
+          onChange(JSON.parse(next))
+          setInvalid(false)
+        } catch {
+          setInvalid(true)
+        }
+      }}
+    />
+  )
+}
+
+function SdlEditor({
+  draft,
+  onImported,
+  onError,
+}: {
+  draft: ProjectDetail
+  onImported: (detail: ProjectDetail) => void
+  onError: (message: string) => void
+}) {
+  const generated = useMemo(
+    () =>
+      yaml.dump(draft.sdl, {
+        noRefs: true,
+        lineWidth: 100,
+        sortKeys: false,
+      }),
+    [draft.sdl],
+  )
+  const [editing, setEditing] = useState(false)
+  const [text, setText] = useState(generated)
+  const [importing, setImporting] = useState(false)
+
+  useEffect(() => {
+    if (!editing) setText(generated)
+  }, [editing, generated])
+
+  async function importSdl() {
+    setImporting(true)
+    try {
+      const detail = await api.importSdl(draft.id, text, draft.revision)
+      onImported(detail)
+      setEditing(false)
+    } catch (error) {
+      onError(error instanceof Error ? error.message : 'SDL 导入失败')
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  function exportSdl() {
+    const blob = new Blob([generated], {
+      type: 'application/yaml;charset=utf-8',
+    })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'workflow.sdl.yaml'
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
+  return (
+    <div className="sdl-editor">
+      <div className="drawer-actions">
+        <button
+          className="small-button"
+          onClick={() => setEditing((value) => !value)}
+        >
+          <Code2 size={14} />
+          {editing ? '预览' : '编辑'}
+        </button>
+        {editing && (
+          <button className="small-button accent" onClick={importSdl}>
+            {importing ? (
+              <LoaderCircle size={14} className="spin" />
+            ) : (
+              <Check size={14} />
+            )}
+            导入
+          </button>
+        )}
+        <button className="small-button" onClick={exportSdl}>
+          <FileCode2 size={14} />
+          导出
+        </button>
+      </div>
+      {editing ? (
+        <textarea
+          className="sdl-textarea"
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+          spellCheck={false}
+        />
+      ) : (
+        <pre className="sdl-preview">{generated}</pre>
+      )}
+    </div>
+  )
+}
+
+function LiteralValue({
+  value,
+  onChange,
+}: {
+  value: unknown
+  onChange: (value: unknown) => void
+}) {
+  const [text, setText] = useState(() => String(value ?? ''))
+  useEffect(() => setText(String(value ?? '')), [value])
+  return (
+    <input
+      value={text}
+      onChange={(event) => {
+        const next = event.target.value
+        setText(next)
+        if (next === 'true') onChange(true)
+        else if (next === 'false') onChange(false)
+        else if (next === 'null') onChange(null)
+        else if (next !== '' && !Number.isNaN(Number(next))) onChange(Number(next))
+        else onChange(next)
+      }}
+      placeholder="比较值"
+    />
+  )
+}
+
+function App() {
+  const queryClient = useQueryClient()
+  const {
+    drawerTab,
+    inspectorTab,
+    drawerOpen,
+    setDrawerTab,
+    setInspectorTab,
+    setDrawerOpen,
+  } = useUiStore()
+  const [projectId, setProjectId] = useState<string | null>(null)
+  const [draft, setDraft] = useState<ProjectDetail | null>(null)
+  const [dirty, setDirty] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [selection, setSelection] = useState<Selection>(null)
+  const [issues, setIssues] = useState<ValidationIssue[]>([])
+  const [notice, setNotice] = useState<Notice | null>(null)
+  const [newProjectOpen, setNewProjectOpen] = useState(false)
+  const [newProjectName, setNewProjectName] = useState('')
+  const [nodes, setNodes] = useState<AgentFlowNode[]>([])
+  const [edges, setEdges] = useState<Edge[]>([])
+  const [nodeStatuses, setNodeStatuses] = useState<
+    Record<string, NodeRunStatus>
+  >({})
+  const [edgeTraversals, setEdgeTraversals] = useState<Record<string, number>>(
+    {},
+  )
+  const [runInputs, setRunInputs] = useState<Record<string, string>>({})
+  const [currentRun, setCurrentRun] = useState<RunSummary | RunDetail | null>(
+    null,
+  )
+  const [runEvents, setRunEvents] = useState<RunEvent[]>([])
+  const [tokenUsage, setTokenUsage] = useState(0)
+  const [secretStatuses, setSecretStatuses] = useState<
+    Record<string, SecretStatus>
+  >({})
+  const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
+  const [keySaving, setKeySaving] = useState<string | null>(null)
+  const [generatedFiles, setGeneratedFiles] = useState<string[]>([])
+  const eventSourceRef = useRef<EventSource | null>(null)
+  const noticeTimerRef = useRef<number | null>(null)
+  const viewportRef = useRef<Viewport | null>(null)
+
+  const projectsQuery = useQuery({
+    queryKey: ['projects'],
+    queryFn: api.listProjects,
+  })
+  const projectQuery = useQuery({
+    queryKey: ['project', projectId],
+    queryFn: () => api.getProject(projectId!),
+    enabled: Boolean(projectId),
+  })
+  const runsQuery = useQuery({
+    queryKey: ['runs', projectId],
+    queryFn: () => api.listRuns(projectId!),
+    enabled: Boolean(projectId),
+    refetchInterval: (query) => {
+      const data = query.state.data
+      return data?.some((run) =>
+        ['queued', 'running'].includes(run.status),
+      )
+        ? 2_000
+        : false
+    },
+  })
+
+  const showNotice = useCallback(
+    (tone: Notice['tone'], message: string) => {
+      setNotice({ tone, message })
+      if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current)
+      noticeTimerRef.current = window.setTimeout(() => setNotice(null), 4_500)
+    },
+    [],
+  )
+
+  useEffect(() => {
+    if (!projectId && projectsQuery.data?.length) {
+      setProjectId(projectsQuery.data[0].id)
+    }
+  }, [projectId, projectsQuery.data])
+
+  useEffect(() => {
+    if (!projectId || !projectQuery.data) return
+    if (draft?.id === projectQuery.data.id) return
+    setDraft(projectQuery.data)
+    setDirty(false)
+    setSelection(null)
+    setIssues([])
+    setCurrentRun(null)
+    setRunEvents([])
+    setNodeStatuses({})
+    setEdgeTraversals({})
+    setTokenUsage(0)
+    setGeneratedFiles([])
+    viewportRef.current = projectQuery.data.canvas.viewport
+    setRunInputs(
+      Object.fromEntries(
+        projectQuery.data.sdl.workflow.inputs.map((input) => [input.name, '']),
+      ),
+    )
+  }, [draft?.id, projectId, projectQuery.data])
+
+  useEffect(() => {
+    if (!projectId || !draft) return
+    let cancelled = false
+    Promise.all(
+      draft.sdl.api_profiles.map(async (profile) => [
+        profile.id,
+        await api.secretStatus(projectId, profile.id),
+      ] as const),
+    )
+      .then((entries) => {
+        if (!cancelled) setSecretStatuses(Object.fromEntries(entries))
+      })
+      .catch(() => {
+        if (!cancelled) setSecretStatuses({})
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [draft?.sdl.api_profiles, projectId])
+
+  useEffect(() => {
+    if (!draft) {
+      setNodes([])
+      setEdges([])
+      return
+    }
+    const canvasNodes = makeCanvasNodes(draft.sdl, draft.canvas)
+    const nodeById = new Map(draft.sdl.agents.map((agent) => [agent.id, agent]))
+    setNodes(
+      canvasNodes.map((node) => {
+        const agent = nodeById.get(node.id)!
+        return {
+          id: node.id,
+          type: 'agent',
+          position: { x: node.x, y: node.y },
+          width: node.width,
+          height: node.height,
+          selected: selection?.kind === 'node' && selection.id === node.id,
+          data: {
+            label: agent.name,
+            agentId: agent.id,
+            profile: agent.api_profile,
+            inputs: agent.inputs.map((port) => port.name),
+            outputs: agent.outputs.map((port) => port.name),
+            status: nodeStatuses[node.id] ?? 'idle',
+          },
+        }
+      }),
+    )
+    setEdges(
+      draft.sdl.edges.map((workflowEdge) => {
+        const traversals = edgeTraversals[workflowEdge.id] ?? 0
+        const color =
+          workflowEdge.type === 'FEEDBACK'
+            ? '#d07932'
+            : workflowEdge.type === 'CONDITIONAL'
+              ? '#98752f'
+              : '#267f73'
+        return {
+          id: workflowEdge.id,
+          source: workflowEdge.from,
+          target: workflowEdge.to,
+          type: 'smoothstep',
+          label: workflowEdge.type,
+          animated: traversals > 0,
+          selected:
+            selection?.kind === 'edge' && selection.id === workflowEdge.id,
+          markerEnd: {
+            type: MarkerType.ArrowClosed,
+            color,
+          },
+          style: {
+            stroke: color,
+            strokeWidth: traversals > 0 ? 2.4 : 1.5,
+            strokeDasharray: workflowEdge.type === 'FEEDBACK' ? '7 4' : undefined,
+          },
+          labelStyle: {
+            fill: color,
+            fontSize: 10,
+            fontWeight: 700,
+          },
+          labelBgStyle: {
+            fill: '#fbfbf7',
+            fillOpacity: 0.96,
+          },
+          labelBgPadding: [5, 3] as [number, number],
+        }
+      }),
+    )
+  }, [draft, edgeTraversals, nodeStatuses, selection])
+
+  useEffect(() => {
+    return () => {
+      eventSourceRef.current?.close()
+      if (noticeTimerRef.current) window.clearTimeout(noticeTimerRef.current)
+    }
+  }, [])
+
+  const selectedAgent = useMemo(
+    () =>
+      selection?.kind === 'node'
+        ? draft?.sdl.agents.find((agent) => agent.id === selection.id) ?? null
+        : null,
+    [draft?.sdl.agents, selection],
+  )
+  const selectedEdge = useMemo(
+    () =>
+      selection?.kind === 'edge'
+        ? draft?.sdl.edges.find((edge) => edge.id === selection.id) ?? null
+        : null,
+    [draft?.sdl.edges, selection],
+  )
+  const pathOptions = useMemo(
+    () => (draft ? conditionPaths(draft.sdl) : []),
+    [draft],
+  )
+
+  function updateDraft(updater: (current: ProjectDetail) => ProjectDetail) {
+    setDraft((current) => {
+      if (!current) return current
+      setDirty(true)
+      return updater(current)
+    })
+  }
+
+  function updateWorkflow(
+    updater: (sdl: SDL) => SDL,
+  ) {
+    updateDraft((current) => ({
+      ...current,
+      sdl: updater(current.sdl),
+    }))
+  }
+
+  function updateAgent(agentId: string, updater: (agent: Agent) => Agent) {
+    updateWorkflow((sdl) => ({
+      ...sdl,
+      agents: sdl.agents.map((agent) =>
+        agent.id === agentId ? updater(agent) : agent,
+      ),
+    }))
+  }
+
+  function updateEdge(edgeId: string, updater: (edge: WorkflowEdge) => WorkflowEdge) {
+    updateWorkflow((sdl) => ({
+      ...sdl,
+      edges: sdl.edges.map((edge) =>
+        edge.id === edgeId ? updater(edge) : edge,
+      ),
+    }))
+  }
+
+  function updateProfile(
+    profileId: string,
+    updater: (profile: ApiProfile) => ApiProfile,
+  ) {
+    updateWorkflow((sdl) => ({
+      ...sdl,
+      api_profiles: sdl.api_profiles.map((profile) =>
+        profile.id === profileId ? updater(profile) : profile,
+      ),
+    }))
+  }
+
+  async function saveProject(): Promise<ProjectDetail | null> {
+    if (!draft) return null
+    if (!dirty) return draft
+    setSaving(true)
+    try {
+      const canvas = viewportRef.current
+        ? { ...draft.canvas, viewport: viewportRef.current }
+        : draft.canvas
+      const updated = await api.updateProject(
+        draft.id,
+        draft.sdl,
+        canvas,
+        draft.revision,
+      )
+      setDraft(updated)
+      viewportRef.current = updated.canvas.viewport
+      setDirty(false)
+      setIssues([])
+      await queryClient.invalidateQueries({ queryKey: ['projects'] })
+      showNotice('success', `已保存 revision ${updated.revision}`)
+      return updated
+    } catch (error) {
+      const validationIssues = issueFromError(error)
+      if (validationIssues.length) setIssues(validationIssues)
+      showNotice(
+        'error',
+        error instanceof Error ? error.message : '保存失败',
+      )
+      return null
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function validateProject() {
+    if (!draft) return false
+    try {
+      const result = await api.validate(draft.id, draft.sdl)
+      setIssues(result.issues)
+      setDrawerTab('issues')
+      if (result.valid) {
+        showNotice('success', 'SDL 校验通过')
+      } else {
+        showNotice('error', `发现 ${result.issues.length} 个校验问题`)
+      }
+      return result.valid
+    } catch (error) {
+      showNotice('error', error instanceof Error ? error.message : '校验失败')
+      return false
+    }
+  }
+
+  async function generateWorkflow() {
+    if (!draft) return
+    const saved = await saveProject()
+    if (!saved) return
+    try {
+      const result = await api.generate(saved.id)
+      setGeneratedFiles(result.files)
+      setDrawerTab('result')
+      showNotice(
+        'success',
+        result.cached ? `复用编译缓存 ${result.compiler_key}` : `已生成 ${result.compiler_key}`,
+      )
+      queryClient.invalidateQueries({ queryKey: ['project', saved.id] })
+      queryClient.invalidateQueries({ queryKey: ['projects'] })
+    } catch (error) {
+      const validationIssues = issueFromError(error)
+      if (validationIssues.length) setIssues(validationIssues)
+      showNotice('error', error instanceof Error ? error.message : '生成失败')
+    }
+  }
+
+  const applyRunEvent = useCallback((event: RunEvent) => {
+    setRunEvents((current) =>
+      current.some((item) => item.seq === event.seq)
+        ? current
+        : [...current, event].sort((left, right) => left.seq - right.seq),
+    )
+    if (event.type === 'node_enter' && event.node_id) {
+      setNodeStatuses((current) => ({
+        ...current,
+        [event.node_id!]: 'running',
+      }))
+    }
+    if (event.type === 'node_exit' && event.node_id) {
+      setNodeStatuses((current) => ({
+        ...current,
+        [event.node_id!]:
+          event.data.status === 'failed' ? 'failed' : 'succeeded',
+      }))
+    }
+    if (event.type === 'edge_traversed' && event.edge_id) {
+      setEdgeTraversals((current) => ({
+        ...current,
+        [event.edge_id!]: (current[event.edge_id!] ?? 0) + 1,
+      }))
+    }
+    if (event.type === 'token_usage') {
+      setTokenUsage(
+        (current) =>
+          current + Number(event.data.total_tokens ?? 0),
+      )
+    }
+    if (event.type === 'error' && event.node_id) {
+      setNodeStatuses((current) => ({
+        ...current,
+        [event.node_id!]: 'failed',
+      }))
+    }
+  }, [])
+
+  const finishRun = useCallback(
+    async (runId: string) => {
+      try {
+        const detail = await api.getRun(runId)
+        setCurrentRun(detail)
+        if (detail.events.length && runEvents.length === 0) {
+          for (const event of detail.events) applyRunEvent(event)
+        }
+      } catch {
+        // The SSE event still carries the terminal state.
+      }
+      queryClient.invalidateQueries({ queryKey: ['runs', projectId] })
+    },
+    [applyRunEvent, projectId, queryClient, runEvents.length],
+  )
+
+  const connectRunEvents = useCallback(
+    (runId: string) => {
+      eventSourceRef.current?.close()
+      const source = new EventSource(api.eventUrl(runId))
+      eventSourceRef.current = source
+      for (const eventType of EVENT_TYPES) {
+        source.addEventListener(eventType, (message) => {
+          const event = parseEvent(message as MessageEvent)
+          if (!event) return
+          applyRunEvent(event)
+          if (event.type === 'run_finished') {
+            source.close()
+            void finishRun(runId)
+          }
+        })
+      }
+      source.onerror = () => {
+        void api
+          .getRun(runId)
+          .then((detail) => {
+            if (TERMINAL_RUN_STATUSES.has(detail.status)) {
+              source.close()
+              setCurrentRun(detail)
+              queryClient.invalidateQueries({ queryKey: ['runs', projectId] })
+            }
+          })
+          .catch(() => undefined)
+      }
+    },
+    [applyRunEvent, finishRun, projectId, queryClient],
+  )
+
+  async function startRun() {
+    const saved = await saveProject()
+    if (!saved) return
+    const valid = await api
+      .validate(saved.id, saved.sdl)
+      .then((result) => {
+        setIssues(result.issues)
+        return result.valid
+      })
+      .catch(() => false)
+    if (!valid) {
+      setDrawerTab('issues')
+      showNotice('error', 'SDL 未通过校验，无法启动运行')
+      return
+    }
+    eventSourceRef.current?.close()
+    setRunEvents([])
+    setNodeStatuses(
+      Object.fromEntries(saved.sdl.start.map((agentId) => [agentId, 'ready'])),
+    )
+    setEdgeTraversals({})
+    setTokenUsage(0)
+    setDrawerTab('events')
+    try {
+      const summary = await api.startRun(saved.id, {
+        inputs: Object.fromEntries(
+          saved.sdl.workflow.inputs.map((input) => [
+            input.name,
+            runInputs[input.name] ?? '',
+          ]),
+        ),
+      })
+      setCurrentRun(summary)
+      connectRunEvents(summary.run_id)
+      queryClient.invalidateQueries({ queryKey: ['runs', saved.id] })
+    } catch (error) {
+      showNotice('error', error instanceof Error ? error.message : '启动失败')
+    }
+  }
+
+  async function cancelRun() {
+    if (!currentRun) return
+    try {
+      const summary = await api.cancelRun(currentRun.run_id)
+      setCurrentRun(summary)
+      eventSourceRef.current?.close()
+      showNotice('info', '运行已取消')
+    } catch (error) {
+      showNotice('error', error instanceof Error ? error.message : '取消失败')
+    }
+  }
+
+  async function loadRun(run: RunSummary) {
+    eventSourceRef.current?.close()
+    try {
+      const detail = await api.getRun(run.run_id)
+      setCurrentRun(detail)
+      setRunEvents(detail.events)
+      setDrawerTab('events')
+      setNodeStatuses({})
+      setEdgeTraversals({})
+      setTokenUsage(0)
+      for (const event of detail.events) applyRunEvent(event)
+      if (!TERMINAL_RUN_STATUSES.has(detail.status)) {
+        connectRunEvents(detail.run_id)
+      }
+    } catch (error) {
+      showNotice('error', error instanceof Error ? error.message : '运行记录读取失败')
+    }
+  }
+
+  async function changeProject(nextProjectId: string) {
+    if (nextProjectId === projectId) return
+    if (dirty && !window.confirm('当前项目有未保存修改，仍要切换吗？')) return
+    eventSourceRef.current?.close()
+    setProjectId(nextProjectId)
+    setDraft(null)
+    setDirty(false)
+    setSelection(null)
+  }
+
+  async function createProject() {
+    const name = newProjectName.trim()
+    if (!name) return
+    try {
+      const project = await api.createProject(name)
+      await queryClient.invalidateQueries({ queryKey: ['projects'] })
+      setNewProjectOpen(false)
+      setNewProjectName('')
+      setProjectId(project.id)
+      setDraft(null)
+      showNotice('success', '项目已创建')
+    } catch (error) {
+      showNotice('error', error instanceof Error ? error.message : '创建失败')
+    }
+  }
+
+  async function deleteProject() {
+    if (!draft) return
+    if (!window.confirm(`删除项目“${draft.name}”及其运行记录？`)) return
+    try {
+      await api.deleteProject(draft.id)
+      const remaining = projectsQuery.data?.filter((item) => item.id !== draft.id)
+      setDraft(null)
+      setProjectId(remaining?.[0]?.id ?? null)
+      await queryClient.invalidateQueries({ queryKey: ['projects'] })
+      showNotice('success', '项目已删除')
+    } catch (error) {
+      showNotice('error', error instanceof Error ? error.message : '删除失败')
+    }
+  }
+
+  async function saveSecret(profileId: string) {
+    if (!draft) return
+    if (dirty) {
+      showNotice('info', '请先保存 Profile 配置')
+      return
+    }
+    const apiKey = secretDrafts[profileId]?.trim()
+    if (!apiKey) return
+    setKeySaving(profileId)
+    try {
+      const status = await api.putSecret(draft.id, profileId, apiKey)
+      setSecretStatuses((current) => ({ ...current, [profileId]: status }))
+      setSecretDrafts((current) => ({ ...current, [profileId]: '' }))
+      showNotice('success', '密钥已写入系统凭据库')
+    } catch (error) {
+      showNotice('error', error instanceof Error ? error.message : '密钥保存失败')
+    } finally {
+      setKeySaving(null)
+    }
+  }
+
+  async function deleteSecret(profileId: string) {
+    if (!draft) return
+    try {
+      await api.deleteSecret(draft.id, profileId)
+      setSecretStatuses((current) => ({
+        ...current,
+        [profileId]: {
+          profile_id: profileId,
+          configured: false,
+          origin: current[profileId]?.origin ?? null,
+        },
+      }))
+      showNotice('info', '密钥已移除')
+    } catch (error) {
+      showNotice('error', error instanceof Error ? error.message : '密钥删除失败')
+    }
+  }
+
+  function onNodesChange(changes: NodeChange<AgentFlowNode>[]) {
+    setNodes((current) => applyNodeChanges(changes, current))
+  }
+
+  function onEdgesChange(changes: EdgeChange<Edge>[]) {
+    setEdges((current) => applyEdgeChanges(changes, current))
+  }
+
+  const onSelectionChange: OnSelectionChangeFunc<AgentFlowNode, Edge> =
+    useCallback(
+      ({ nodes: selectedNodes, edges: selectedEdges }) => {
+        const nextSelection: Selection = selectedNodes[0]
+          ? { kind: 'node', id: selectedNodes[0].id }
+          : selectedEdges[0]
+            ? { kind: 'edge', id: selectedEdges[0].id }
+            : null
+
+        setSelection((current) => {
+          if (
+            current?.kind === nextSelection?.kind &&
+            current?.id === nextSelection?.id
+          ) {
+            return current
+          }
+          return nextSelection
+        })
+        if (nextSelection) setInspectorTab('selection')
+      },
+      [setInspectorTab],
+    )
+
+  function persistNodePositions(nextNodes: AgentFlowNode[]) {
+    if (!draft) return
+    const positions = new Map(
+      nextNodes.map((node) => [
+        node.id,
+        {
+          id: node.id,
+          x: node.position.x,
+          y: node.position.y,
+          width: node.width ?? 238,
+          height: node.height ?? 132,
+        },
+      ]),
+    )
+    updateDraft((current) => ({
+      ...current,
+      canvas: {
+        ...current.canvas,
+        nodes: current.canvas.nodes.map(
+          (node) => positions.get(node.id) ?? node,
+        ),
+      },
+    }))
+  }
+
+  function onNodeDragStop() {
+    persistNodePositions(nodes)
+  }
+
+  function onMoveEnd(_: unknown, viewport: Viewport) {
+    viewportRef.current = viewport
+  }
+
+  function onConnect(connection: Connection) {
+    if (!draft || !connection.source || !connection.target) return
+    if (connection.source === connection.target) return
+    const source = draft.sdl.agents.find((agent) => agent.id === connection.source)
+    const target = draft.sdl.agents.find((agent) => agent.id === connection.target)
+    if (!source || !target) return
+    const edgeId = uniqueId(
+      `${source.id}-to-${target.id}`,
+      draft.sdl.edges.map((edge) => edge.id),
+    )
+    updateDraft((current) => ({
+      ...current,
+      sdl: {
+        ...current.sdl,
+        edges: [
+          ...current.sdl.edges,
+          {
+            id: edgeId,
+            from: source.id,
+            to: target.id,
+            type: 'PIPE',
+            mappings: firstCompatibleMapping(source, target),
+          },
+        ],
+      },
+      canvas: {
+        ...current.canvas,
+        edges: [
+          ...current.canvas.edges,
+          { id: edgeId, bend_points: [] },
+        ],
+      },
+    }))
+    setSelection({ kind: 'edge', id: edgeId })
+    setInspectorTab('selection')
+  }
+
+  function onNodesDelete(deleted: AgentFlowNode[]) {
+    if (!draft || !deleted.length) return
+    const deletedIds = new Set(deleted.map((node) => node.id))
+    updateDraft((current) => ({
+      ...current,
+      sdl: {
+        ...current.sdl,
+        agents: current.sdl.agents.filter((agent) => !deletedIds.has(agent.id)),
+        start: current.sdl.start.filter((agentId) => !deletedIds.has(agentId)),
+        edges: current.sdl.edges.filter(
+          (edge) => !deletedIds.has(edge.from) && !deletedIds.has(edge.to),
+        ),
+        workflow: {
+          ...current.sdl.workflow,
+          outputs: current.sdl.workflow.outputs.filter(
+            (output) => !deletedIds.has(output.agent),
+          ),
+        },
+      },
+      canvas: {
+        ...current.canvas,
+        nodes: current.canvas.nodes.filter(
+          (node) => !deletedIds.has(node.id),
+        ),
+        edges: current.canvas.edges.filter((canvasEdge) => {
+          const edge = current.sdl.edges.find(
+            (item) => item.id === canvasEdge.id,
+          )
+          return edge && !deletedIds.has(edge.from) && !deletedIds.has(edge.to)
+        }),
+      },
+    }))
+    setSelection(null)
+  }
+
+  function onEdgesDelete(deleted: Edge[]) {
+    if (!draft || !deleted.length) return
+    const deletedIds = new Set(deleted.map((edge) => edge.id))
+    updateDraft((current) => ({
+      ...current,
+      sdl: {
+        ...current.sdl,
+        edges: current.sdl.edges.filter((edge) => !deletedIds.has(edge.id)),
+      },
+      canvas: {
+        ...current.canvas,
+        edges: current.canvas.edges.filter(
+          (edge) => !deletedIds.has(edge.id),
+        ),
+      },
+    }))
+    setSelection(null)
+  }
+
+  function addAgent() {
+    if (!draft) return
+    const id = uniqueId(
+      'agent',
+      draft.sdl.agents.map((agent) => agent.id),
+    )
+    const index = draft.sdl.agents.length
+    const node: CanvasNode = {
+      id,
+      x: 100 + (index % 3) * 320,
+      y: 120 + Math.floor(index / 3) * 210,
+      width: 238,
+      height: 132,
+    }
+    const agent: Agent = {
+      id,
+      name: '新 Agent',
+      api_profile: draft.sdl.api_profiles[0]?.id ?? 'openai-main',
+      system_prompt: '你是一个负责处理输入并返回结构化输出的 Agent。',
+      inputs: [{ name: 'input', type: 'TEXT', required: true }],
+      outputs: [{ name: 'output', type: 'TEXT' }],
+      limits: { max_tokens: null },
+      output_dir: null,
+    }
+    updateDraft((current) => ({
+      ...current,
+      sdl: {
+        ...current.sdl,
+        agents: [...current.sdl.agents, agent],
+        start: current.sdl.start.length ? current.sdl.start : [id],
+        workflow: {
+          ...current.sdl.workflow,
+          inputs:
+            current.sdl.start.length > 0
+              ? current.sdl.workflow.inputs
+              : [
+                  ...current.sdl.workflow.inputs,
+                  { name: 'input', type: 'TEXT', required: true },
+                ],
+        },
+      },
+      canvas: {
+        ...current.canvas,
+        nodes: [...current.canvas.nodes, node],
+      },
+    }))
+    setSelection({ kind: 'node', id })
+    setInspectorTab('selection')
+  }
+
+  function setPort(agentId: string, side: 'inputs' | 'outputs', index: number, patch: Partial<Port>) {
+    updateAgent(agentId, (agent) => ({
+      ...agent,
+      [side]: agent[side].map((port, portIndex) =>
+        portIndex === index ? { ...port, ...patch } : port,
+      ),
+    }))
+  }
+
+  function addPort(agentId: string, side: 'inputs' | 'outputs') {
+    updateAgent(agentId, (agent) => {
+      const base = side === 'inputs' ? 'input' : 'output'
+      const name = uniqueId(
+        base,
+        [...agent.inputs, ...agent.outputs].map((port) => port.name),
+      ).replaceAll('-', '_')
+      return {
+        ...agent,
+        [side]: [
+          ...agent[side],
+          {
+            name,
+            type: 'TEXT',
+            ...(side === 'inputs' ? { required: true } : {}),
+          },
+        ],
+      }
+    })
+  }
+
+  function removePort(agentId: string, side: 'inputs' | 'outputs', index: number) {
+    updateAgent(agentId, (agent) => ({
+      ...agent,
+      [side]: agent[side].filter((_, portIndex) => portIndex !== index),
+    }))
+  }
+
+  function renderInspectorTabs() {
+    const tabs: Array<{
+      value: InspectorTab
+      label: string
+      icon: typeof Settings2
+    }> = [
+      { value: 'selection', label: '检查器', icon: Settings2 },
+      { value: 'workflow', label: '工作流', icon: Workflow },
+      { value: 'api', label: 'API', icon: KeyRound },
+    ]
+    return (
+      <div className="inspector-tabs">
+        {tabs.map(({ value, label, icon: Icon }) => (
+          <button
+            key={value}
+            className={inspectorTab === value ? 'active' : ''}
+            onClick={() => setInspectorTab(value)}
+          >
+            <Icon size={14} />
+            {label}
+          </button>
+        ))}
+      </div>
+    )
+  }
+
+  function renderPorts(agent: Agent, side: 'inputs' | 'outputs') {
+    return (
+      <div className="port-section">
+        <div className="section-line">
+          <span>{side === 'inputs' ? '输入端口' : '输出端口'}</span>
+          <button className="icon-button" onClick={() => addPort(agent.id, side)}>
+            <Plus size={14} />
+          </button>
+        </div>
+        <div className="port-editor-list">
+          {agent[side].map((port, index) => (
+            <div className="port-editor-row" key={`${side}-${index}`}>
+              <input
+                value={port.name}
+                onChange={(event) =>
+                  setPort(agent.id, side, index, {
+                    name: event.target.value
+                      .toLowerCase()
+                      .replaceAll(/[^a-z0-9_]/g, '_'),
+                  })
+                }
+                aria-label="端口名称"
+              />
+              <select
+                value={port.type}
+                onChange={(event) =>
+                  setPort(agent.id, side, index, {
+                    type: event.target.value as PortType,
+                  })
+                }
+              >
+                {PORT_TYPES.map((type) => (
+                  <option key={type}>{type}</option>
+                ))}
+              </select>
+              {side === 'inputs' && (
+                <input
+                  className="port-check"
+                  type="checkbox"
+                  checked={port.required !== false}
+                  title="必填"
+                  onChange={(event) =>
+                    setPort(agent.id, side, index, {
+                      required: event.target.checked,
+                    })
+                  }
+                />
+              )}
+              <button
+                className="icon-button danger"
+                onClick={() => removePort(agent.id, side, index)}
+                title="删除端口"
+              >
+                <X size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  function renderSelectionInspector() {
+    if (selectedAgent) {
+      const agent = selectedAgent
+      return (
+        <div className="inspector-body">
+          <div className="inspector-heading">
+            <div>
+              <span className="eyebrow">AGENT</span>
+              <h2>{agent.name}</h2>
+            </div>
+            <span className="id-chip">{agent.id}</span>
+          </div>
+          <label>
+            名称
+            <input
+              value={agent.name}
+              onChange={(event) =>
+                updateAgent(agent.id, (current) => ({
+                  ...current,
+                  name: event.target.value,
+                }))
+              }
+            />
+          </label>
+          <label>
+            API Profile
+            <select
+              value={agent.api_profile}
+              onChange={(event) =>
+                updateAgent(agent.id, (current) => ({
+                  ...current,
+                  api_profile: event.target.value,
+                }))
+              }
+            >
+              {draft?.sdl.api_profiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.name || profile.id}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            System Prompt
+            <textarea
+              rows={7}
+              value={agent.system_prompt}
+              onChange={(event) =>
+                updateAgent(agent.id, (current) => ({
+                  ...current,
+                  system_prompt: event.target.value,
+                }))
+              }
+            />
+          </label>
+          <label>
+            Max tokens
+            <input
+              type="number"
+              min={1}
+              placeholder="不限制"
+              value={agent.limits.max_tokens ?? ''}
+              onChange={(event) =>
+                updateAgent(agent.id, (current) => ({
+                  ...current,
+                  limits: {
+                    max_tokens: event.target.value
+                      ? Number(event.target.value)
+                      : null,
+                  },
+                }))
+              }
+            />
+          </label>
+          {renderPorts(agent, 'inputs')}
+          {renderPorts(agent, 'outputs')}
+        </div>
+      )
+    }
+
+    if (selectedEdge) {
+      const edge = selectedEdge
+      const source = draft?.sdl.agents.find((agent) => agent.id === edge.from)
+      const target = draft?.sdl.agents.find((agent) => agent.id === edge.to)
+      return (
+        <div className="inspector-body">
+          <div className="inspector-heading">
+            <div>
+              <span className="eyebrow">EDGE</span>
+              <h2>{edge.id}</h2>
+            </div>
+            <span className="id-chip">
+              {edge.from} → {edge.to}
+            </span>
+          </div>
+          <label>
+            类型
+            <select
+              value={edge.type}
+              onChange={(event) => {
+                const type = event.target.value as EdgeType
+                updateEdge(edge.id, (current) => ({
+                  ...current,
+                  type,
+                  condition:
+                    type === 'PIPE'
+                      ? null
+                      : current.condition ??
+                        (type === 'CONDITIONAL'
+                          ? defaultCondition(draft!.sdl)
+                          : null),
+                  guard:
+                    type === 'FEEDBACK'
+                      ? {
+                          max_traversals:
+                            current.guard?.max_traversals ??
+                            draft!.sdl.workflow.execution
+                              .feedback_limit_default,
+                        }
+                      : current.guard,
+                }))
+              }}
+            >
+              {EDGE_TYPES.map((type) => (
+                <option key={type}>{type}</option>
+              ))}
+            </select>
+          </label>
+          <div className="mapping-section">
+            <div className="section-line">
+              <span>数据映射</span>
+              <button
+                className="icon-button"
+                onClick={() =>
+                  updateEdge(edge.id, (current) => ({
+                    ...current,
+                    mappings: [
+                      ...current.mappings,
+                      {
+                        from: source?.outputs[0]?.name ?? '',
+                        to: target?.inputs[0]?.name ?? '',
+                      },
+                    ],
+                  }))
+                }
+              >
+                <Plus size={14} />
+              </button>
+            </div>
+            {edge.mappings.map((mapping, index) => (
+              <div className="mapping-row" key={`${edge.id}-map-${index}`}>
+                <select
+                  value={mapping.from}
+                  onChange={(event) =>
+                    updateEdge(edge.id, (current) => ({
+                      ...current,
+                      mappings: current.mappings.map((item, itemIndex) =>
+                        itemIndex === index
+                          ? { ...item, from: event.target.value }
+                          : item,
+                      ),
+                    }))
+                  }
+                >
+                  {source?.outputs.map((port) => (
+                    <option key={port.name}>{port.name}</option>
+                  ))}
+                </select>
+                <span>→</span>
+                <select
+                  value={mapping.to}
+                  onChange={(event) =>
+                    updateEdge(edge.id, (current) => ({
+                      ...current,
+                      mappings: current.mappings.map((item, itemIndex) =>
+                        itemIndex === index
+                          ? { ...item, to: event.target.value }
+                          : item,
+                      ),
+                    }))
+                  }
+                >
+                  {target?.inputs.map((port) => (
+                    <option key={port.name}>{port.name}</option>
+                  ))}
+                </select>
+                <button
+                  className="icon-button danger"
+                  onClick={() =>
+                    updateEdge(edge.id, (current) => ({
+                      ...current,
+                      mappings: current.mappings.filter(
+                        (_, itemIndex) => itemIndex !== index,
+                      ),
+                    }))
+                  }
+                  title="删除映射"
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+          {edge.type !== 'PIPE' && (
+            <div className="condition-section">
+              <div className="section-line">
+                <span>触发条件</span>
+                {edge.type === 'CONDITIONAL' && !edge.condition && (
+                  <button
+                    className="small-button"
+                    onClick={() =>
+                      updateEdge(edge.id, (current) => ({
+                        ...current,
+                        condition: defaultCondition(draft!.sdl),
+                      }))
+                    }
+                  >
+                    <Plus size={13} />
+                    条件
+                  </button>
+                )}
+              </div>
+              {edge.condition && edge.condition.op !== 'and' && edge.condition.op !== 'or' && (
+                <>
+                  <label>
+                    字段
+                    <select
+                      value={edge.condition.left ?? ''}
+                      onChange={(event) =>
+                        updateEdge(edge.id, (current) => ({
+                          ...current,
+                          condition: {
+                            ...current.condition!,
+                            left: event.target.value,
+                          },
+                        }))
+                      }
+                    >
+                      {pathOptions.map((path) => (
+                        <option key={path.value} value={path.value}>
+                          {path.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    运算符
+                    <select
+                      value={edge.condition.op}
+                      onChange={(event) =>
+                        updateEdge(edge.id, (current) => ({
+                          ...current,
+                          condition: {
+                            ...current.condition!,
+                            op: event.target.value,
+                          },
+                        }))
+                      }
+                    >
+                      {['eq', 'ne', 'lt', 'lte', 'gt', 'gte', 'contains', 'exists'].map(
+                        (operator) => (
+                          <option key={operator}>{operator}</option>
+                        ),
+                      )}
+                    </select>
+                  </label>
+                  {edge.condition.op !== 'exists' && (
+                    <label>
+                      比较值
+                      <LiteralValue
+                        value={edge.condition.right}
+                        onChange={(right) =>
+                          updateEdge(edge.id, (current) => ({
+                            ...current,
+                            condition: { ...current.condition!, right },
+                          }))
+                        }
+                      />
+                    </label>
+                  )}
+                </>
+              )}
+              <details className="advanced-json">
+                <summary>高级条件 JSON</summary>
+                <JsonConditionEditor
+                  key={`${edge.id}-${JSON.stringify(edge.condition)}`}
+                  value={edge.condition}
+                  onChange={(condition) =>
+                    updateEdge(edge.id, (current) => ({
+                      ...current,
+                      condition,
+                    }))
+                  }
+                />
+              </details>
+            </div>
+          )}
+          {edge.type === 'FEEDBACK' && (
+            <label>
+              最大回注次数
+              <input
+                type="number"
+                min={1}
+                value={edge.guard?.max_traversals ?? ''}
+                onChange={(event) =>
+                  updateEdge(edge.id, (current) => ({
+                    ...current,
+                    guard: {
+                      max_traversals: event.target.value
+                        ? Number(event.target.value)
+                        : null,
+                    },
+                  }))
+                }
+              />
+            </label>
+          )}
+        </div>
+      )
+    }
+
+    return (
+      <div className="inspector-empty">
+        <GitBranch size={28} />
+        <span>未选择画布元素</span>
+        <dl>
+          <div>
+            <dt>Agents</dt>
+            <dd>{draft?.sdl.agents.length ?? 0}</dd>
+          </div>
+          <div>
+            <dt>Edges</dt>
+            <dd>{draft?.sdl.edges.length ?? 0}</dd>
+          </div>
+          <div>
+            <dt>Revision</dt>
+            <dd>{draft?.revision ?? '—'}</dd>
+          </div>
+        </dl>
+      </div>
+    )
+  }
+
+  function renderWorkflowInspector() {
+    if (!draft) return null
+    const workflowMeta = draft.sdl.workflow
+    return (
+      <div className="inspector-body">
+        <div className="inspector-heading">
+          <div>
+            <span className="eyebrow">WORKFLOW</span>
+            <h2>{workflowMeta.name}</h2>
+          </div>
+          <span className="id-chip">{workflowMeta.id}</span>
+        </div>
+        <label>
+          名称
+          <input
+            value={workflowMeta.name}
+            onChange={(event) =>
+              updateWorkflow((sdl) => ({
+                ...sdl,
+                workflow: { ...sdl.workflow, name: event.target.value },
+              }))
+            }
+          />
+        </label>
+        <label>
+          全局背景 Prompt
+          <textarea
+            rows={6}
+            value={workflowMeta.global_context?.text ?? ''}
+            onChange={(event) =>
+              updateWorkflow((sdl) => ({
+                ...sdl,
+                workflow: {
+                  ...sdl.workflow,
+                  global_context: {
+                    text: event.target.value,
+                    injection: sdl.workflow.global_context?.injection ?? 'prefix',
+                    applies_to: sdl.workflow.global_context?.applies_to ?? 'all',
+                  },
+                },
+              }))
+            }
+          />
+        </label>
+        <div className="two-column-fields">
+          <label>
+            注入位置
+            <select
+              value={workflowMeta.global_context?.injection ?? 'prefix'}
+              onChange={(event) =>
+                updateWorkflow((sdl) => ({
+                  ...sdl,
+                  workflow: {
+                    ...sdl.workflow,
+                    global_context: {
+                      text: sdl.workflow.global_context?.text ?? '',
+                      injection: event.target.value as 'prefix' | 'suffix',
+                      applies_to: sdl.workflow.global_context?.applies_to ?? 'all',
+                    },
+                  },
+                }))
+              }
+            >
+              <option value="prefix">Prefix</option>
+              <option value="suffix">Suffix</option>
+            </select>
+          </label>
+          <label>
+            Feedback 默认上限
+            <input
+              type="number"
+              min={1}
+              value={workflowMeta.execution.feedback_limit_default}
+              onChange={(event) =>
+                updateWorkflow((sdl) => ({
+                  ...sdl,
+                  workflow: {
+                    ...sdl.workflow,
+                    execution: {
+                      ...sdl.workflow.execution,
+                      feedback_limit_default: Number(event.target.value),
+                    },
+                  },
+                }))
+              }
+            />
+          </label>
+        </div>
+        <div className="port-section">
+          <div className="section-line">
+            <span>工作流输入</span>
+            <button
+              className="icon-button"
+              onClick={() =>
+                updateWorkflow((sdl) => ({
+                  ...sdl,
+                  workflow: {
+                    ...sdl.workflow,
+                    inputs: [
+                      ...sdl.workflow.inputs,
+                      {
+                        name: uniqueId(
+                          'input',
+                          sdl.workflow.inputs.map((input) => input.name),
+                        ).replaceAll('-', '_'),
+                        type: 'TEXT',
+                        required: true,
+                      },
+                    ],
+                  },
+                }))
+              }
+            >
+              <Plus size={14} />
+            </button>
+          </div>
+          {workflowMeta.inputs.map((input, index) => (
+            <div className="port-editor-row" key={input.name}>
+              <input
+                value={input.name}
+                onChange={(event) =>
+                  updateWorkflow((sdl) => ({
+                    ...sdl,
+                    workflow: {
+                      ...sdl.workflow,
+                      inputs: sdl.workflow.inputs.map((item, itemIndex) =>
+                        itemIndex === index
+                          ? { ...item, name: event.target.value }
+                          : item,
+                      ),
+                    },
+                  }))
+                }
+              />
+              <select
+                value={input.type}
+                onChange={(event) =>
+                  updateWorkflow((sdl) => ({
+                    ...sdl,
+                    workflow: {
+                      ...sdl.workflow,
+                      inputs: sdl.workflow.inputs.map((item, itemIndex) =>
+                        itemIndex === index
+                          ? { ...item, type: event.target.value as PortType }
+                          : item,
+                      ),
+                    },
+                  }))
+                }
+              >
+                {PORT_TYPES.map((type) => (
+                  <option key={type}>{type}</option>
+                ))}
+              </select>
+              <button
+                className="icon-button danger"
+                onClick={() =>
+                  updateWorkflow((sdl) => ({
+                    ...sdl,
+                    workflow: {
+                      ...sdl.workflow,
+                      inputs: sdl.workflow.inputs.filter(
+                        (_, itemIndex) => itemIndex !== index,
+                      ),
+                    },
+                  }))
+                }
+              >
+                <X size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="port-section">
+          <div className="section-line">
+            <span>工作流输出</span>
+            <button
+              className="icon-button"
+              onClick={() => {
+                const firstAgent = draft.sdl.agents[0]
+                if (!firstAgent) return
+                updateWorkflow((sdl) => ({
+                  ...sdl,
+                  workflow: {
+                    ...sdl.workflow,
+                    outputs: [
+                      ...sdl.workflow.outputs,
+                      {
+                        name: uniqueId(
+                          'output',
+                          sdl.workflow.outputs.map((output) => output.name),
+                        ).replaceAll('-', '_'),
+                        agent: firstAgent.id,
+                        port: firstAgent.outputs[0]?.name ?? '',
+                      },
+                    ],
+                  },
+                }))
+              }}
+            >
+              <Plus size={14} />
+            </button>
+          </div>
+          {workflowMeta.outputs.map((output, index) => {
+            const agent = draft.sdl.agents.find(
+              (item) => item.id === output.agent,
+            )
+            return (
+              <div className="output-editor-row" key={`${output.name}-${index}`}>
+                <input
+                  value={output.name}
+                  onChange={(event) =>
+                    updateWorkflow((sdl) => ({
+                      ...sdl,
+                      workflow: {
+                        ...sdl.workflow,
+                        outputs: sdl.workflow.outputs.map((item, itemIndex) =>
+                          itemIndex === index
+                            ? { ...item, name: event.target.value }
+                            : item,
+                        ),
+                      },
+                    }))
+                  }
+                />
+                <select
+                  value={output.agent}
+                  onChange={(event) =>
+                    updateWorkflow((sdl) => ({
+                      ...sdl,
+                      workflow: {
+                        ...sdl.workflow,
+                        outputs: sdl.workflow.outputs.map((item, itemIndex) =>
+                          itemIndex === index
+                            ? {
+                                ...item,
+                                agent: event.target.value,
+                                port:
+                                  sdl.agents.find(
+                                    (candidate) =>
+                                      candidate.id === event.target.value,
+                                  )?.outputs[0]?.name ?? '',
+                              }
+                            : item,
+                        ),
+                      },
+                    }))
+                  }
+                >
+                  {draft.sdl.agents.map((item) => (
+                    <option key={item.id}>{item.id}</option>
+                  ))}
+                </select>
+                <select
+                  value={output.port}
+                  onChange={(event) =>
+                    updateWorkflow((sdl) => ({
+                      ...sdl,
+                      workflow: {
+                        ...sdl.workflow,
+                        outputs: sdl.workflow.outputs.map((item, itemIndex) =>
+                          itemIndex === index
+                            ? { ...item, port: event.target.value }
+                            : item,
+                        ),
+                      },
+                    }))
+                  }
+                >
+                  {agent?.outputs.map((port) => (
+                    <option key={port.name}>{port.name}</option>
+                  ))}
+                </select>
+                <button
+                  className="icon-button danger"
+                  onClick={() =>
+                    updateWorkflow((sdl) => ({
+                      ...sdl,
+                      workflow: {
+                        ...sdl.workflow,
+                        outputs: sdl.workflow.outputs.filter(
+                          (_, itemIndex) => itemIndex !== index,
+                        ),
+                      },
+                    }))
+                  }
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
+
+  function renderApiInspector() {
+    if (!draft) return null
+    return (
+      <div className="inspector-body">
+        <div className="inspector-heading">
+          <div>
+            <span className="eyebrow">OPENAI COMPATIBLE</span>
+            <h2>API Profiles</h2>
+          </div>
+          <button
+            className="icon-button"
+            title="新增 Profile"
+            onClick={() =>
+              updateWorkflow((sdl) => {
+                const id = uniqueId(
+                  'profile',
+                  sdl.api_profiles.map((profile) => profile.id),
+                )
+                return {
+                  ...sdl,
+                  api_profiles: [
+                    ...sdl.api_profiles,
+                    {
+                      id,
+                      name: '新 Profile',
+                      provider: 'openai_compatible',
+                      base_url: 'http://127.0.0.1:8001/v1',
+                      model: 'local-model',
+                      request: {
+                        timeout_seconds: 60,
+                        max_retries: 2,
+                        temperature: 0.2,
+                      },
+                      capabilities: {
+                        function_calling: false,
+                        vision: false,
+                        long_context: false,
+                        structured_output: true,
+                      },
+                    },
+                  ],
+                }
+              })
+            }
+          >
+            <Plus size={15} />
+          </button>
+        </div>
+        {draft.sdl.api_profiles.map((profile) => {
+          const local =
+            profile.base_url.includes('127.0.0.1') ||
+            profile.base_url.includes('localhost')
+          const status = secretStatuses[profile.id]
+          return (
+            <section className="profile-card" key={profile.id}>
+              <div className="profile-title">
+                <div>
+                  <strong>{profile.name || profile.id}</strong>
+                  <span>{profile.id}</span>
+                </div>
+                <span
+                  className={classNames(
+                    'credential-badge',
+                    status?.configured || local ? 'ready' : 'missing',
+                  )}
+                >
+                  {status?.configured || local ? (
+                    <CheckCircle2 size={12} />
+                  ) : (
+                    <CircleAlert size={12} />
+                  )}
+                  {local ? '本地接口' : status?.configured ? '已配置' : '缺少密钥'}
+                </span>
+              </div>
+              <label>
+                显示名称
+                <input
+                  value={profile.name ?? ''}
+                  onChange={(event) =>
+                    updateProfile(profile.id, (current) => ({
+                      ...current,
+                      name: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                Base URL
+                <input
+                  value={profile.base_url}
+                  onChange={(event) =>
+                    updateProfile(profile.id, (current) => ({
+                      ...current,
+                      base_url: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+              <div className="two-column-fields">
+                <label>
+                  Model
+                  <input
+                    value={profile.model}
+                    onChange={(event) =>
+                      updateProfile(profile.id, (current) => ({
+                        ...current,
+                        model: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  Temperature
+                  <input
+                    type="number"
+                    step="0.1"
+                    min={0}
+                    max={2}
+                    value={profile.request.temperature}
+                    onChange={(event) =>
+                      updateProfile(profile.id, (current) => ({
+                        ...current,
+                        request: {
+                          ...current.request,
+                          temperature: Number(event.target.value),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+              </div>
+              {!local && (
+                <div className="secret-row">
+                  <input
+                    type="password"
+                    value={secretDrafts[profile.id] ?? ''}
+                    placeholder={
+                      status?.configured ? '输入新密钥以替换' : '输入 API Key'
+                    }
+                    onChange={(event) =>
+                      setSecretDrafts((current) => ({
+                        ...current,
+                        [profile.id]: event.target.value,
+                      }))
+                    }
+                  />
+                  <button
+                    className="small-button accent"
+                    disabled={dirty || keySaving === profile.id}
+                    onClick={() => saveSecret(profile.id)}
+                    title={dirty ? '先保存 Profile 配置' : '保存密钥'}
+                  >
+                    {keySaving === profile.id ? (
+                      <LoaderCircle size={13} className="spin" />
+                    ) : (
+                      <KeyRound size={13} />
+                    )}
+                    保存
+                  </button>
+                  {status?.configured && (
+                    <button
+                      className="icon-button danger"
+                      onClick={() => deleteSecret(profile.id)}
+                      title="删除密钥"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  )}
+                </div>
+              )}
+              <div className="capability-row">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={profile.capabilities.structured_output}
+                    onChange={(event) =>
+                      updateProfile(profile.id, (current) => ({
+                        ...current,
+                        capabilities: {
+                          ...current.capabilities,
+                          structured_output: event.target.checked,
+                        },
+                      }))
+                    }
+                  />
+                  Structured JSON
+                </label>
+              </div>
+            </section>
+          )
+        })}
+      </div>
+    )
+  }
+
+  const currentRunStatus = currentRun?.status
+  const isRunActive =
+    currentRunStatus === 'queued' || currentRunStatus === 'running'
+  const canRun = Boolean(draft) && !isRunActive
+
+  if (projectsQuery.isLoading) {
+    return (
+      <div className="boot-screen">
+        <div className="brand-mark">LL</div>
+        <LoaderCircle className="spin" size={18} />
+      </div>
+    )
+  }
+
+  if (projectsQuery.error) {
+    return (
+      <div className="boot-screen">
+        <CircleAlert size={22} />
+        <strong>无法连接 LoomLane API</strong>
+        <span>{projectsQuery.error.message}</span>
+      </div>
+    )
+  }
+
+  return (
+    <div
+      className={classNames(
+        'app-shell',
+        drawerOpen ? 'drawer-open' : 'drawer-closed',
+      )}
+    >
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark">LL</span>
+          <span>LoomLane</span>
+        </div>
+        <div className="workflow-title">
+          <strong>{draft?.sdl.workflow.name ?? '加载中'}</strong>
+          <span>
+            rev {draft?.revision ?? '—'}
+            {dirty ? ' · 未保存' : ''}
+          </span>
+        </div>
+        <div className="topbar-actions">
+          <button className="toolbar-button" onClick={validateProject}>
+            <CheckCircle2 size={15} />
+            校验
+          </button>
+          <button className="toolbar-button" onClick={generateWorkflow}>
+            <Braces size={15} />
+            生成
+          </button>
+          <button
+            className="toolbar-button"
+            disabled={!dirty || saving}
+            onClick={saveProject}
+          >
+            {saving ? (
+              <LoaderCircle size={15} className="spin" />
+            ) : (
+              <Save size={15} />
+            )}
+            保存
+          </button>
+          {isRunActive ? (
+            <button className="run-button cancel" onClick={cancelRun}>
+              <Square size={14} fill="currentColor" />
+              停止
+            </button>
+          ) : (
+            <button
+              className="run-button"
+              disabled={!canRun}
+              onClick={startRun}
+            >
+              <Play size={14} fill="currentColor" />
+              运行
+            </button>
+          )}
+        </div>
+      </header>
+
+      {notice && (
+        <div className={`notice notice-${notice.tone}`}>
+          {notice.tone === 'error' ? (
+            <CircleAlert size={15} />
+          ) : notice.tone === 'success' ? (
+            <CheckCircle2 size={15} />
+          ) : (
+            <Activity size={15} />
+          )}
+          <span>{notice.message}</span>
+          <button className="icon-button" onClick={() => setNotice(null)}>
+            <X size={13} />
+          </button>
+        </div>
+      )}
+
+      <aside className="left-panel">
+        <section className="panel-section projects-section">
+          <div className="panel-heading">
+            <span>项目</span>
+            <button
+              className="icon-button"
+              title="新建项目"
+              onClick={() => setNewProjectOpen(true)}
+            >
+              <FolderPlus size={15} />
+            </button>
+          </div>
+          <div className="project-list">
+            {projectsQuery.data?.map((project) => (
+              <button
+                key={project.id}
+                className={project.id === projectId ? 'active' : ''}
+                onClick={() => changeProject(project.id)}
+              >
+                <Folder size={14} />
+                <span>
+                  <strong>{project.name}</strong>
+                  <small>r{project.revision}</small>
+                </span>
+              </button>
+            ))}
+          </div>
+          {newProjectOpen && (
+            <div className="inline-create">
+              <input
+                autoFocus
+                value={newProjectName}
+                placeholder="项目名称"
+                onChange={(event) => setNewProjectName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') void createProject()
+                  if (event.key === 'Escape') setNewProjectOpen(false)
+                }}
+              />
+              <button className="icon-button" onClick={createProject}>
+                <Check size={14} />
+              </button>
+              <button
+                className="icon-button"
+                onClick={() => setNewProjectOpen(false)}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
+        </section>
+
+        <section className="panel-section">
+          <div className="panel-heading">
+            <span>节点库</span>
+            <button className="icon-button" onClick={addAgent}>
+              <Plus size={15} />
+            </button>
+          </div>
+          <button className="palette-agent" onClick={addAgent}>
+            <span className="agent-icon">
+              <Bot size={15} />
+            </span>
+            <span>
+              <strong>Agent</strong>
+              <small>OpenAI Compatible</small>
+            </span>
+            <Plus size={14} />
+          </button>
+        </section>
+
+        <section className="panel-section run-panel">
+          <div className="panel-heading">
+            <span>运行输入</span>
+            <Activity size={14} />
+          </div>
+          <div className="run-inputs">
+            {draft?.sdl.workflow.inputs.map((input) => (
+              <label key={input.name}>
+                <span>
+                  {input.name}
+                  <small>{input.type}</small>
+                </span>
+                {input.type === 'TEXT' || input.type === 'MIXED' ? (
+                  <textarea
+                    rows={3}
+                    value={runInputs[input.name] ?? ''}
+                    onChange={(event) =>
+                      setRunInputs((current) => ({
+                        ...current,
+                        [input.name]: event.target.value,
+                      }))
+                    }
+                  />
+                ) : (
+                  <textarea
+                    rows={3}
+                    value={runInputs[input.name] ?? '{}'}
+                    onChange={(event) =>
+                      setRunInputs((current) => ({
+                        ...current,
+                        [input.name]: event.target.value,
+                      }))
+                    }
+                  />
+                )}
+              </label>
+            ))}
+          </div>
+          <div className="run-summary">
+            <span className={`run-status status-${currentRun?.status ?? 'idle'}`}>
+              <CirclePlay size={13} />
+              {currentRun ? runStatusLabel(currentRun.status) : '未运行'}
+            </span>
+            <span>{tokenUsage.toLocaleString()} tokens</span>
+          </div>
+          <div className="run-history">
+            {runsQuery.data?.slice(0, 4).map((run) => (
+              <button
+                key={run.run_id}
+                className={currentRun?.run_id === run.run_id ? 'active' : ''}
+                onClick={() => loadRun(run)}
+              >
+                <span className={`run-dot dot-${run.status}`} />
+                <span>{formatTime(run.created_at)}</span>
+                <small>{runStatusLabel(run.status)}</small>
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <button className="delete-project" onClick={deleteProject}>
+          <Trash2 size={14} />
+          删除项目
+        </button>
+      </aside>
+
+      <main className="canvas-panel">
+        {draft ? (
+          <ReactFlow<AgentFlowNode, Edge>
+            nodes={nodes}
+            edges={edges}
+            nodeTypes={nodeTypes}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            onNodeDragStop={onNodeDragStop}
+            onMoveEnd={onMoveEnd}
+            onConnect={onConnect}
+            onNodesDelete={onNodesDelete}
+            onEdgesDelete={onEdgesDelete}
+            onSelectionChange={onSelectionChange}
+            defaultEdgeOptions={{ type: 'smoothstep' }}
+            fitView
+            fitViewOptions={{ padding: 0.3 }}
+            minZoom={0.25}
+            maxZoom={1.8}
+            deleteKeyCode={['Backspace', 'Delete']}
+          >
+            <Background
+              variant={BackgroundVariant.Dots}
+              gap={22}
+              size={1.3}
+              color="#cdd4ce"
+            />
+            <Controls showInteractive={false} />
+            <MiniMap
+              pannable
+              zoomable
+              nodeColor={(node) => {
+                const status = (node.data as { status?: NodeRunStatus }).status
+                if (status === 'running') return '#167a70'
+                if (status === 'failed') return '#b54c42'
+                if (status === 'succeeded') return '#5e7d45'
+                return '#b8c0b9'
+              }}
+              maskColor="rgba(237, 240, 235, 0.72)"
+            />
+          </ReactFlow>
+        ) : (
+          <div className="canvas-placeholder">
+            <LoaderCircle className="spin" size={18} />
+            <span>加载工作流</span>
+          </div>
+        )}
+        <div className="canvas-hint">
+          <Unplug size={13} />
+          <span>拖动端口连线</span>
+        </div>
+      </main>
+
+      <aside className="inspector">
+        {renderInspectorTabs()}
+        {inspectorTab === 'selection' && renderSelectionInspector()}
+        {inspectorTab === 'workflow' && renderWorkflowInspector()}
+        {inspectorTab === 'api' && renderApiInspector()}
+      </aside>
+
+      <section className="bottom-drawer">
+        <div className="drawer-tabs">
+          {(
+            [
+              ['sdl', 'SDL', FileCode2],
+              ['issues', `问题 ${issues.length || ''}`, CircleAlert],
+              ['events', `事件 ${runEvents.length || ''}`, Terminal],
+              ['result', '结果', Braces],
+            ] as Array<[DrawerTab, string, typeof FileCode2]>
+          ).map(([value, label, Icon]) => (
+            <button
+              key={value}
+              className={drawerTab === value && drawerOpen ? 'active' : ''}
+              onClick={() => {
+                setDrawerTab(value)
+                setDrawerOpen(true)
+              }}
+            >
+              <Icon size={14} />
+              {label}
+            </button>
+          ))}
+          <button
+            className="drawer-toggle"
+            title={drawerOpen ? '收起面板' : '展开面板'}
+            onClick={() => setDrawerOpen(!drawerOpen)}
+          >
+            {drawerOpen ? (
+              <PanelBottomClose size={15} />
+            ) : (
+              <PanelBottomOpen size={15} />
+            )}
+          </button>
+        </div>
+        {drawerOpen && (
+          <div className="drawer-content">
+            {drawerTab === 'sdl' && draft && (
+              <SdlEditor
+                draft={draft}
+                onImported={(detail) => {
+                  setDraft(detail)
+                  setDirty(false)
+                  setIssues([])
+                  setSelection(null)
+                  setRunInputs(
+                    Object.fromEntries(
+                      detail.sdl.workflow.inputs.map((input) => [
+                        input.name,
+                        '',
+                      ]),
+                    ),
+                  )
+                  queryClient.invalidateQueries({ queryKey: ['projects'] })
+                  showNotice('success', `SDL 已导入 revision ${detail.revision}`)
+                }}
+                onError={(message) => showNotice('error', message)}
+              />
+            )}
+            {drawerTab === 'issues' && (
+              <div className="issues-list">
+                {issues.length === 0 ? (
+                  <div className="drawer-empty">
+                    <CheckCircle2 size={17} />
+                    当前没有校验问题
+                  </div>
+                ) : (
+                  issues.map((issue, index) => (
+                    <button
+                      key={`${issue.code}-${index}`}
+                      className={`issue-row issue-${issue.severity}`}
+                      onClick={() => {
+                        if (issue.node_id) {
+                          setSelection({ kind: 'node', id: issue.node_id })
+                          setInspectorTab('selection')
+                        } else if (issue.edge_id) {
+                          setSelection({ kind: 'edge', id: issue.edge_id })
+                          setInspectorTab('selection')
+                        }
+                      }}
+                    >
+                      <CircleAlert size={14} />
+                      <code>{issue.code}</code>
+                      <span>{issue.message}</span>
+                      <small>{issue.path}</small>
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
+            {drawerTab === 'events' && (
+              <div className="event-console">
+                {runEvents.length === 0 ? (
+                  <div className="drawer-empty">
+                    <Terminal size={17} />
+                    尚无运行事件
+                  </div>
+                ) : (
+                  runEvents.map((event) => (
+                    <div className="event-row" key={`${event.run_id}-${event.seq}`}>
+                      <span>{String(event.seq).padStart(3, '0')}</span>
+                      <time>{formatTime(event.ts)}</time>
+                      <code>{event.type}</code>
+                      <span>{event.node_id ?? event.edge_id ?? 'workflow'}</span>
+                      <small>{JSON.stringify(event.data)}</small>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+            {drawerTab === 'result' && (
+              <div className="result-grid">
+                <div>
+                  <span className="eyebrow">RUN RESULT</span>
+                  <pre>
+                    {JSON.stringify(
+                      currentRun && 'result' in currentRun
+                        ? currentRun.result
+                        : null,
+                      null,
+                      2,
+                    )}
+                  </pre>
+                </div>
+                <div>
+                  <span className="eyebrow">GENERATED FILES</span>
+                  <pre>{generatedFiles.join('\n') || '尚未生成'}</pre>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
+function JsonConditionEditor({
+  value,
+  onChange,
+}: {
+  value: ConditionNode | null | undefined
+  onChange: (value: ConditionNode) => void
+}) {
+  const [text, setText] = useState(() =>
+    JSON.stringify(value ?? { op: 'exists', left: '$.run.step' }, null, 2),
+  )
+  const [invalid, setInvalid] = useState(false)
+  return (
+    <>
+      <textarea
+        rows={8}
+        value={text}
+        className={invalid ? 'field-invalid' : ''}
+        onChange={(event) => {
+          setText(event.target.value)
+          try {
+            const parsed = JSON.parse(event.target.value)
+            if (parsed && typeof parsed === 'object' && typeof parsed.op === 'string') {
+              onChange(parsed as ConditionNode)
+              setInvalid(false)
+            } else {
+              setInvalid(true)
+            }
+          } catch {
+            setInvalid(true)
+          }
+        }}
+        spellCheck={false}
+      />
+    </>
+  )
+}
+
+export default App

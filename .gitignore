@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+node_modules/
+dist/
+workspace/
+.pnpm-store/
+.browser-profile*/
+*.tsbuildinfo
+*.egg-info/
+*.log
+.DS_Store
+
