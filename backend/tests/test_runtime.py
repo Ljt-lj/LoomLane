@@ -5,6 +5,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,6 +19,9 @@ class MemoryCredentials:
     def get(self, project_id: str, profile_id: str, base_url: str) -> str | None:
         return None
 
+    def get_library(self, profile_id: str, base_url: str) -> str | None:
+        return None
+
     def status(self, project_id: str, profile_id: str, base_url: str):
         from loomlane.models import SecretStatus
 
@@ -28,6 +32,12 @@ class MemoryCredentials:
 
     def delete(self, project_id: str, profile_id: str) -> None:
         return None
+
+
+class LibraryMemoryCredentials(MemoryCredentials):
+    def get_library(self, profile_id: str, base_url: str) -> str | None:
+        assert profile_id == "deepseek-flash"
+        return "library-secret"
 
 
 class FakeOpenAIHandler(BaseHTTPRequestHandler):
@@ -200,3 +210,27 @@ async def test_agent_json_output_enables_response_format(
         "content"
     ]
     await manager.shutdown()
+
+
+def test_runtime_environment_uses_linked_library_credential(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    sdl = default_sdl()
+    profile = sdl.api_profiles[0]
+    previous_id = profile.id
+    profile.id = "deepseek-flash"
+    profile.library_id = "deepseek-flash"
+    for agent in sdl.agents:
+        if agent.api_profile == previous_id:
+            agent.api_profile = profile.id
+    project = store.create("library credential test", sdl, default_canvas())
+    manager = RunManager(store, LibraryMemoryCredentials())
+
+    env = manager._runtime_environment(
+        project,
+        "run-id",
+        SimpleNamespace(compiler_key="test-hash"),
+    )
+
+    assert env["LOOMLANE_SECRET_DEEPSEEK_FLASH"] == "library-secret"

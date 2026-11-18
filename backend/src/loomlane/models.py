@@ -72,6 +72,7 @@ class CapabilityFlags(StrictModel):
 
 class ApiProfile(StrictModel):
     id: str
+    library_id: str | None = None
     name: str | None = None
     provider: Literal["openai_compatible"] = "openai_compatible"
     base_url: str
@@ -254,10 +255,16 @@ class SecretStatus(StrictModel):
     profile_id: str
     configured: bool
     origin: str | None = None
+    scope: Literal["project", "library"] | None = None
 
 
 class SecretPutRequest(StrictModel):
     api_key: str = Field(min_length=1)
+
+
+class SecretImportRequest(StrictModel):
+    project_id: str
+    profile_id: str
 
 
 class RunStartRequest(StrictModel):

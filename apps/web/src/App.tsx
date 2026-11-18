@@ -35,6 +35,8 @@ import {
   LoaderCircle,
   PanelBottomClose,
   PanelBottomOpen,
+  PanelLeftClose,
+  PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
   Play,
@@ -87,6 +89,10 @@ import type {
 import {
   INSPECTOR_MAX_WIDTH,
   INSPECTOR_MIN_WIDTH,
+  DRAWER_MAX_HEIGHT,
+  DRAWER_MIN_HEIGHT,
+  LEFT_PANEL_MAX_WIDTH,
+  LEFT_PANEL_MIN_WIDTH,
   useUiStore,
   type DrawerTab,
   type InspectorTab,
@@ -325,11 +331,17 @@ function App() {
     drawerTab,
     inspectorTab,
     drawerOpen,
+    drawerHeight,
+    leftPanelOpen,
+    leftPanelWidth,
     inspectorOpen,
     inspectorWidth,
     setDrawerTab,
     setInspectorTab,
     setDrawerOpen,
+    setDrawerHeight,
+    setLeftPanelOpen,
+    setLeftPanelWidth,
     setInspectorOpen,
     setInspectorWidth,
   } = useUiStore()
@@ -362,6 +374,25 @@ function App() {
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
   const [keySaving, setKeySaving] = useState<string | null>(null)
   const [profileDeleting, setProfileDeleting] = useState<string | null>(null)
+  const [libraryProfileDrafts, setLibraryProfileDrafts] = useState<
+    Record<string, ApiProfile>
+  >({})
+  const [librarySecretDrafts, setLibrarySecretDrafts] = useState<
+    Record<string, string>
+  >({})
+  const [librarySecretStatuses, setLibrarySecretStatuses] = useState<
+    Record<string, SecretStatus>
+  >({})
+  const [libraryProfileSaving, setLibraryProfileSaving] = useState<string | null>(
+    null,
+  )
+  const [libraryProfileDeleting, setLibraryProfileDeleting] = useState<
+    string | null
+  >(null)
+  const [libraryKeySaving, setLibraryKeySaving] = useState<string | null>(null)
+  const [libraryProfileLinking, setLibraryProfileLinking] = useState<
+    string | null
+  >(null)
   const [generatedFiles, setGeneratedFiles] = useState<string[]>([])
   const eventSourceRef = useRef<EventSource | null>(null)
   const noticeTimerRef = useRef<number | null>(null)
@@ -370,7 +401,17 @@ function App() {
     startX: number
     startWidth: number
   } | null>(null)
+  const leftResizeRef = useRef<{
+    startX: number
+    startWidth: number
+  } | null>(null)
+  const drawerResizeRef = useRef<{
+    startY: number
+    startHeight: number
+  } | null>(null)
   const [resizingInspector, setResizingInspector] = useState(false)
+  const [resizingLeft, setResizingLeft] = useState(false)
+  const [resizingDrawer, setResizingDrawer] = useState(false)
 
   function startInspectorResize(event: ReactPointerEvent<HTMLDivElement>) {
     if (event.button !== 0) return
@@ -417,9 +458,103 @@ function App() {
     }
   }
 
+  function startLeftResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return
+    event.preventDefault()
+    leftResizeRef.current = {
+      startX: event.clientX,
+      startWidth: leftPanelWidth,
+    }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    setResizingLeft(true)
+  }
+
+  function moveLeftResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = leftResizeRef.current
+    if (!drag) return
+    setLeftPanelWidth(drag.startWidth + event.clientX - drag.startX)
+  }
+
+  function finishLeftResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!leftResizeRef.current) return
+    leftResizeRef.current = null
+    setResizingLeft(false)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  function resizeLeftWithKeyboard(
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) {
+    const step = 12
+    if (event.key === 'ArrowRight') {
+      event.preventDefault()
+      setLeftPanelWidth(leftPanelWidth + step)
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault()
+      setLeftPanelWidth(leftPanelWidth - step)
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      setLeftPanelWidth(LEFT_PANEL_MIN_WIDTH)
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      setLeftPanelWidth(LEFT_PANEL_MAX_WIDTH)
+    }
+  }
+
+  function startDrawerResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return
+    event.preventDefault()
+    drawerResizeRef.current = {
+      startY: event.clientY,
+      startHeight: drawerHeight,
+    }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    setResizingDrawer(true)
+  }
+
+  function moveDrawerResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = drawerResizeRef.current
+    if (!drag) return
+    setDrawerHeight(drag.startHeight + drag.startY - event.clientY)
+  }
+
+  function finishDrawerResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!drawerResizeRef.current) return
+    drawerResizeRef.current = null
+    setResizingDrawer(false)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  function resizeDrawerWithKeyboard(
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) {
+    const step = 12
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setDrawerHeight(drawerHeight + step)
+    } else if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setDrawerHeight(drawerHeight - step)
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      setDrawerHeight(DRAWER_MIN_HEIGHT)
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      setDrawerHeight(DRAWER_MAX_HEIGHT)
+    }
+  }
+
   const projectsQuery = useQuery({
     queryKey: ['projects'],
     queryFn: api.listProjects,
+  })
+  const apiProfilesQuery = useQuery({
+    queryKey: ['api-profiles'],
+    queryFn: api.listApiProfiles,
   })
   const projectQuery = useQuery({
     queryKey: ['project', projectId],
@@ -495,6 +630,35 @@ function App() {
       cancelled = true
     }
   }, [draft?.sdl.api_profiles, projectId])
+
+  useEffect(() => {
+    const profiles = apiProfilesQuery.data
+    if (!profiles) return
+    setLibraryProfileDrafts((current) => {
+      const next: Record<string, ApiProfile> = {}
+      for (const profile of profiles) {
+        next[profile.id] = current[profile.id] ?? profile
+      }
+      return next
+    })
+
+    let cancelled = false
+    Promise.all(
+      profiles.map(async (profile) => [
+        profile.id,
+        await api.apiProfileSecretStatus(profile.id),
+      ] as const),
+    )
+      .then((entries) => {
+        if (!cancelled) setLibrarySecretStatuses(Object.fromEntries(entries))
+      })
+      .catch(() => {
+        if (!cancelled) setLibrarySecretStatuses({})
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [apiProfilesQuery.data])
 
   useEffect(() => {
     if (!draft) {
@@ -951,6 +1115,269 @@ function App() {
     }
   }
 
+  function updateLibraryProfileDraft(
+    profileId: string,
+    updater: (profile: ApiProfile) => ApiProfile,
+  ) {
+    setLibraryProfileDrafts((current) => {
+      const profile = current[profileId]
+      if (!profile) return current
+      return {
+        ...current,
+        [profileId]: updater(profile),
+      }
+    })
+  }
+
+  async function createLibraryProfile() {
+    const profileId = uniqueId(
+      'profile',
+      (apiProfilesQuery.data ?? []).map((profile) => profile.id),
+    )
+    const profile: ApiProfile = {
+      id: profileId,
+      library_id: null,
+      name: '新常用 Profile',
+      provider: 'openai_compatible',
+      base_url: 'https://api.deepseek.com/v1',
+      model: 'deepseek-chat',
+      request: {
+        timeout_seconds: 60,
+        max_retries: 2,
+        temperature: 0.2,
+      },
+      capabilities: {
+        function_calling: false,
+        vision: false,
+        long_context: true,
+        structured_output: true,
+      },
+    }
+    setLibraryProfileSaving(profileId)
+    try {
+      const created = await api.createApiProfile(profile)
+      setLibraryProfileDrafts((current) => ({
+        ...current,
+        [created.id]: created,
+      }))
+      await queryClient.invalidateQueries({ queryKey: ['api-profiles'] })
+      showNotice('success', '常用 API Profile 已创建')
+    } catch (error) {
+      showNotice(
+        'error',
+        error instanceof Error ? error.message : '常用 Profile 创建失败',
+      )
+    } finally {
+      setLibraryProfileSaving(null)
+    }
+  }
+
+  async function saveLibraryProfile(profileId: string) {
+    const profile = libraryProfileDrafts[profileId]
+    if (!profile) return
+    setLibraryProfileSaving(profileId)
+    try {
+      const saved = await api.updateApiProfile(profileId, {
+        ...profile,
+        library_id: null,
+      })
+      setLibraryProfileDrafts((current) => ({
+        ...current,
+        [profileId]: saved,
+      }))
+      await queryClient.invalidateQueries({ queryKey: ['api-profiles'] })
+      showNotice('success', '常用 API Profile 已保存')
+    } catch (error) {
+      showNotice(
+        'error',
+        error instanceof Error ? error.message : '常用 Profile 保存失败',
+      )
+    } finally {
+      setLibraryProfileSaving(null)
+    }
+  }
+
+  async function deleteLibraryProfile(profileId: string) {
+    const profile = libraryProfileDrafts[profileId]
+    if (!profile) return
+    if (
+      !window.confirm(
+        `从常用库删除“${profile.name || profile.id}”？已加入项目的副本不会被删除。`,
+      )
+    ) {
+      return
+    }
+    setLibraryProfileDeleting(profileId)
+    try {
+      await api.deleteApiProfile(profileId)
+      setLibraryProfileDrafts((current) => {
+        const next = { ...current }
+        delete next[profileId]
+        return next
+      })
+      setLibrarySecretDrafts((current) => {
+        const next = { ...current }
+        delete next[profileId]
+        return next
+      })
+      setLibrarySecretStatuses((current) => {
+        const next = { ...current }
+        delete next[profileId]
+        return next
+      })
+      await queryClient.invalidateQueries({ queryKey: ['api-profiles'] })
+      showNotice('success', '常用 API Profile 已删除')
+    } catch (error) {
+      showNotice(
+        'error',
+        error instanceof Error ? error.message : '常用 Profile 删除失败',
+      )
+    } finally {
+      setLibraryProfileDeleting(null)
+    }
+  }
+
+  async function saveLibrarySecret(profileId: string) {
+    const apiKey = librarySecretDrafts[profileId]?.trim()
+    if (!apiKey) return
+    setLibraryKeySaving(profileId)
+    try {
+      const status = await api.putApiProfileSecret(profileId, apiKey)
+      setLibrarySecretStatuses((current) => ({
+        ...current,
+        [profileId]: status,
+      }))
+      setLibrarySecretDrafts((current) => ({ ...current, [profileId]: '' }))
+      showNotice('success', '常用库密钥已安全保存')
+    } catch (error) {
+      showNotice(
+        'error',
+        error instanceof Error ? error.message : '常用库密钥保存失败',
+      )
+    } finally {
+      setLibraryKeySaving(null)
+    }
+  }
+
+  async function deleteLibrarySecret(profileId: string) {
+    try {
+      await api.deleteApiProfileSecret(profileId)
+      setLibrarySecretStatuses((current) => ({
+        ...current,
+        [profileId]: {
+          profile_id: profileId,
+          configured: false,
+          origin: current[profileId]?.origin ?? null,
+          scope: 'library',
+        },
+      }))
+      showNotice('info', '常用库密钥已移除')
+    } catch (error) {
+      showNotice(
+        'error',
+        error instanceof Error ? error.message : '常用库密钥删除失败',
+      )
+    }
+  }
+
+  async function addLibraryProfileToProject(profileId: string) {
+    if (!draft) return
+    const profile = libraryProfileDrafts[profileId]
+    if (!profile) return
+    setLibraryProfileLinking(profileId)
+    try {
+      const projectProfileId = uniqueId(
+        profile.id,
+        draft.sdl.api_profiles.map((item) => item.id),
+      )
+      const linkedProfile: ApiProfile = {
+        ...profile,
+        id: projectProfileId,
+        library_id: profile.id,
+      }
+      updateWorkflow((sdl) => ({
+        ...sdl,
+        api_profiles: [...sdl.api_profiles, linkedProfile],
+      }))
+      if (librarySecretStatuses[profile.id]?.configured) {
+        setSecretStatuses((current) => ({
+          ...current,
+          [projectProfileId]: {
+            ...librarySecretStatuses[profile.id],
+            profile_id: projectProfileId,
+            scope: 'library',
+          },
+        }))
+      }
+      showNotice('success', '已加入当前项目，保存项目后生效')
+    } finally {
+      setLibraryProfileLinking(null)
+    }
+  }
+
+  async function saveProjectProfileToLibrary(profile: ApiProfile) {
+    if (!draft || !libraryProfileDrafts) return
+    const libraryProfiles = apiProfilesQuery.data ?? []
+    const linkedLibraryProfile = profile.library_id
+      ? libraryProfiles.find((item) => item.id === profile.library_id)
+      : null
+    const libraryProfileId =
+      linkedLibraryProfile?.id ??
+      uniqueId(
+        profile.id,
+        libraryProfiles.map((item) => item.id),
+      )
+    const payload: ApiProfile = {
+      ...profile,
+      id: libraryProfileId,
+      library_id: null,
+    }
+    setLibraryProfileSaving(profile.id)
+    try {
+      const saved = linkedLibraryProfile
+        ? await api.updateApiProfile(libraryProfileId, payload)
+        : await api.createApiProfile(payload)
+      setLibraryProfileDrafts((current) => ({
+        ...current,
+        [saved.id]: saved,
+      }))
+      updateProfile(profile.id, (current) => ({
+        ...current,
+        library_id: saved.id,
+      }))
+      await queryClient.invalidateQueries({ queryKey: ['api-profiles'] })
+
+      const projectSecret = secretStatuses[profile.id]
+      if (projectSecret?.configured && projectSecret.scope !== 'library') {
+        try {
+          const imported = await api.importProjectSecret(
+            saved.id,
+            draft.id,
+            profile.id,
+          )
+          setLibrarySecretStatuses((current) => ({
+            ...current,
+            [saved.id]: imported,
+          }))
+        } catch {
+          showNotice(
+            'info',
+            'Profile 已保存到常用库，但项目密钥未能导入；请在常用库中单独填写密钥',
+          )
+          return
+        }
+      }
+      showNotice('success', 'Profile 已保存到常用库')
+    } catch (error) {
+      showNotice(
+        'error',
+        error instanceof Error ? error.message : '保存到常用库失败',
+      )
+    } finally {
+      setLibraryProfileSaving(null)
+    }
+  }
+
   async function deleteApiProfile(profile: ApiProfile) {
     if (!draft) return
     const removal = removeApiProfile(draft.sdl, profile.id)
@@ -972,7 +1399,10 @@ function App() {
     const referenceMessage = replacement
       ? `，${removal.referencedAgentIds.length} 个 Agent 将切换到“${replacement.name || replacement.id}”`
       : ''
-    const secretMessage = secretStatuses[profile.id]?.configured
+    const hasProjectSecret =
+      secretStatuses[profile.id]?.configured &&
+      secretStatuses[profile.id]?.scope !== 'library'
+    const secretMessage = hasProjectSecret
       ? '，并移除已保存的密钥'
       : ''
     if (
@@ -985,7 +1415,7 @@ function App() {
 
     setProfileDeleting(profile.id)
     try {
-      if (secretStatuses[profile.id]?.configured) {
+      if (hasProjectSecret) {
         await api.deleteSecret(draft.id, profile.id)
       }
       updateWorkflow((sdl) => {
@@ -1996,6 +2426,7 @@ function App() {
 
   function renderApiInspector() {
     if (!draft) return null
+    const libraryProfiles = apiProfilesQuery.data ?? []
     return (
       <div className="inspector-body">
         <div className="inspector-heading">
@@ -2005,212 +2436,522 @@ function App() {
           </div>
           <button
             className="icon-button"
-            title="新增 Profile"
-            onClick={() =>
-              updateWorkflow((sdl) => {
-                const id = uniqueId(
-                  'profile',
-                  sdl.api_profiles.map((profile) => profile.id),
-                )
-                return {
-                  ...sdl,
-                  api_profiles: [
-                    ...sdl.api_profiles,
-                    {
-                      id,
-                      name: '新 Profile',
-                      provider: 'openai_compatible',
-                      base_url: 'http://127.0.0.1:8001/v1',
-                      model: 'local-model',
-                      request: {
-                        timeout_seconds: 60,
-                        max_retries: 2,
-                        temperature: 0.2,
-                      },
-                      capabilities: {
-                        function_calling: false,
-                        vision: false,
-                        long_context: false,
-                        structured_output: true,
-                      },
-                    },
-                  ],
-                }
-              })
-            }
+            title="刷新常用库"
+            disabled={apiProfilesQuery.isFetching}
+            onClick={() => queryClient.invalidateQueries({ queryKey: ['api-profiles'] })}
           >
-            <Plus size={15} />
+            <RefreshCw
+              size={14}
+              className={apiProfilesQuery.isFetching ? 'spin' : undefined}
+            />
           </button>
         </div>
-        {draft.sdl.api_profiles.map((profile) => {
-          const local =
-            profile.base_url.includes('127.0.0.1') ||
-            profile.base_url.includes('localhost')
-          const status = secretStatuses[profile.id]
-          return (
-            <section className="profile-card" key={profile.id}>
-              <div className="profile-title">
-                <div className="profile-title-copy">
-                  <strong>{profile.name || profile.id}</strong>
-                  <span>{profile.id}</span>
+
+        <section className="api-profile-group">
+          <div className="section-line api-group-heading">
+            <span>常用 API 库</span>
+            <button
+              className="icon-button"
+              title="新增常用 Profile"
+              disabled={libraryProfileSaving !== null}
+              onClick={createLibraryProfile}
+            >
+              {libraryProfileSaving &&
+              !libraryProfiles.some(
+                (profile) => profile.id === libraryProfileSaving,
+              ) ? (
+                <LoaderCircle size={14} className="spin" />
+              ) : (
+                <Plus size={15} />
+              )}
+            </button>
+          </div>
+          <p className="api-group-help">密钥独立保存在系统凭据库，可被多个项目复用。</p>
+          {apiProfilesQuery.isLoading && (
+            <div className="api-group-state">
+              <LoaderCircle size={14} className="spin" />
+              读取常用库
+            </div>
+          )}
+          {apiProfilesQuery.error && (
+            <div className="api-group-state error">
+              <CircleAlert size={14} />
+              {apiProfilesQuery.error.message}
+            </div>
+          )}
+          {!apiProfilesQuery.isLoading &&
+            !apiProfilesQuery.error &&
+            libraryProfiles.length === 0 && (
+              <div className="api-group-state">
+                <KeyRound size={14} />
+                尚无常用 Profile
+              </div>
+            )}
+          {libraryProfiles.map((serverProfile) => {
+            const profile =
+              libraryProfileDrafts[serverProfile.id] ?? serverProfile
+            const status = librarySecretStatuses[serverProfile.id]
+            const local =
+              profile.base_url.includes('127.0.0.1') ||
+              profile.base_url.includes('localhost')
+            const linked = draft.sdl.api_profiles.some(
+              (item) => item.library_id === serverProfile.id,
+            )
+            const saving = libraryProfileSaving === serverProfile.id
+            const deleting = libraryProfileDeleting === serverProfile.id
+            return (
+              <section className="profile-card library-profile-card" key={serverProfile.id}>
+                <div className="profile-title">
+                  <div className="profile-title-copy">
+                    <strong>{profile.name || profile.id}</strong>
+                    <span>{profile.id}</span>
+                  </div>
+                  <div className="profile-title-actions">
+                    <span
+                      className={classNames(
+                        'credential-badge',
+                        status?.configured || local ? 'ready' : 'missing',
+                      )}
+                    >
+                      {status?.configured || local ? (
+                        <CheckCircle2 size={12} />
+                      ) : (
+                        <CircleAlert size={12} />
+                      )}
+                      {local
+                        ? '本地接口'
+                        : status?.configured
+                          ? '常用库密钥'
+                          : '缺少密钥'}
+                    </span>
+                    <button
+                      className="icon-button danger"
+                      aria-label="删除常用 Profile"
+                      disabled={deleting || saving}
+                      onClick={() => deleteLibraryProfile(serverProfile.id)}
+                      title="从常用库删除"
+                    >
+                      {deleting ? (
+                        <LoaderCircle size={14} className="spin" />
+                      ) : (
+                        <Trash2 size={14} />
+                      )}
+                    </button>
+                  </div>
                 </div>
-                <div className="profile-title-actions">
-                  <span
-                    className={classNames(
-                      'credential-badge',
-                      status?.configured || local ? 'ready' : 'missing',
+                <label>
+                  显示名称
+                  <input
+                    value={profile.name ?? ''}
+                    onChange={(event) =>
+                      updateLibraryProfileDraft(serverProfile.id, (current) => ({
+                        ...current,
+                        name: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  Base URL
+                  <input
+                    value={profile.base_url}
+                    onChange={(event) =>
+                      updateLibraryProfileDraft(serverProfile.id, (current) => ({
+                        ...current,
+                        base_url: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <div className="two-column-fields">
+                  <label>
+                    Model
+                    <input
+                      value={profile.model}
+                      onChange={(event) =>
+                        updateLibraryProfileDraft(serverProfile.id, (current) => ({
+                          ...current,
+                          model: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    Temperature
+                    <input
+                      type="number"
+                      step="0.1"
+                      min={0}
+                      max={2}
+                      value={profile.request.temperature}
+                      onChange={(event) =>
+                        updateLibraryProfileDraft(serverProfile.id, (current) => ({
+                          ...current,
+                          request: {
+                            ...current.request,
+                            temperature: Number(event.target.value),
+                          },
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+                {!local && (
+                  <div className="secret-row">
+                    <input
+                      type="password"
+                      value={librarySecretDrafts[serverProfile.id] ?? ''}
+                      placeholder={
+                        status?.configured ? '输入新密钥以替换' : '输入 API Key'
+                      }
+                      onChange={(event) =>
+                        setLibrarySecretDrafts((current) => ({
+                          ...current,
+                          [serverProfile.id]: event.target.value,
+                        }))
+                      }
+                    />
+                    <button
+                      className="small-button accent"
+                      disabled={
+                        deleting ||
+                        saving ||
+                        libraryKeySaving === serverProfile.id
+                      }
+                      onClick={() => saveLibrarySecret(serverProfile.id)}
+                      title="保存常用库密钥"
+                    >
+                      {libraryKeySaving === serverProfile.id ? (
+                        <LoaderCircle size={13} className="spin" />
+                      ) : (
+                        <KeyRound size={13} />
+                      )}
+                      保存
+                    </button>
+                    {status?.configured && (
+                      <button
+                        className="icon-button danger"
+                        disabled={deleting || saving}
+                        onClick={() => deleteLibrarySecret(serverProfile.id)}
+                        title="删除常用库密钥"
+                      >
+                        <Trash2 size={14} />
+                      </button>
                     )}
-                  >
-                    {status?.configured || local ? (
-                      <CheckCircle2 size={12} />
-                    ) : (
-                      <CircleAlert size={12} />
-                    )}
-                    {local
-                      ? '本地接口'
-                      : status?.configured
-                        ? '已配置'
-                        : '缺少密钥'}
-                  </span>
+                  </div>
+                )}
+                <div className="capability-row">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={profile.capabilities.structured_output}
+                      onChange={(event) =>
+                        updateLibraryProfileDraft(serverProfile.id, (current) => ({
+                          ...current,
+                          capabilities: {
+                            ...current.capabilities,
+                            structured_output: event.target.checked,
+                          },
+                        }))
+                      }
+                    />
+                    Structured JSON
+                  </label>
+                </div>
+                <div className="profile-card-actions">
                   <button
-                    className="icon-button danger"
-                    aria-label="删除 Profile"
-                    disabled={
-                      profileDeleting !== null || keySaving === profile.id
-                    }
-                    onClick={() => deleteApiProfile(profile)}
-                    title="删除 Profile"
+                    className="small-button"
+                    disabled={deleting || saving}
+                    onClick={() => saveLibraryProfile(serverProfile.id)}
                   >
-                    {profileDeleting === profile.id ? (
-                      <LoaderCircle size={14} className="spin" />
+                    {saving ? (
+                      <LoaderCircle size={13} className="spin" />
                     ) : (
-                      <Trash2 size={14} />
+                      <Save size={13} />
                     )}
+                    保存配置
                   </button>
-                </div>
-              </div>
-              <label>
-                显示名称
-                <input
-                  value={profile.name ?? ''}
-                  onChange={(event) =>
-                    updateProfile(profile.id, (current) => ({
-                      ...current,
-                      name: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                Base URL
-                <input
-                  value={profile.base_url}
-                  onChange={(event) =>
-                    updateProfile(profile.id, (current) => ({
-                      ...current,
-                      base_url: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-              <div className="two-column-fields">
-                <label>
-                  Model
-                  <input
-                    value={profile.model}
-                    onChange={(event) =>
-                      updateProfile(profile.id, (current) => ({
-                        ...current,
-                        model: event.target.value,
-                      }))
-                    }
-                  />
-                </label>
-                <label>
-                  Temperature
-                  <input
-                    type="number"
-                    step="0.1"
-                    min={0}
-                    max={2}
-                    value={profile.request.temperature}
-                    onChange={(event) =>
-                      updateProfile(profile.id, (current) => ({
-                        ...current,
-                        request: {
-                          ...current.request,
-                          temperature: Number(event.target.value),
-                        },
-                      }))
-                    }
-                  />
-                </label>
-              </div>
-              {!local && (
-                <div className="secret-row">
-                  <input
-                    type="password"
-                    value={secretDrafts[profile.id] ?? ''}
-                    placeholder={
-                      status?.configured ? '输入新密钥以替换' : '输入 API Key'
-                    }
-                    onChange={(event) =>
-                      setSecretDrafts((current) => ({
-                        ...current,
-                        [profile.id]: event.target.value,
-                      }))
-                    }
-                  />
                   <button
                     className="small-button accent"
                     disabled={
-                      dirty ||
-                      keySaving === profile.id ||
-                      profileDeleting === profile.id
+                      linked ||
+                      deleting ||
+                      saving ||
+                      libraryProfileLinking === serverProfile.id
                     }
-                    onClick={() => saveSecret(profile.id)}
-                    title={dirty ? '先保存 Profile 配置' : '保存密钥'}
+                    onClick={() => addLibraryProfileToProject(serverProfile.id)}
+                    title={linked ? '当前项目已使用该配置' : '加入当前项目'}
                   >
-                    {keySaving === profile.id ? (
+                    {libraryProfileLinking === serverProfile.id ? (
                       <LoaderCircle size={13} className="spin" />
+                    ) : linked ? (
+                      <Check size={13} />
                     ) : (
-                      <KeyRound size={13} />
+                      <Plus size={13} />
                     )}
-                    保存
+                    {linked ? '已加入' : '加入项目'}
                   </button>
-                  {status?.configured && (
+                </div>
+              </section>
+            )
+          })}
+        </section>
+
+        <section className="api-profile-group">
+          <div className="section-line api-group-heading">
+            <span>当前项目</span>
+            <button
+              className="icon-button"
+              title="新增项目 Profile"
+              onClick={() =>
+                updateWorkflow((sdl) => {
+                  const id = uniqueId(
+                    'profile',
+                    sdl.api_profiles.map((profile) => profile.id),
+                  )
+                  return {
+                    ...sdl,
+                    api_profiles: [
+                      ...sdl.api_profiles,
+                      {
+                        id,
+                        name: '新 Profile',
+                        provider: 'openai_compatible',
+                        base_url: 'http://127.0.0.1:8001/v1',
+                        model: 'local-model',
+                        request: {
+                          timeout_seconds: 60,
+                          max_retries: 2,
+                          temperature: 0.2,
+                        },
+                        capabilities: {
+                          function_calling: false,
+                          vision: false,
+                          long_context: false,
+                          structured_output: true,
+                        },
+                      },
+                    ],
+                  }
+                })
+              }
+            >
+              <Plus size={15} />
+            </button>
+          </div>
+          {draft.sdl.api_profiles.length === 0 && (
+            <div className="api-group-state">
+              <CircleAlert size={14} />
+              当前项目尚未选择 API Profile
+            </div>
+          )}
+          {draft.sdl.api_profiles.map((profile) => {
+            const local =
+              profile.base_url.includes('127.0.0.1') ||
+              profile.base_url.includes('localhost')
+            const status = secretStatuses[profile.id]
+            const usingLibrarySecret =
+              status?.configured && status.scope === 'library'
+            return (
+              <section className="profile-card" key={profile.id}>
+                <div className="profile-title">
+                  <div className="profile-title-copy">
+                    <strong>{profile.name || profile.id}</strong>
+                    <span>{profile.id}</span>
+                    {profile.library_id && (
+                      <small className="profile-library-link">
+                        常用库：{profile.library_id}
+                      </small>
+                    )}
+                  </div>
+                  <div className="profile-title-actions">
+                    <span
+                      className={classNames(
+                        'credential-badge',
+                        status?.configured || local ? 'ready' : 'missing',
+                      )}
+                    >
+                      {status?.configured || local ? (
+                        <CheckCircle2 size={12} />
+                      ) : (
+                        <CircleAlert size={12} />
+                      )}
+                      {local
+                        ? '本地接口'
+                        : usingLibrarySecret
+                          ? '常用库密钥'
+                          : status?.configured
+                            ? '项目密钥'
+                            : '缺少密钥'}
+                    </span>
                     <button
                       className="icon-button danger"
-                      disabled={profileDeleting === profile.id}
-                      onClick={() => deleteSecret(profile.id)}
-                      title="删除密钥"
+                      aria-label="删除 Profile"
+                      disabled={
+                        profileDeleting !== null || keySaving === profile.id
+                      }
+                      onClick={() => deleteApiProfile(profile)}
+                      title="删除 Profile"
                     >
-                      <Trash2 size={14} />
+                      {profileDeleting === profile.id ? (
+                        <LoaderCircle size={14} className="spin" />
+                      ) : (
+                        <Trash2 size={14} />
+                      )}
                     </button>
+                  </div>
+                </div>
+                <div className="profile-card-actions">
+                  <button
+                    className="small-button"
+                    disabled={
+                      libraryProfileSaving === profile.id ||
+                      libraryProfileDeleting !== null
+                    }
+                    onClick={() => saveProjectProfileToLibrary(profile)}
+                    title="将当前配置保存为可复用 API"
+                  >
+                    {libraryProfileSaving === profile.id ? (
+                      <LoaderCircle size={13} className="spin" />
+                    ) : (
+                      <Save size={13} />
+                    )}
+                    {profile.library_id ? '更新常用库' : '保存到常用库'}
+                  </button>
+                  {profile.library_id && (
+                    <span className="profile-linked-note">
+                      <Check size={12} />
+                      已关联
+                    </span>
                   )}
                 </div>
-              )}
-              <div className="capability-row">
                 <label>
+                  显示名称
                   <input
-                    type="checkbox"
-                    checked={profile.capabilities.structured_output}
+                    value={profile.name ?? ''}
                     onChange={(event) =>
                       updateProfile(profile.id, (current) => ({
                         ...current,
-                        capabilities: {
-                          ...current.capabilities,
-                          structured_output: event.target.checked,
-                        },
+                        name: event.target.value,
                       }))
                     }
                   />
-                  Structured JSON
                 </label>
-              </div>
-            </section>
-          )
-        })}
+                <label>
+                  Base URL
+                  <input
+                    value={profile.base_url}
+                    onChange={(event) =>
+                      updateProfile(profile.id, (current) => ({
+                        ...current,
+                        base_url: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <div className="two-column-fields">
+                  <label>
+                    Model
+                    <input
+                      value={profile.model}
+                      onChange={(event) =>
+                        updateProfile(profile.id, (current) => ({
+                          ...current,
+                          model: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    Temperature
+                    <input
+                      type="number"
+                      step="0.1"
+                      min={0}
+                      max={2}
+                      value={profile.request.temperature}
+                      onChange={(event) =>
+                        updateProfile(profile.id, (current) => ({
+                          ...current,
+                          request: {
+                            ...current.request,
+                            temperature: Number(event.target.value),
+                          },
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+                {!local && (
+                  <div className="secret-row">
+                    <input
+                      type="password"
+                      value={secretDrafts[profile.id] ?? ''}
+                      placeholder={
+                        status?.configured
+                          ? usingLibrarySecret
+                            ? '输入项目密钥以覆盖常用库密钥'
+                            : '输入新密钥以替换'
+                          : '输入 API Key'
+                      }
+                      onChange={(event) =>
+                        setSecretDrafts((current) => ({
+                          ...current,
+                          [profile.id]: event.target.value,
+                        }))
+                      }
+                    />
+                    <button
+                      className="small-button accent"
+                      disabled={
+                        dirty ||
+                        keySaving === profile.id ||
+                        profileDeleting === profile.id
+                      }
+                      onClick={() => saveSecret(profile.id)}
+                      title={dirty ? '先保存 Profile 配置' : '保存项目密钥'}
+                    >
+                      {keySaving === profile.id ? (
+                        <LoaderCircle size={13} className="spin" />
+                      ) : (
+                        <KeyRound size={13} />
+                      )}
+                      保存
+                    </button>
+                    {status?.configured && !usingLibrarySecret && (
+                      <button
+                        className="icon-button danger"
+                        disabled={profileDeleting === profile.id}
+                        onClick={() => deleteSecret(profile.id)}
+                        title="删除项目密钥"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    )}
+                  </div>
+                )}
+                <div className="capability-row">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={profile.capabilities.structured_output}
+                      onChange={(event) =>
+                        updateProfile(profile.id, (current) => ({
+                          ...current,
+                          capabilities: {
+                            ...current.capabilities,
+                            structured_output: event.target.checked,
+                          },
+                        }))
+                      }
+                    />
+                    Structured JSON
+                  </label>
+                </div>
+              </section>
+            )
+          })}
+        </section>
       </div>
     )
   }
@@ -2244,11 +2985,16 @@ function App() {
       className={classNames(
         'app-shell',
         drawerOpen ? 'drawer-open' : 'drawer-closed',
+        leftPanelOpen ? 'left-open' : 'left-closed',
         inspectorOpen ? 'inspector-open' : 'inspector-closed',
+        resizingLeft && 'left-resizing',
+        resizingDrawer && 'drawer-resizing',
         resizingInspector && 'inspector-resizing',
       )}
       style={
         {
+          '--left-width': `${leftPanelWidth}px`,
+          '--drawer-height': `${drawerHeight}px`,
           '--inspector-width': `${inspectorWidth}px`,
         } as CSSProperties
       }
@@ -2320,141 +3066,186 @@ function App() {
         </div>
       )}
 
-      <aside className="left-panel">
-        <section className="panel-section projects-section">
-          <div className="panel-heading">
-            <span>项目</span>
-            <button
-              className="icon-button"
-              title="新建项目"
-              onClick={() => setNewProjectOpen(true)}
-            >
-              <FolderPlus size={15} />
-            </button>
-          </div>
-          <div className="project-list">
-            {projectsQuery.data?.map((project) => (
-              <button
-                key={project.id}
-                className={project.id === projectId ? 'active' : ''}
-                onClick={() => changeProject(project.id)}
-              >
-                <Folder size={14} />
-                <span>
-                  <strong>{project.name}</strong>
-                  <small>r{project.revision}</small>
-                </span>
-              </button>
-            ))}
-          </div>
-          {newProjectOpen && (
-            <div className="inline-create">
-              <input
-                autoFocus
-                value={newProjectName}
-                placeholder="项目名称"
-                onChange={(event) => setNewProjectName(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') void createProject()
-                  if (event.key === 'Escape') setNewProjectOpen(false)
-                }}
-              />
-              <button className="icon-button" onClick={createProject}>
-                <Check size={14} />
-              </button>
-              <button
-                className="icon-button"
-                onClick={() => setNewProjectOpen(false)}
-              >
-                <X size={14} />
-              </button>
-            </div>
-          )}
-        </section>
+      <aside
+        id="left-panel"
+        className={classNames('left-panel', !leftPanelOpen && 'collapsed')}
+      >
+        {leftPanelOpen ? (
+          <>
+            <div
+              className="left-resize-handle"
+              role="separator"
+              aria-label="调整导航栏宽度"
+              aria-orientation="vertical"
+              aria-valuemin={LEFT_PANEL_MIN_WIDTH}
+              aria-valuemax={LEFT_PANEL_MAX_WIDTH}
+              aria-valuenow={leftPanelWidth}
+              tabIndex={0}
+              onKeyDown={resizeLeftWithKeyboard}
+              onPointerDown={startLeftResize}
+              onPointerMove={moveLeftResize}
+              onPointerUp={finishLeftResize}
+              onPointerCancel={finishLeftResize}
+              onLostPointerCapture={finishLeftResize}
+            />
+            <section className="panel-section projects-section">
+              <div className="panel-heading">
+                <span>项目</span>
+                <div className="panel-heading-actions">
+                  <button
+                    className="icon-button"
+                    title="新建项目"
+                    onClick={() => setNewProjectOpen(true)}
+                  >
+                    <FolderPlus size={15} />
+                  </button>
+                  <button
+                    className="icon-button"
+                    title="收起导航栏"
+                    aria-controls="left-panel"
+                    onClick={() => setLeftPanelOpen(false)}
+                  >
+                    <PanelLeftClose size={15} />
+                  </button>
+                </div>
+              </div>
+              <div className="project-list">
+                {projectsQuery.data?.map((project) => (
+                  <button
+                    key={project.id}
+                    className={project.id === projectId ? 'active' : ''}
+                    onClick={() => changeProject(project.id)}
+                  >
+                    <Folder size={14} />
+                    <span>
+                      <strong>{project.name}</strong>
+                      <small>r{project.revision}</small>
+                    </span>
+                  </button>
+                ))}
+              </div>
+              {newProjectOpen && (
+                <div className="inline-create">
+                  <input
+                    autoFocus
+                    value={newProjectName}
+                    placeholder="项目名称"
+                    onChange={(event) => setNewProjectName(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') void createProject()
+                      if (event.key === 'Escape') setNewProjectOpen(false)
+                    }}
+                  />
+                  <button className="icon-button" onClick={createProject}>
+                    <Check size={14} />
+                  </button>
+                  <button
+                    className="icon-button"
+                    onClick={() => setNewProjectOpen(false)}
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              )}
+            </section>
 
-        <section className="panel-section">
-          <div className="panel-heading">
-            <span>节点库</span>
-            <button className="icon-button" onClick={addAgent}>
-              <Plus size={15} />
+            <section className="panel-section">
+              <div className="panel-heading">
+                <span>节点库</span>
+                <button className="icon-button" onClick={addAgent}>
+                  <Plus size={15} />
+                </button>
+              </div>
+              <button className="palette-agent" onClick={addAgent}>
+                <span className="agent-icon">
+                  <Bot size={15} />
+                </span>
+                <span>
+                  <strong>Agent</strong>
+                  <small>OpenAI Compatible</small>
+                </span>
+                <Plus size={14} />
+              </button>
+            </section>
+
+            <section className="panel-section run-panel">
+              <div className="panel-heading">
+                <span>运行输入</span>
+                <Activity size={14} />
+              </div>
+              <div className="run-inputs">
+                {draft?.sdl.workflow.inputs.map((input) => (
+                  <label key={input.name}>
+                    <span>
+                      {input.name}
+                      <small>{input.type}</small>
+                    </span>
+                    {input.type === 'TEXT' || input.type === 'MIXED' ? (
+                      <textarea
+                        rows={3}
+                        value={runInputs[input.name] ?? ''}
+                        onChange={(event) =>
+                          setRunInputs((current) => ({
+                            ...current,
+                            [input.name]: event.target.value,
+                          }))
+                        }
+                      />
+                    ) : (
+                      <textarea
+                        rows={3}
+                        value={runInputs[input.name] ?? '{}'}
+                        onChange={(event) =>
+                          setRunInputs((current) => ({
+                            ...current,
+                            [input.name]: event.target.value,
+                          }))
+                        }
+                      />
+                    )}
+                  </label>
+                ))}
+              </div>
+              <div className="run-summary">
+                <span
+                  className={`run-status status-${currentRun?.status ?? 'idle'}`}
+                >
+                  <CirclePlay size={13} />
+                  {currentRun ? runStatusLabel(currentRun.status) : '未运行'}
+                </span>
+                <span>{tokenUsage.toLocaleString()} tokens</span>
+              </div>
+              <div className="run-history">
+                {runsQuery.data?.slice(0, 4).map((run) => (
+                  <button
+                    key={run.run_id}
+                    className={currentRun?.run_id === run.run_id ? 'active' : ''}
+                    onClick={() => loadRun(run)}
+                  >
+                    <span className={`run-dot dot-${run.status}`} />
+                    <span>{formatTime(run.created_at)}</span>
+                    <small>{runStatusLabel(run.status)}</small>
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            <button className="delete-project" onClick={deleteProject}>
+              <Trash2 size={14} />
+              删除项目
             </button>
-          </div>
-          <button className="palette-agent" onClick={addAgent}>
-            <span className="agent-icon">
-              <Bot size={15} />
-            </span>
-            <span>
-              <strong>Agent</strong>
-              <small>OpenAI Compatible</small>
-            </span>
-            <Plus size={14} />
+          </>
+        ) : (
+          <button
+            className="left-expand"
+            title="展开导航栏"
+            aria-controls="left-panel"
+            onClick={() => setLeftPanelOpen(true)}
+          >
+            <PanelLeftOpen size={16} />
+            <span>导航</span>
           </button>
-        </section>
-
-        <section className="panel-section run-panel">
-          <div className="panel-heading">
-            <span>运行输入</span>
-            <Activity size={14} />
-          </div>
-          <div className="run-inputs">
-            {draft?.sdl.workflow.inputs.map((input) => (
-              <label key={input.name}>
-                <span>
-                  {input.name}
-                  <small>{input.type}</small>
-                </span>
-                {input.type === 'TEXT' || input.type === 'MIXED' ? (
-                  <textarea
-                    rows={3}
-                    value={runInputs[input.name] ?? ''}
-                    onChange={(event) =>
-                      setRunInputs((current) => ({
-                        ...current,
-                        [input.name]: event.target.value,
-                      }))
-                    }
-                  />
-                ) : (
-                  <textarea
-                    rows={3}
-                    value={runInputs[input.name] ?? '{}'}
-                    onChange={(event) =>
-                      setRunInputs((current) => ({
-                        ...current,
-                        [input.name]: event.target.value,
-                      }))
-                    }
-                  />
-                )}
-              </label>
-            ))}
-          </div>
-          <div className="run-summary">
-            <span className={`run-status status-${currentRun?.status ?? 'idle'}`}>
-              <CirclePlay size={13} />
-              {currentRun ? runStatusLabel(currentRun.status) : '未运行'}
-            </span>
-            <span>{tokenUsage.toLocaleString()} tokens</span>
-          </div>
-          <div className="run-history">
-            {runsQuery.data?.slice(0, 4).map((run) => (
-              <button
-                key={run.run_id}
-                className={currentRun?.run_id === run.run_id ? 'active' : ''}
-                onClick={() => loadRun(run)}
-              >
-                <span className={`run-dot dot-${run.status}`} />
-                <span>{formatTime(run.created_at)}</span>
-                <small>{runStatusLabel(run.status)}</small>
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <button className="delete-project" onClick={deleteProject}>
-          <Trash2 size={14} />
-          删除项目
-        </button>
+        )}
       </aside>
 
       <main className="canvas-panel">
@@ -2550,7 +3341,25 @@ function App() {
         )}
       </aside>
 
-      <section className="bottom-drawer">
+      <section id="drawer-panel" className="bottom-drawer">
+        {drawerOpen && (
+          <div
+            className="drawer-resize-handle"
+            role="separator"
+            aria-label="调整底部面板高度"
+            aria-orientation="horizontal"
+            aria-valuemin={DRAWER_MIN_HEIGHT}
+            aria-valuemax={DRAWER_MAX_HEIGHT}
+            aria-valuenow={drawerHeight}
+            tabIndex={0}
+            onKeyDown={resizeDrawerWithKeyboard}
+            onPointerDown={startDrawerResize}
+            onPointerMove={moveDrawerResize}
+            onPointerUp={finishDrawerResize}
+            onPointerCancel={finishDrawerResize}
+            onLostPointerCapture={finishDrawerResize}
+          />
+        )}
         <div className="drawer-tabs">
           {(
             [
@@ -2575,6 +3384,7 @@ function App() {
           <button
             className="drawer-toggle"
             title={drawerOpen ? '收起面板' : '展开面板'}
+            aria-controls="drawer-panel"
             onClick={() => setDrawerOpen(!drawerOpen)}
           >
             {drawerOpen ? (

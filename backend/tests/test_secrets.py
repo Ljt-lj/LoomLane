@@ -48,6 +48,57 @@ def test_store_uses_keyring_when_available(
     assert not store.fallback_path.exists()
 
 
+def test_library_credentials_are_separate_from_project_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entries: dict[tuple[str, str], str] = {}
+
+    monkeypatch.setattr(
+        secrets.keyring,
+        "set_password",
+        lambda service, account, payload: entries.__setitem__(
+            (service, account), payload
+        ),
+    )
+    monkeypatch.setattr(
+        secrets.keyring,
+        "get_password",
+        lambda service, account: entries.get((service, account)),
+    )
+    monkeypatch.setattr(
+        secrets.keyring,
+        "delete_password",
+        lambda service, account: entries.pop((service, account), None),
+    )
+    store = CredentialStore(fallback_path=tmp_path / "credentials.dpapi")
+
+    status = store.put_library(
+        "deepseek-flash",
+        "library-secret",
+        "https://api.deepseek.com/v1",
+    )
+
+    assert status.scope == "library"
+    assert store.get_library(
+        "deepseek-flash",
+        "https://api.deepseek.com/v1",
+    ) == "library-secret"
+    assert store.get(
+        "project",
+        "deepseek-flash",
+        "https://api.deepseek.com/v1",
+    ) is None
+    assert ("LoomLane", "@library/deepseek-flash") in entries
+
+    store.delete_library("deepseek-flash")
+
+    assert store.get_library(
+        "deepseek-flash",
+        "https://api.deepseek.com/v1",
+    ) is None
+
+
 def test_store_uses_encrypted_fallback_when_keyring_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -1,4 +1,5 @@
 import type {
+  ApiProfile,
   GenerateResponse,
   ProjectDetail,
   ProjectSummary,
@@ -86,6 +87,56 @@ export const api = {
 
   deleteProject: (projectId: string) =>
     request<void>(`/api/projects/${projectId}`, { method: 'DELETE' }),
+
+  listApiProfiles: () => request<ApiProfile[]>('/api/api-profiles'),
+
+  createApiProfile: (profile: ApiProfile) =>
+    request<ApiProfile>('/api/api-profiles', {
+      method: 'POST',
+      body: JSON.stringify(profile),
+    }),
+
+  updateApiProfile: (profileId: string, profile: ApiProfile) =>
+    request<ApiProfile>(`/api/api-profiles/${profileId}`, {
+      method: 'PUT',
+      body: JSON.stringify(profile),
+    }),
+
+  deleteApiProfile: (profileId: string) =>
+    request<void>(`/api/api-profiles/${profileId}`, { method: 'DELETE' }),
+
+  apiProfileSecretStatus: (profileId: string) =>
+    request<SecretStatus>(`/api/api-profiles/${profileId}/secret/status`),
+
+  putApiProfileSecret: (
+    profileId: string,
+    apiKey: string,
+  ) =>
+    request<SecretStatus>(`/api/api-profiles/${profileId}/secret`, {
+      method: 'PUT',
+      body: JSON.stringify({ api_key: apiKey }),
+    }),
+
+  deleteApiProfileSecret: (profileId: string) =>
+    request<void>(`/api/api-profiles/${profileId}/secret`, {
+      method: 'DELETE',
+    }),
+
+  importProjectSecret: (
+    libraryProfileId: string,
+    projectId: string,
+    projectProfileId: string,
+  ) =>
+    request<SecretStatus>(
+      `/api/api-profiles/${libraryProfileId}/secret/import-from-project`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: projectId,
+          profile_id: projectProfileId,
+        }),
+      },
+    ),
 
   validate: (projectId: string, sdl: SDL) =>
     request<ValidationResponse>(`/api/projects/${projectId}/validate`, {

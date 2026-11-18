@@ -173,6 +173,9 @@ class CredentialStore:
     def _account(self, project_id: str, profile_id: str) -> str:
         return f"{project_id}/{profile_id}"
 
+    def _library_account(self, profile_id: str) -> str:
+        return f"@library/{profile_id}"
+
     def _read_fallback_entries(self) -> dict[str, str]:
         if not self.fallback_path.exists():
             return {}
@@ -241,12 +244,13 @@ class CredentialStore:
                 ) from exc
         return True
 
-    def put(
+    def _put_account(
         self,
-        project_id: str,
+        account: str,
         profile_id: str,
         api_key: str,
         base_url: str,
+        scope: str,
     ) -> SecretStatus:
         origin = normalize_origin(base_url)
         payload = json.dumps(
@@ -257,30 +261,35 @@ class CredentialStore:
         try:
             keyring.set_password(
                 self.service_name,
-                self._account(project_id, profile_id),
+                account,
                 payload,
             )
         except Exception:
             try:
-                self._put_fallback(self._account(project_id, profile_id), payload)
+                self._put_fallback(account, payload)
             except CredentialError as fallback_exc:
                 raise CredentialError(
                     "System credential vault and encrypted local fallback "
                     "are both unavailable"
                 ) from fallback_exc
-        return SecretStatus(profile_id=profile_id, configured=True, origin=origin)
+        return SecretStatus(
+            profile_id=profile_id,
+            configured=True,
+            origin=origin,
+            scope=scope,
+        )
 
-    def _read(self, project_id: str, profile_id: str) -> CredentialRecord | None:
+    def _read_account(self, account: str) -> CredentialRecord | None:
         payload = None
         try:
             payload = keyring.get_password(
                 self.service_name,
-                self._account(project_id, profile_id),
+                account,
             )
         except Exception:
             pass
         if not payload:
-            payload = self._get_fallback(self._account(project_id, profile_id))
+            payload = self._get_fallback(account)
         if not payload:
             return None
         try:
@@ -293,13 +302,48 @@ class CredentialStore:
             raise CredentialError("Stored credential record is malformed")
         return CredentialRecord(api_key=api_key, origin=origin)
 
+    def put(
+        self,
+        project_id: str,
+        profile_id: str,
+        api_key: str,
+        base_url: str,
+    ) -> SecretStatus:
+        return self._put_account(
+            self._account(project_id, profile_id),
+            profile_id,
+            api_key,
+            base_url,
+            "project",
+        )
+
+    def put_library(
+        self,
+        profile_id: str,
+        api_key: str,
+        base_url: str,
+    ) -> SecretStatus:
+        return self._put_account(
+            self._library_account(profile_id),
+            profile_id,
+            api_key,
+            base_url,
+            "library",
+        )
+
     def get(
         self,
         project_id: str,
         profile_id: str,
         base_url: str,
     ) -> str | None:
-        record = self._read(project_id, profile_id)
+        record = self._read_account(self._account(project_id, profile_id))
+        if record is None or record.origin != normalize_origin(base_url):
+            return None
+        return record.api_key
+
+    def get_library(self, profile_id: str, base_url: str) -> str | None:
+        record = self._read_account(self._library_account(profile_id))
         if record is None or record.origin != normalize_origin(base_url):
             return None
         return record.api_key
@@ -310,30 +354,69 @@ class CredentialStore:
         profile_id: str,
         base_url: str,
     ) -> SecretStatus:
+        return self._status_account(
+            self._account(project_id, profile_id),
+            profile_id,
+            base_url,
+            "project",
+        )
+
+    def status_library(self, profile_id: str, base_url: str) -> SecretStatus:
+        return self._status_account(
+            self._library_account(profile_id),
+            profile_id,
+            base_url,
+            "library",
+        )
+
+    def _status_account(
+        self,
+        account: str,
+        profile_id: str,
+        base_url: str,
+        scope: str,
+    ) -> SecretStatus:
         origin = normalize_origin(base_url)
-        record = self._read(project_id, profile_id)
+        record = self._read_account(account)
         configured = record is not None and record.origin == origin
         return SecretStatus(
             profile_id=profile_id,
             configured=configured,
             origin=origin,
+            scope=scope,
         )
 
     def delete(self, project_id: str, profile_id: str) -> None:
+        self._delete_account(self._account(project_id, profile_id))
+
+    def delete_library(self, profile_id: str) -> None:
+        self._delete_account(self._library_account(profile_id))
+
+    def copy_to_library(
+        self,
+        project_id: str,
+        profile_id: str,
+        library_id: str,
+        base_url: str,
+    ) -> SecretStatus | None:
+        record = self._read_account(self._account(project_id, profile_id))
+        if record is None or record.origin != normalize_origin(base_url):
+            return None
+        return self.put_library(library_id, record.api_key, base_url)
+
+    def _delete_account(self, account: str) -> None:
         keyring_available = False
         try:
             keyring.delete_password(
                 self.service_name,
-                self._account(project_id, profile_id),
+                account,
             )
             keyring_available = True
         except keyring.errors.PasswordDeleteError:
             keyring_available = True
         except Exception:
             pass
-        fallback_deleted = self._delete_fallback(
-            self._account(project_id, profile_id)
-        )
+        fallback_deleted = self._delete_fallback(account)
         if not keyring_available and not fallback_deleted:
             raise CredentialError(
                 "System credential vault is unavailable and no encrypted "

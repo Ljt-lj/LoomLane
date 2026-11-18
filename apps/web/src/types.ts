@@ -44,6 +44,7 @@ export interface WorkflowMeta {
 
 export interface ApiProfile {
   id: string
+  library_id?: string | null
   name?: string | null
   provider: 'openai_compatible'
   base_url: string
@@ -201,6 +202,7 @@ export interface SecretStatus {
   profile_id: string
   configured: boolean
   origin: string | null
+  scope?: 'project' | 'library' | null
 }
 
 export interface GenerateResponse {

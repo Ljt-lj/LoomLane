@@ -143,6 +143,11 @@ class RunManager:
                     profile.id,
                     profile.base_url,
                 )
+                if not api_key and profile.library_id:
+                    api_key = self.credentials.get_library(
+                        profile.library_id,
+                        profile.base_url,
+                    )
             except CredentialError as exc:
                 raise RunConfigurationError(str(exc)) from exc
             if api_key:
