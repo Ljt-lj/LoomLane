@@ -6,13 +6,17 @@ LoomLane 是一个本地优先的多 Agent 流水线可视化编排与编译系�
 
 - 使用 React Flow 编辑 Agent、端口、连线和反馈边。
 - 支持 `PIPE`、`CONDITIONAL`、`FEEDBACK` 三类边。
+- 右侧检查器支持最小化收纳和 `300-560px` 宽度调节，并记忆上次 UI 状态。
+- 支持 Agent、边和 API Profile 删除；删除 Agent 会清理关联边和工作流输出，删除 Profile 会迁移或阻止仍被引用的 Agent。
+- 条件编辑器支持 `AND`、`OR`、`NOT`、多谓词嵌套、删除和高级 JSON 编辑。
+- 每个 Agent 可独立启用层次化 JSON 输出模板，并通过 `response_format={"type":"json_object"}` 约束模型返回 JSON。
 - 以 `workflow.sdl.yaml` 作为唯一业务语义真源，`canvas.json` 只保存布局。
 - 支持 SDL 编辑、导入、导出、结构校验和语义校验。
 - 从 SDL 确定性生成可独立运行的 Python 工作流项目。
 - 通过 OpenAI 兼容的 `/chat/completions` 接口执行 Agent。
 - 通过 NDJSON 和 SSE 回传节点、边、Token 用量和运行错误。
 - 保存运行历史、事件和结果，并支持取消运行。
-- API Key 存储在操作系统凭据库，不进入 SDL、项目文件或生成代码。
+- API Key 优先存储在操作系统凭据库；Windows 凭据库不可用时，使用当前用户 DPAPI 加密的本地回退文件。密钥不进入 SDL、项目文件或生成代码。
 - 提供桌面和移动端自适应工作界面。
 
 ## 仓库结构
@@ -34,7 +38,7 @@ LoomLane/
 - Python 3.12
 - Node.js 20+
 - pnpm 10+，推荐使用 pnpm 11
-- 可用的操作系统凭据库，例如 Windows Credential Manager、macOS Keychain 或 Linux Secret Service
+- 操作系统凭据库，例如 Windows Credential Manager、macOS Keychain 或 Linux Secret Service。Windows 上凭据库不可用时会自动使用 DPAPI 加密回退。
 
 ## 安装
 
@@ -77,7 +81,9 @@ pnpm --dir apps/web dev
 5. 在运行输入中填写工作流启动节点所需的输入，点击“运行”。
 6. 在画布和历史面板查看节点、边、Token 用量、错误与最终结果。
 
-API Key 按项目 ID 和 Profile ID 隔离，并绑定 Profile 的 `base_url` origin。修改 origin 后，旧密钥会被视为未配置。
+API Key 按项目 ID 和 Profile ID 隔离，并绑定 Profile 的 `base_url` origin。修改 origin 后，旧密钥会被视为未配置。Windows 上若系统凭据库写入失败，LoomLane 会把密钥保存到 `workspace/credentials.dpapi`；该文件使用当前 Windows 用户的 DPAPI 加密，`workspace/` 默认不进入 Git。
+
+修改 Pydantic 模型、SDL 字段或生成模板后必须重启后端；如果保存时出现 `422 extra_forbidden`，通常说明后端仍在运行旧代码。更多配置格式和排障步骤见 [docs/initial-technical-plan.md](docs/initial-technical-plan.md)。
 
 ## 本地数据
 

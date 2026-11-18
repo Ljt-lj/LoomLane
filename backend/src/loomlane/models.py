@@ -99,6 +99,11 @@ class AgentLimits(StrictModel):
     max_tokens: int | None = Field(default=None, ge=1)
 
 
+class AgentJsonOutput(StrictModel):
+    enabled: bool = False
+    template: dict[str, Any] = Field(default_factory=dict)
+
+
 class Agent(StrictModel):
     id: str
     name: str
@@ -107,6 +112,7 @@ class Agent(StrictModel):
     inputs: list[Port] = Field(default_factory=list)
     outputs: list[Port] = Field(default_factory=list)
     limits: AgentLimits = Field(default_factory=AgentLimits)
+    json_output: AgentJsonOutput = Field(default_factory=AgentJsonOutput)
     output_dir: str | None = None
 
 

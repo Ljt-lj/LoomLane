@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from loomlane.condition import ConditionReferences, validate_condition
+from loomlane.condition import (
+    ConditionReferences,
+    evaluate_condition,
+    validate_condition,
+)
 from loomlane.models import Condition, EdgeGuard
 from loomlane.storage import default_sdl
 from loomlane.validator import validate_sdl
@@ -101,6 +105,42 @@ def test_condition_rejects_unlisted_paths() -> None:
     errors = validate_condition(condition, references)
 
     assert any("invalid agent output path" in error for error in errors)
+
+
+def test_multi_predicate_condition_validates_and_evaluates() -> None:
+    condition = Condition(
+        op="and",
+        args=[
+            Condition(
+                op="lt",
+                left="$.agents.reviewer.outputs.score",
+                right=0.8,
+            ),
+            Condition(
+                op="lt",
+                left="$.edges.review-feedback.traversals",
+                right=3,
+            ),
+        ],
+    )
+    references = ConditionReferences(
+        agents={"reviewer"},
+        agent_ports={("reviewer", "score")},
+        workflow_inputs=set(),
+        edges={"review-feedback"},
+        run_fields={"step"},
+    )
+
+    errors = validate_condition(condition, references)
+    root = {
+        "agents": {"reviewer": {"outputs": {"score": 0.72}}},
+        "edges": {"review-feedback": {"traversals": 2}},
+    }
+
+    assert errors == []
+    assert evaluate_condition(condition, root)
+    root["edges"]["review-feedback"]["traversals"] = 3
+    assert not evaluate_condition(condition, root)
 
 
 def test_port_type_mismatch_is_rejected() -> None:

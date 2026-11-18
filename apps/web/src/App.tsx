@@ -35,6 +35,8 @@ import {
   LoaderCircle,
   PanelBottomClose,
   PanelBottomOpen,
+  PanelRightClose,
+  PanelRightOpen,
   Play,
   Plus,
   RefreshCw,
@@ -48,6 +50,9 @@ import {
   X,
 } from 'lucide-react'
 import {
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -60,6 +65,8 @@ import {
   type AgentFlowNode,
   type NodeRunStatus,
 } from './AgentNode'
+import ConditionEditor from './ConditionEditor'
+import JsonOutputEditor from './JsonOutputEditor'
 import type {
   Agent,
   ApiProfile,
@@ -78,6 +85,8 @@ import type {
   WorkflowEdge,
 } from './types'
 import {
+  INSPECTOR_MAX_WIDTH,
+  INSPECTOR_MIN_WIDTH,
   useUiStore,
   type DrawerTab,
   type InspectorTab,
@@ -86,6 +95,7 @@ import {
   conditionPaths,
   defaultCondition,
   firstCompatibleMapping,
+  removeApiProfile,
   uniqueId,
 } from './workflow-utils'
 
@@ -309,41 +319,19 @@ function SdlEditor({
   )
 }
 
-function LiteralValue({
-  value,
-  onChange,
-}: {
-  value: unknown
-  onChange: (value: unknown) => void
-}) {
-  const [text, setText] = useState(() => String(value ?? ''))
-  useEffect(() => setText(String(value ?? '')), [value])
-  return (
-    <input
-      value={text}
-      onChange={(event) => {
-        const next = event.target.value
-        setText(next)
-        if (next === 'true') onChange(true)
-        else if (next === 'false') onChange(false)
-        else if (next === 'null') onChange(null)
-        else if (next !== '' && !Number.isNaN(Number(next))) onChange(Number(next))
-        else onChange(next)
-      }}
-      placeholder="比较值"
-    />
-  )
-}
-
 function App() {
   const queryClient = useQueryClient()
   const {
     drawerTab,
     inspectorTab,
     drawerOpen,
+    inspectorOpen,
+    inspectorWidth,
     setDrawerTab,
     setInspectorTab,
     setDrawerOpen,
+    setInspectorOpen,
+    setInspectorWidth,
   } = useUiStore()
   const [projectId, setProjectId] = useState<string | null>(null)
   const [draft, setDraft] = useState<ProjectDetail | null>(null)
@@ -373,10 +361,61 @@ function App() {
   >({})
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
   const [keySaving, setKeySaving] = useState<string | null>(null)
+  const [profileDeleting, setProfileDeleting] = useState<string | null>(null)
   const [generatedFiles, setGeneratedFiles] = useState<string[]>([])
   const eventSourceRef = useRef<EventSource | null>(null)
   const noticeTimerRef = useRef<number | null>(null)
   const viewportRef = useRef<Viewport | null>(null)
+  const inspectorResizeRef = useRef<{
+    startX: number
+    startWidth: number
+  } | null>(null)
+  const [resizingInspector, setResizingInspector] = useState(false)
+
+  function startInspectorResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return
+    event.preventDefault()
+    inspectorResizeRef.current = {
+      startX: event.clientX,
+      startWidth: inspectorWidth,
+    }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    setResizingInspector(true)
+  }
+
+  function moveInspectorResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = inspectorResizeRef.current
+    if (!drag) return
+    setInspectorWidth(drag.startWidth + drag.startX - event.clientX)
+  }
+
+  function finishInspectorResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!inspectorResizeRef.current) return
+    inspectorResizeRef.current = null
+    setResizingInspector(false)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  function resizeInspectorWithKeyboard(
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) {
+    const step = 12
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault()
+      setInspectorWidth(inspectorWidth + step)
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault()
+      setInspectorWidth(inspectorWidth - step)
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      setInspectorWidth(INSPECTOR_MIN_WIDTH)
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      setInspectorWidth(INSPECTOR_MAX_WIDTH)
+    }
+  }
 
   const projectsQuery = useQuery({
     queryKey: ['projects'],
@@ -886,7 +925,7 @@ function App() {
       const status = await api.putSecret(draft.id, profileId, apiKey)
       setSecretStatuses((current) => ({ ...current, [profileId]: status }))
       setSecretDrafts((current) => ({ ...current, [profileId]: '' }))
-      showNotice('success', '密钥已写入系统凭据库')
+      showNotice('success', '密钥已安全保存')
     } catch (error) {
       showNotice('error', error instanceof Error ? error.message : '密钥保存失败')
     } finally {
@@ -909,6 +948,68 @@ function App() {
       showNotice('info', '密钥已移除')
     } catch (error) {
       showNotice('error', error instanceof Error ? error.message : '密钥删除失败')
+    }
+  }
+
+  async function deleteApiProfile(profile: ApiProfile) {
+    if (!draft) return
+    const removal = removeApiProfile(draft.sdl, profile.id)
+    if (removal.kind === 'blocked') {
+      showNotice(
+        'error',
+        removal.reason === 'only-referenced-profile'
+          ? `“${profile.name || profile.id}”正被 ${removal.referencedAgentIds.length} 个 Agent 使用。请先新增其他 Profile 再删除。`
+          : 'Profile 不存在，请刷新项目后重试。',
+      )
+      return
+    }
+
+    const replacement = removal.replacementProfileId
+      ? draft.sdl.api_profiles.find(
+          (item) => item.id === removal.replacementProfileId,
+        )
+      : null
+    const referenceMessage = replacement
+      ? `，${removal.referencedAgentIds.length} 个 Agent 将切换到“${replacement.name || replacement.id}”`
+      : ''
+    const secretMessage = secretStatuses[profile.id]?.configured
+      ? '，并移除已保存的密钥'
+      : ''
+    if (
+      !window.confirm(
+        `删除 Profile“${profile.name || profile.id}”${referenceMessage}${secretMessage}？`,
+      )
+    ) {
+      return
+    }
+
+    setProfileDeleting(profile.id)
+    try {
+      if (secretStatuses[profile.id]?.configured) {
+        await api.deleteSecret(draft.id, profile.id)
+      }
+      updateWorkflow((sdl) => {
+        const result = removeApiProfile(sdl, profile.id)
+        return result.kind === 'removed' ? result.sdl : sdl
+      })
+      setSecretStatuses((current) => {
+        const next = { ...current }
+        delete next[profile.id]
+        return next
+      })
+      setSecretDrafts((current) => {
+        const next = { ...current }
+        delete next[profile.id]
+        return next
+      })
+      showNotice('success', 'Profile 已从草稿中删除，保存项目后生效')
+    } catch (error) {
+      showNotice(
+        'error',
+        error instanceof Error ? error.message : 'Profile 删除失败',
+      )
+    } finally {
+      setProfileDeleting(null)
     }
   }
 
@@ -1067,6 +1168,24 @@ function App() {
     setSelection(null)
   }
 
+  function deleteSelection() {
+    if (selectedAgent) {
+      if (
+        !window.confirm(
+          `删除 Agent “${selectedAgent.name}” 及与它相连的所有边？`,
+        )
+      ) {
+        return
+      }
+      onNodesDelete(nodes.filter((node) => node.id === selectedAgent.id))
+      return
+    }
+    if (selectedEdge) {
+      if (!window.confirm(`删除连线 “${selectedEdge.id}”？`)) return
+      onEdgesDelete(edges.filter((edge) => edge.id === selectedEdge.id))
+    }
+  }
+
   function addAgent() {
     if (!draft) return
     const id = uniqueId(
@@ -1089,6 +1208,7 @@ function App() {
       inputs: [{ name: 'input', type: 'TEXT', required: true }],
       outputs: [{ name: 'output', type: 'TEXT' }],
       limits: { max_tokens: null },
+      json_output: { enabled: false, template: {} },
       output_dir: null,
     }
     updateDraft((current) => ({
@@ -1176,6 +1296,15 @@ function App() {
             {label}
           </button>
         ))}
+        <button
+          className="inspector-collapse"
+          title="收起检查器"
+          aria-label="收起检查器"
+          aria-controls="inspector-panel"
+          onClick={() => setInspectorOpen(false)}
+        >
+          <PanelRightClose size={15} />
+        </button>
       </div>
     )
   }
@@ -1252,7 +1381,17 @@ function App() {
               <span className="eyebrow">AGENT</span>
               <h2>{agent.name}</h2>
             </div>
-            <span className="id-chip">{agent.id}</span>
+            <div className="inspector-heading-actions">
+              <span className="id-chip">{agent.id}</span>
+              <button
+                className="small-button danger"
+                title="删除所选 Agent"
+                onClick={deleteSelection}
+              >
+                <Trash2 size={13} />
+                删除
+              </button>
+            </div>
           </div>
           <label>
             名称
@@ -1316,6 +1455,16 @@ function App() {
               }
             />
           </label>
+          <JsonOutputEditor
+            value={agent.json_output ?? { enabled: false, template: {} }}
+            outputNames={agent.outputs.map((port) => port.name)}
+            onChange={(jsonOutput) =>
+              updateAgent(agent.id, (current) => ({
+                ...current,
+                json_output: jsonOutput,
+              }))
+            }
+          />
           {renderPorts(agent, 'inputs')}
           {renderPorts(agent, 'outputs')}
         </div>
@@ -1333,9 +1482,19 @@ function App() {
               <span className="eyebrow">EDGE</span>
               <h2>{edge.id}</h2>
             </div>
-            <span className="id-chip">
-              {edge.from} → {edge.to}
-            </span>
+            <div className="inspector-heading-actions">
+              <span className="id-chip">
+                {edge.from} → {edge.to}
+              </span>
+              <button
+                className="small-button danger"
+                title="删除所选连线"
+                onClick={deleteSelection}
+              >
+                <Trash2 size={13} />
+                删除
+              </button>
+            </div>
           </div>
           <label>
             类型
@@ -1464,65 +1623,18 @@ function App() {
                   </button>
                 )}
               </div>
-              {edge.condition && edge.condition.op !== 'and' && edge.condition.op !== 'or' && (
-                <>
-                  <label>
-                    字段
-                    <select
-                      value={edge.condition.left ?? ''}
-                      onChange={(event) =>
-                        updateEdge(edge.id, (current) => ({
-                          ...current,
-                          condition: {
-                            ...current.condition!,
-                            left: event.target.value,
-                          },
-                        }))
-                      }
-                    >
-                      {pathOptions.map((path) => (
-                        <option key={path.value} value={path.value}>
-                          {path.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    运算符
-                    <select
-                      value={edge.condition.op}
-                      onChange={(event) =>
-                        updateEdge(edge.id, (current) => ({
-                          ...current,
-                          condition: {
-                            ...current.condition!,
-                            op: event.target.value,
-                          },
-                        }))
-                      }
-                    >
-                      {['eq', 'ne', 'lt', 'lte', 'gt', 'gte', 'contains', 'exists'].map(
-                        (operator) => (
-                          <option key={operator}>{operator}</option>
-                        ),
-                      )}
-                    </select>
-                  </label>
-                  {edge.condition.op !== 'exists' && (
-                    <label>
-                      比较值
-                      <LiteralValue
-                        value={edge.condition.right}
-                        onChange={(right) =>
-                          updateEdge(edge.id, (current) => ({
-                            ...current,
-                            condition: { ...current.condition!, right },
-                          }))
-                        }
-                      />
-                    </label>
-                  )}
-                </>
+              {edge.condition && (
+                <ConditionEditor
+                  value={edge.condition}
+                  pathOptions={pathOptions}
+                  createPredicate={() => defaultCondition(draft!.sdl)}
+                  onChange={(condition) =>
+                    updateEdge(edge.id, (current) => ({
+                      ...current,
+                      condition,
+                    }))
+                  }
+                />
               )}
               <details className="advanced-json">
                 <summary>高级条件 JSON</summary>
@@ -1938,23 +2050,44 @@ function App() {
           return (
             <section className="profile-card" key={profile.id}>
               <div className="profile-title">
-                <div>
+                <div className="profile-title-copy">
                   <strong>{profile.name || profile.id}</strong>
                   <span>{profile.id}</span>
                 </div>
-                <span
-                  className={classNames(
-                    'credential-badge',
-                    status?.configured || local ? 'ready' : 'missing',
-                  )}
-                >
-                  {status?.configured || local ? (
-                    <CheckCircle2 size={12} />
-                  ) : (
-                    <CircleAlert size={12} />
-                  )}
-                  {local ? '本地接口' : status?.configured ? '已配置' : '缺少密钥'}
-                </span>
+                <div className="profile-title-actions">
+                  <span
+                    className={classNames(
+                      'credential-badge',
+                      status?.configured || local ? 'ready' : 'missing',
+                    )}
+                  >
+                    {status?.configured || local ? (
+                      <CheckCircle2 size={12} />
+                    ) : (
+                      <CircleAlert size={12} />
+                    )}
+                    {local
+                      ? '本地接口'
+                      : status?.configured
+                        ? '已配置'
+                        : '缺少密钥'}
+                  </span>
+                  <button
+                    className="icon-button danger"
+                    aria-label="删除 Profile"
+                    disabled={
+                      profileDeleting !== null || keySaving === profile.id
+                    }
+                    onClick={() => deleteApiProfile(profile)}
+                    title="删除 Profile"
+                  >
+                    {profileDeleting === profile.id ? (
+                      <LoaderCircle size={14} className="spin" />
+                    ) : (
+                      <Trash2 size={14} />
+                    )}
+                  </button>
+                </div>
               </div>
               <label>
                 显示名称
@@ -2030,7 +2163,11 @@ function App() {
                   />
                   <button
                     className="small-button accent"
-                    disabled={dirty || keySaving === profile.id}
+                    disabled={
+                      dirty ||
+                      keySaving === profile.id ||
+                      profileDeleting === profile.id
+                    }
                     onClick={() => saveSecret(profile.id)}
                     title={dirty ? '先保存 Profile 配置' : '保存密钥'}
                   >
@@ -2044,6 +2181,7 @@ function App() {
                   {status?.configured && (
                     <button
                       className="icon-button danger"
+                      disabled={profileDeleting === profile.id}
                       onClick={() => deleteSecret(profile.id)}
                       title="删除密钥"
                     >
@@ -2106,7 +2244,14 @@ function App() {
       className={classNames(
         'app-shell',
         drawerOpen ? 'drawer-open' : 'drawer-closed',
+        inspectorOpen ? 'inspector-open' : 'inspector-closed',
+        resizingInspector && 'inspector-resizing',
       )}
+      style={
+        {
+          '--inspector-width': `${inspectorWidth}px`,
+        } as CSSProperties
+      }
     >
       <header className="topbar">
         <div className="brand">
@@ -2365,11 +2510,44 @@ function App() {
         </div>
       </main>
 
-      <aside className="inspector">
-        {renderInspectorTabs()}
-        {inspectorTab === 'selection' && renderSelectionInspector()}
-        {inspectorTab === 'workflow' && renderWorkflowInspector()}
-        {inspectorTab === 'api' && renderApiInspector()}
+      <aside
+        id="inspector-panel"
+        className={classNames('inspector', !inspectorOpen && 'collapsed')}
+      >
+        {inspectorOpen ? (
+          <>
+            <div
+              className="inspector-resize-handle"
+              role="separator"
+              aria-label="调整检查器宽度"
+              aria-orientation="vertical"
+              aria-valuemin={INSPECTOR_MIN_WIDTH}
+              aria-valuemax={INSPECTOR_MAX_WIDTH}
+              aria-valuenow={inspectorWidth}
+              tabIndex={0}
+              onKeyDown={resizeInspectorWithKeyboard}
+              onPointerDown={startInspectorResize}
+              onPointerMove={moveInspectorResize}
+              onPointerUp={finishInspectorResize}
+              onPointerCancel={finishInspectorResize}
+              onLostPointerCapture={finishInspectorResize}
+            />
+            {renderInspectorTabs()}
+            {inspectorTab === 'selection' && renderSelectionInspector()}
+            {inspectorTab === 'workflow' && renderWorkflowInspector()}
+            {inspectorTab === 'api' && renderApiInspector()}
+          </>
+        ) : (
+          <button
+            className="inspector-expand"
+            title="展开检查器"
+            aria-controls="inspector-panel"
+            onClick={() => setInspectorOpen(true)}
+          >
+            <PanelRightOpen size={16} />
+            <span>检查器</span>
+          </button>
+        )}
       </aside>
 
       <section className="bottom-drawer">

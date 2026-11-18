@@ -152,6 +152,15 @@ def default_sdl() -> SDL:
                         },
                     ],
                     "limits": {"max_tokens": None},
+                    "json_output": {
+                        "enabled": True,
+                        "template": {
+                            "draft": "完整的 Markdown 草稿文本",
+                            "outline": {
+                                "sections": "章节标题字符串数组",
+                            },
+                        },
+                    },
                     "output_dir": None,
                 },
                 {
@@ -175,6 +184,13 @@ def default_sdl() -> SDL:
                         },
                     ],
                     "limits": {"max_tokens": None},
+                    "json_output": {
+                        "enabled": True,
+                        "template": {
+                            "review": "具体、可执行的审查意见",
+                            "score": "0 到 1 之间的数字",
+                        },
+                    },
                     "output_dir": None,
                 },
             ],

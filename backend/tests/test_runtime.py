@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from loomlane.models import RunStartRequest
+from loomlane.models import AgentJsonOutput, RunStartRequest
 from loomlane.runtime import RunManager
 from loomlane.storage import ProjectStore, default_canvas, default_sdl
 
@@ -39,13 +39,13 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
         return
 
     def do_POST(self) -> None:
-        type(self).calls.append({})
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        type(self).calls.append(body)
         if type(self).forced_status is not None:
             self.send_response(type(self).forced_status)
             self.end_headers()
             return
 
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         system = body["messages"][0]["content"]
         if "审查初稿" in system:
             type(self).reviewer_calls += 1
@@ -152,4 +152,51 @@ async def test_non_retryable_4xx_is_not_retried(
     assert detail.status == "failed"
     assert len(FakeOpenAIHandler.calls) == 1
     assert any(event["type"] == "error" for event in detail.events)
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agent_json_output_enables_response_format(
+    tmp_path: Path,
+    fake_openai: str,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    sdl = default_sdl()
+    sdl.api_profiles[0].base_url = fake_openai
+    sdl.api_profiles[0].capabilities.structured_output = False
+    for agent in sdl.agents:
+        agent.json_output.enabled = False
+    sdl.agents[0].json_output = AgentJsonOutput(
+        enabled=True,
+        template={
+            "draft": "完整的 Markdown 草稿文本",
+            "outline": {"sections": "章节标题字符串数组"},
+        },
+    )
+    project = store.create("json output test", sdl, default_canvas())
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"requirement": "test"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    drafter_calls = [
+        call
+        for call in FakeOpenAIHandler.calls
+        if "Use the following JSON template" in call["messages"][0]["content"]
+    ]
+    reviewer_calls = [
+        call
+        for call in FakeOpenAIHandler.calls
+        if "审查初稿" in call["messages"][0]["content"]
+    ]
+    assert len(drafter_calls) == 2
+    assert all(call["response_format"] == {"type": "json_object"} for call in drafter_calls)
+    assert all("response_format" not in call for call in reviewer_calls)
+    assert '"sections": "章节标题字符串数组"' in drafter_calls[0]["messages"][0][
+        "content"
+    ]
     await manager.shutdown()

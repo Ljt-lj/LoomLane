@@ -62,6 +62,11 @@ export interface ApiProfile {
   note?: string | null
 }
 
+export interface AgentJsonOutput {
+  enabled: boolean
+  template: Record<string, unknown>
+}
+
 export interface Agent {
   id: string
   name: string
@@ -72,6 +77,7 @@ export interface Agent {
   limits: {
     max_tokens: number | null
   }
+  json_output: AgentJsonOutput
   output_dir: string | null
 }
 

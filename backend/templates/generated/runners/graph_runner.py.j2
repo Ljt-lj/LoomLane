@@ -126,11 +126,10 @@ def _extract_json(content: str) -> dict[str, Any]:
         value = json.loads(stripped)
     except json.JSONDecodeError:
         start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start < 0 or end <= start:
+        if start < 0:
             raise WorkflowError("Agent response did not contain a JSON object")
         try:
-            value = json.loads(stripped[start : end + 1])
+            value, _ = json.JSONDecoder().raw_decode(stripped[start:])
         except json.JSONDecodeError as exc:
             raise WorkflowError(f"Agent response contained invalid JSON: {exc}") from exc
     if not isinstance(value, dict):
@@ -184,6 +183,25 @@ def _output_contract(agent: dict[str, Any]) -> str:
     )
 
 
+def _json_output_contract(agent: dict[str, Any]) -> str | None:
+    config = agent.get("json_output") or {}
+    if not config.get("enabled"):
+        return None
+    template = config.get("template") or {}
+    if not template:
+        return (
+            "Structured output mode is enabled. "
+            "Return exactly one valid JSON object."
+        )
+    rendered = json.dumps(template, ensure_ascii=False, indent=2)
+    return (
+        "Use the following JSON template as the required response shape. "
+        "Preserve every key and nesting level. String leaves describe the "
+        "content or type to return for that field:\n"
+        f"{rendered}"
+    )
+
+
 def _system_prompt(agent: dict[str, Any]) -> str:
     global_chunk: str | None = None
     global_context = SDL["workflow"].get("global_context")
@@ -199,6 +217,9 @@ def _system_prompt(agent: dict[str, Any]) -> str:
     if global_chunk and global_context and global_context.get("injection") == "suffix":
         chunks.append(global_chunk)
     chunks.append(_output_contract(agent))
+    json_contract = _json_output_contract(agent)
+    if json_contract:
+        chunks.append(json_contract)
     return "\n\n".join(chunks)
 
 
@@ -233,7 +254,11 @@ def _call_agent(
     max_tokens = agent.get("limits", {}).get("max_tokens")
     if max_tokens:
         body["max_tokens"] = max_tokens
-    if profile.get("capabilities", {}).get("structured_output"):
+    json_output = agent.get("json_output") or {}
+    if (
+        json_output.get("enabled")
+        or profile.get("capabilities", {}).get("structured_output")
+    ):
         body["response_format"] = {"type": "json_object"}
 
     url = profile["base_url"].rstrip("/") + "/chat/completions"
