@@ -44,6 +44,7 @@ export interface WorkflowMeta {
 
 export interface ApiProfile {
   id: string
+  library_id?: string | null
   name?: string | null
   provider: 'openai_compatible'
   base_url: string
@@ -62,6 +63,11 @@ export interface ApiProfile {
   note?: string | null
 }
 
+export interface AgentJsonOutput {
+  enabled: boolean
+  template: Record<string, unknown>
+}
+
 export interface Agent {
   id: string
   name: string
@@ -72,6 +78,7 @@ export interface Agent {
   limits: {
     max_tokens: number | null
   }
+  json_output: AgentJsonOutput
   output_dir: string | null
 }
 
@@ -195,6 +202,7 @@ export interface SecretStatus {
   profile_id: string
   configured: boolean
   origin: string | null
+  scope?: 'project' | 'library' | null
 }
 
 export interface GenerateResponse {

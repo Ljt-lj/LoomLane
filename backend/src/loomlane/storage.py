@@ -13,6 +13,7 @@ import yaml
 from pydantic import ValidationError
 
 from .models import (
+    ApiProfile,
     CanvasEdge,
     CanvasLayout,
     CanvasNode,
@@ -20,7 +21,7 @@ from .models import (
     ProjectSummary,
     SDL,
 )
-from .settings import projects_dir
+from .settings import data_dir, projects_dir
 from .validator import validate_sdl
 
 
@@ -33,6 +34,14 @@ class ProjectNotFound(StorageError):
 
 
 class RevisionConflict(StorageError):
+    pass
+
+
+class ApiProfileNotFound(StorageError):
+    pass
+
+
+class ApiProfileConflict(StorageError):
     pass
 
 
@@ -152,6 +161,15 @@ def default_sdl() -> SDL:
                         },
                     ],
                     "limits": {"max_tokens": None},
+                    "json_output": {
+                        "enabled": True,
+                        "template": {
+                            "draft": "完整的 Markdown 草稿文本",
+                            "outline": {
+                                "sections": "章节标题字符串数组",
+                            },
+                        },
+                    },
                     "output_dir": None,
                 },
                 {
@@ -175,6 +193,13 @@ def default_sdl() -> SDL:
                         },
                     ],
                     "limits": {"max_tokens": None},
+                    "json_output": {
+                        "enabled": True,
+                        "template": {
+                            "review": "具体、可执行的审查意见",
+                            "score": "0 到 1 之间的数字",
+                        },
+                    },
                     "output_dir": None,
                 },
             ],
@@ -322,6 +347,103 @@ def sdl_to_yaml(sdl: SDL) -> str:
         sort_keys=False,
         default_flow_style=False,
     )
+
+
+class ApiProfileStore:
+    """Persists reusable API profile metadata outside project SDL files."""
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = (path or data_dir() / "api-profiles.json").resolve()
+        self._lock = threading.RLock()
+
+    def _read_profiles(self) -> list[ApiProfile]:
+        if not self.path.exists():
+            return []
+        try:
+            data = _read_json(self.path)
+            raw_profiles = data.get("profiles", []) if isinstance(data, dict) else data
+            if not isinstance(raw_profiles, list):
+                raise ValueError("profiles must be a list")
+            return [
+                ApiProfile.model_validate(item).model_copy(update={"library_id": None})
+                for item in raw_profiles
+            ]
+        except (OSError, TypeError, ValueError, ValidationError) as exc:
+            raise StorageError("API Profile library could not be read") from exc
+
+    def _write_profiles(self, profiles: list[ApiProfile]) -> None:
+        try:
+            _atomic_write_json(
+                self.path,
+                {
+                    "version": 1,
+                    "profiles": [
+                        profile.model_dump(
+                            mode="json",
+                            by_alias=True,
+                            exclude_none=True,
+                        )
+                        for profile in profiles
+                    ],
+                },
+            )
+        except OSError as exc:
+            raise StorageError("API Profile library could not be written") from exc
+
+    def list(self) -> list[ApiProfile]:
+        with self._lock:
+            return self._read_profiles()
+
+    def get(self, profile_id: str) -> ApiProfile:
+        with self._lock:
+            profile = next(
+                (
+                    item
+                    for item in self._read_profiles()
+                    if item.id == profile_id
+                ),
+                None,
+            )
+            if profile is None:
+                raise ApiProfileNotFound(profile_id)
+            return profile
+
+    def create(self, profile: ApiProfile) -> ApiProfile:
+        with self._lock:
+            profiles = self._read_profiles()
+            if any(item.id == profile.id for item in profiles):
+                raise ApiProfileConflict(profile.id)
+            normalized = profile.model_copy(update={"library_id": None})
+            self._write_profiles([*profiles, normalized])
+            return normalized
+
+    def update(self, profile_id: str, profile: ApiProfile) -> ApiProfile:
+        with self._lock:
+            profiles = self._read_profiles()
+            index = next(
+                (
+                    item_index
+                    for item_index, item in enumerate(profiles)
+                    if item.id == profile_id
+                ),
+                None,
+            )
+            if index is None:
+                raise ApiProfileNotFound(profile_id)
+            if profile.id != profile_id:
+                raise ApiProfileConflict(profile.id)
+            normalized = profile.model_copy(update={"library_id": None})
+            profiles[index] = normalized
+            self._write_profiles(profiles)
+            return normalized
+
+    def delete(self, profile_id: str) -> None:
+        with self._lock:
+            profiles = self._read_profiles()
+            remaining = [item for item in profiles if item.id != profile_id]
+            if len(remaining) == len(profiles):
+                raise ApiProfileNotFound(profile_id)
+            self._write_profiles(remaining)
 
 
 class ProjectStore:

@@ -5,17 +5,21 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from loomlane.models import RunStartRequest
+from loomlane.models import AgentJsonOutput, RunStartRequest
 from loomlane.runtime import RunManager
 from loomlane.storage import ProjectStore, default_canvas, default_sdl
 
 
 class MemoryCredentials:
     def get(self, project_id: str, profile_id: str, base_url: str) -> str | None:
+        return None
+
+    def get_library(self, profile_id: str, base_url: str) -> str | None:
         return None
 
     def status(self, project_id: str, profile_id: str, base_url: str):
@@ -30,6 +34,12 @@ class MemoryCredentials:
         return None
 
 
+class LibraryMemoryCredentials(MemoryCredentials):
+    def get_library(self, profile_id: str, base_url: str) -> str | None:
+        assert profile_id == "deepseek-flash"
+        return "library-secret"
+
+
 class FakeOpenAIHandler(BaseHTTPRequestHandler):
     calls: list[dict[str, Any]] = []
     reviewer_calls = 0
@@ -39,13 +49,13 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
         return
 
     def do_POST(self) -> None:
-        type(self).calls.append({})
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        type(self).calls.append(body)
         if type(self).forced_status is not None:
             self.send_response(type(self).forced_status)
             self.end_headers()
             return
 
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         system = body["messages"][0]["content"]
         if "审查初稿" in system:
             type(self).reviewer_calls += 1
@@ -153,3 +163,74 @@ async def test_non_retryable_4xx_is_not_retried(
     assert len(FakeOpenAIHandler.calls) == 1
     assert any(event["type"] == "error" for event in detail.events)
     await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agent_json_output_enables_response_format(
+    tmp_path: Path,
+    fake_openai: str,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    sdl = default_sdl()
+    sdl.api_profiles[0].base_url = fake_openai
+    sdl.api_profiles[0].capabilities.structured_output = False
+    for agent in sdl.agents:
+        agent.json_output.enabled = False
+    sdl.agents[0].json_output = AgentJsonOutput(
+        enabled=True,
+        template={
+            "draft": "完整的 Markdown 草稿文本",
+            "outline": {"sections": "章节标题字符串数组"},
+        },
+    )
+    project = store.create("json output test", sdl, default_canvas())
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"requirement": "test"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    drafter_calls = [
+        call
+        for call in FakeOpenAIHandler.calls
+        if "Use the following JSON template" in call["messages"][0]["content"]
+    ]
+    reviewer_calls = [
+        call
+        for call in FakeOpenAIHandler.calls
+        if "审查初稿" in call["messages"][0]["content"]
+    ]
+    assert len(drafter_calls) == 2
+    assert all(call["response_format"] == {"type": "json_object"} for call in drafter_calls)
+    assert all("response_format" not in call for call in reviewer_calls)
+    assert '"sections": "章节标题字符串数组"' in drafter_calls[0]["messages"][0][
+        "content"
+    ]
+    await manager.shutdown()
+
+
+def test_runtime_environment_uses_linked_library_credential(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    sdl = default_sdl()
+    profile = sdl.api_profiles[0]
+    previous_id = profile.id
+    profile.id = "deepseek-flash"
+    profile.library_id = "deepseek-flash"
+    for agent in sdl.agents:
+        if agent.api_profile == previous_id:
+            agent.api_profile = profile.id
+    project = store.create("library credential test", sdl, default_canvas())
+    manager = RunManager(store, LibraryMemoryCredentials())
+
+    env = manager._runtime_environment(
+        project,
+        "run-id",
+        SimpleNamespace(compiler_key="test-hash"),
+    )
+
+    assert env["LOOMLANE_SECRET_DEEPSEEK_FLASH"] == "library-secret"

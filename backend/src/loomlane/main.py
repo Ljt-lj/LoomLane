@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from . import __version__
 from .compiler import COMPILER_VERSION, WorkflowCompiler
 from .models import (
+    ApiProfile,
     GenerateResponse,
     ImportSDLRequest,
     ProjectCreateRequest,
@@ -21,6 +22,7 @@ from .models import (
     RunDetail,
     RunStartRequest,
     RunSummary,
+    SecretImportRequest,
     SecretPutRequest,
     SecretStatus,
     ValidateWorkflowRequest,
@@ -34,6 +36,9 @@ from .runtime import (
 )
 from .secrets import CredentialError, CredentialStore
 from .storage import (
+    ApiProfileConflict,
+    ApiProfileNotFound,
+    ApiProfileStore,
     InvalidWorkflow,
     ProjectNotFound,
     ProjectStore,
@@ -45,10 +50,12 @@ from .validator import validate_sdl
 def create_app(
     *,
     store: ProjectStore | None = None,
+    api_profiles: ApiProfileStore | None = None,
     credentials: CredentialStore | None = None,
     manager: RunManager | None = None,
 ) -> FastAPI:
     project_store = store or ProjectStore()
+    api_profile_store = api_profiles or ApiProfileStore()
     credential_store = credentials or CredentialStore()
     run_manager = manager or RunManager(
         project_store,
@@ -70,6 +77,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.store = project_store
+    app.state.api_profiles = api_profile_store
     app.state.credentials = credential_store
     app.state.runs = run_manager
     app.add_middleware(
@@ -88,6 +96,26 @@ def create_app(
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content={"detail": "Project not found", "project_id": str(exc)},
+        )
+
+    @app.exception_handler(ApiProfileNotFound)
+    async def api_profile_not_found(
+        _: Request,
+        exc: ApiProfileNotFound,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": "API Profile not found", "profile_id": str(exc)},
+        )
+
+    @app.exception_handler(ApiProfileConflict)
+    async def api_profile_conflict(
+        _: Request,
+        exc: ApiProfileConflict,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": "API Profile already exists", "profile_id": str(exc)},
         )
 
     @app.exception_handler(RunNotFound)
@@ -161,6 +189,93 @@ def create_app(
             "version": __version__,
             "compiler_version": COMPILER_VERSION,
         }
+
+    @app.get("/api/api-profiles", response_model=list[ApiProfile])
+    async def list_api_profiles() -> list[ApiProfile]:
+        return api_profile_store.list()
+
+    @app.post(
+        "/api/api-profiles",
+        response_model=ApiProfile,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_api_profile(payload: ApiProfile) -> ApiProfile:
+        return api_profile_store.create(payload)
+
+    @app.put("/api/api-profiles/{profile_id}", response_model=ApiProfile)
+    async def update_api_profile(
+        profile_id: str,
+        payload: ApiProfile,
+    ) -> ApiProfile:
+        return api_profile_store.update(profile_id, payload)
+
+    @app.delete(
+        "/api/api-profiles/{profile_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_api_profile(profile_id: str) -> None:
+        api_profile_store.delete(profile_id)
+        try:
+            credential_store.delete_library(profile_id)
+        except CredentialError:
+            # Metadata removal is authoritative; an unavailable OS vault must
+            # not make the profile deletion appear to have failed.
+            pass
+
+    @app.get(
+        "/api/api-profiles/{profile_id}/secret/status",
+        response_model=SecretStatus,
+    )
+    async def get_library_secret_status(profile_id: str) -> SecretStatus:
+        profile = api_profile_store.get(profile_id)
+        return credential_store.status_library(profile_id, profile.base_url)
+
+    @app.put(
+        "/api/api-profiles/{profile_id}/secret",
+        response_model=SecretStatus,
+    )
+    async def put_library_secret(
+        profile_id: str,
+        payload: SecretPutRequest,
+    ) -> SecretStatus:
+        profile = api_profile_store.get(profile_id)
+        return credential_store.put_library(
+            profile_id,
+            payload.api_key,
+            profile.base_url,
+        )
+
+    @app.delete(
+        "/api/api-profiles/{profile_id}/secret",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_library_secret(profile_id: str) -> None:
+        api_profile_store.get(profile_id)
+        credential_store.delete_library(profile_id)
+
+    @app.post(
+        "/api/api-profiles/{profile_id}/secret/import-from-project",
+        response_model=SecretStatus,
+    )
+    async def import_library_secret(
+        profile_id: str,
+        payload: SecretImportRequest,
+    ) -> SecretStatus:
+        library_profile = api_profile_store.get(profile_id)
+        project = project_or_404(payload.project_id)
+        project_profile = profile_or_404(project, payload.profile_id)
+        status_result = credential_store.copy_to_library(
+            project.id,
+            project_profile.id,
+            profile_id,
+            library_profile.base_url,
+        )
+        if status_result is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No compatible project credential is configured",
+            )
+        return status_result
 
     @app.get("/api/projects", response_model=list[ProjectSummary])
     async def list_projects() -> list[ProjectSummary]:
@@ -256,7 +371,20 @@ def create_app(
     ) -> SecretStatus:
         project = project_or_404(project_id)
         profile = profile_or_404(project, profile_id)
-        return credential_store.status(project_id, profile_id, profile.base_url)
+        status_result = credential_store.status(
+            project_id,
+            profile_id,
+            profile.base_url,
+        )
+        if status_result.configured or not profile.library_id:
+            return status_result
+        library_status = credential_store.status_library(
+            profile.library_id,
+            profile.base_url,
+        )
+        if library_status.configured:
+            return library_status.model_copy(update={"profile_id": profile_id})
+        return status_result
 
     @app.put(
         "/api/projects/{project_id}/secrets/{profile_id}",

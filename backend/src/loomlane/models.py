@@ -72,6 +72,7 @@ class CapabilityFlags(StrictModel):
 
 class ApiProfile(StrictModel):
     id: str
+    library_id: str | None = None
     name: str | None = None
     provider: Literal["openai_compatible"] = "openai_compatible"
     base_url: str
@@ -99,6 +100,11 @@ class AgentLimits(StrictModel):
     max_tokens: int | None = Field(default=None, ge=1)
 
 
+class AgentJsonOutput(StrictModel):
+    enabled: bool = False
+    template: dict[str, Any] = Field(default_factory=dict)
+
+
 class Agent(StrictModel):
     id: str
     name: str
@@ -107,6 +113,7 @@ class Agent(StrictModel):
     inputs: list[Port] = Field(default_factory=list)
     outputs: list[Port] = Field(default_factory=list)
     limits: AgentLimits = Field(default_factory=AgentLimits)
+    json_output: AgentJsonOutput = Field(default_factory=AgentJsonOutput)
     output_dir: str | None = None
 
 
@@ -248,10 +255,16 @@ class SecretStatus(StrictModel):
     profile_id: str
     configured: bool
     origin: str | None = None
+    scope: Literal["project", "library"] | None = None
 
 
 class SecretPutRequest(StrictModel):
     api_key: str = Field(min_length=1)
+
+
+class SecretImportRequest(StrictModel):
+    project_id: str
+    profile_id: str
 
 
 class RunStartRequest(StrictModel):

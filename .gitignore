@@ -1,17 +1,43 @@
+# Python
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 htmlcov/
+*.egg-info/
+
+# Node and build output
 node_modules/
 dist/
-workspace/
 .pnpm-store/
-.browser-profile*/
 *.tsbuildinfo
-*.egg-info/
+
+# Runtime data
+workspace/
 *.log
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local test and browser artifacts
+.tmp/
+.tmp-*/
+test-results/
+playwright-report/
+.browser-profile*/
+
+# Local-only screenshots
+/desktop-before.png
+
+# Editor and OS metadata
+.vscode/
+.idea/
 .DS_Store
+Thumbs.db
+Desktop.ini
 
