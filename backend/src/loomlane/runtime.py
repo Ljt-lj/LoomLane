@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -15,7 +16,15 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from .compiler import WorkflowCompiler
-from .models import ProjectDetail, RunDetail, RunStartRequest, RunSummary
+from .models import (
+    GateDecisionRequest,
+    GateDecisionResponse,
+    PendingHumanGate,
+    ProjectDetail,
+    RunDetail,
+    RunStartRequest,
+    RunSummary,
+)
 from .secrets import CredentialError, CredentialStore
 from .storage import ProjectStore, _atomic_write_json, _atomic_write_text, utc_now
 
@@ -33,6 +42,14 @@ class ActiveRunExists(RunError):
 
 
 class RunConfigurationError(RunError):
+    pass
+
+
+class GateNotFound(RunError):
+    pass
+
+
+class GateConflict(RunError):
     pass
 
 
@@ -58,6 +75,11 @@ class _LiveRun:
     task: asyncio.Task[None] | None = None
     cancelled: bool = False
     finished: bool = False
+    waiting_gate_ids: set[str] = field(default_factory=set)
+
+    @property
+    def gates_dir(self) -> Path:
+        return self.run_root / "gates"
 
 
 class RunManager:
@@ -96,6 +118,7 @@ class RunManager:
         env = self._runtime_environment(project, run_id, generated)
         run_root = self.store.project_path(project_id) / "runs" / run_id
         (run_root / "workspace").mkdir(parents=True, exist_ok=False)
+        (run_root / "gates").mkdir(parents=True, exist_ok=True)
         _atomic_write_json(run_root / "input.json", request.inputs)
 
         started_at = utc_now()
@@ -135,6 +158,9 @@ class RunManager:
             "PYTHONUTF8": "1",
             "LOOMLANE_RUN_ID": run_id,
             "LOOMLANE_WORKFLOW_HASH": generated.compiler_key,
+            "LOOMLANE_GATE_DIR": str(
+                self.store.project_path(project.id) / "runs" / run_id / "gates"
+            ),
         }
         for profile in project.sdl.api_profiles:
             try:
@@ -330,6 +356,22 @@ class RunManager:
                 raise RunError("Workflow exceeded the event count limit")
             event_file.write(json.dumps(event, ensure_ascii=False) + "\n")
             event_file.flush()
+            event_type = event.get("type")
+            event_data = event.get("data")
+            gate_id = (
+                event_data.get("gate_id")
+                if isinstance(event_data, dict)
+                else None
+            )
+            if event_type == "human_gate_waiting" and isinstance(gate_id, str):
+                live.waiting_gate_ids.add(gate_id)
+            elif event_type == "human_gate_resolved" and isinstance(gate_id, str):
+                live.waiting_gate_ids.discard(gate_id)
+            if event_type in {"human_gate_waiting", "human_gate_resolved"}:
+                await self._set_meta(
+                    live,
+                    status="waiting" if live.waiting_gate_ids else "running",
+                )
             async with self._lock:
                 live.events.append(event)
                 for queue in list(live.subscribers):
@@ -378,10 +420,99 @@ class RunManager:
         summary = self._read_meta(run_root / "meta.json")
         result = self._read_result(run_root / "result.json")
         events = self._read_events_file(run_root)
+        pending_gates = self._read_pending_gates(run_root)
         return RunDetail(
             **summary.model_dump(),
             result=result or None,
             events=events,
+            pending_gates=pending_gates,
+        )
+
+    def _read_pending_gates(self, run_root: Path) -> list[PendingHumanGate]:
+        gates_dir = run_root / "gates"
+        if not gates_dir.exists():
+            return []
+        pending: list[PendingHumanGate] = []
+        for path in sorted(gates_dir.glob("gate-*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if payload.get("decision") not in {None, ""}:
+                    continue
+                pending.append(
+                    PendingHumanGate(
+                        gate_id=payload["gate_id"],
+                        edge_id=payload["edge_id"],
+                        prompt=payload["prompt"],
+                        requested_at=payload["requested_at"],
+                        timeout_seconds=payload.get("timeout_seconds"),
+                    )
+                )
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return pending
+
+    async def decide_gate(
+        self,
+        run_id: str,
+        gate_id: str,
+        request: GateDecisionRequest,
+    ) -> GateDecisionResponse:
+        run_root, _ = self._find_run(run_id)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", gate_id):
+            raise GateNotFound(gate_id)
+        async with self._lock:
+            live = self._live.get(run_id)
+            if live is None or live.finished:
+                raise GateConflict("Run is not waiting for human input")
+        summary = self._read_meta(run_root / "meta.json")
+        if summary.status != "waiting":
+            raise GateConflict("Run is not waiting for human input")
+        gate_path = run_root / "gates" / f"{gate_id}.json"
+        if not gate_path.exists():
+            raise GateNotFound(gate_id)
+        lock_path = gate_path.with_suffix(".lock")
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                lock = lock_path.open("x", encoding="utf-8")
+                break
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise GateConflict(
+                        f"Gate '{gate_id}' is being decided"
+                    )
+                await asyncio.sleep(0.02)
+            except OSError as exc:
+                raise GateConflict(
+                    f"Gate '{gate_id}' could not be decided"
+                ) from exc
+        try:
+            try:
+                payload = json.loads(gate_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise GateNotFound(gate_id) from exc
+            if payload.get("decision") not in {None, ""}:
+                raise GateConflict(f"Gate '{gate_id}' has already been decided")
+            payload.update(
+                {
+                    "decision": request.decision,
+                    "comment": request.comment,
+                    "decided_at": utc_now().isoformat(),
+                    "resolved_by": "human",
+                }
+            )
+            _atomic_write_json(gate_path, payload)
+        finally:
+            lock.close()
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+        return GateDecisionResponse(
+            run_id=run_id,
+            gate_id=gate_id,
+            decision=request.decision,
+            accepted_at=utc_now(),
         )
 
     def _read_events_file(self, run_root: Path) -> list[dict[str, Any]]:

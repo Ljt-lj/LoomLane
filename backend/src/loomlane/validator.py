@@ -11,7 +11,9 @@ from .condition import (
     validate_condition,
 )
 from .models import (
+    AggregateConfig,
     EdgeType,
+    HumanGateConfig,
     SDL,
     ValidationIssue,
     ValidationResponse,
@@ -264,13 +266,16 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
     incoming: dict[str, int] = defaultdict(int)
     for edge in sdl.edges:
         if (
-            edge.type != EdgeType.FEEDBACK
+            edge.type not in {EdgeType.FEEDBACK, EdgeType.LOOP}
             and edge.from_ in agents
             and edge.to in agents
         ):
             adjacency[edge.from_].add(edge.to)
             incoming[edge.to] += 1
 
+    aggregate_modes: dict[str, set[str]] = defaultdict(set)
+    aggregate_targets: set[str] = set()
+    non_aggregate_targets: set[str] = set()
     for edge in sdl.edges:
         if edge.from_ not in agents:
             issues.append(
@@ -290,7 +295,11 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
                     edge_id=edge.id,
                 )
             )
-        if not edge.mappings:
+        if not edge.mappings and edge.type in {
+            EdgeType.PIPE,
+            EdgeType.CONDITIONAL,
+            EdgeType.FEEDBACK,
+        }:
             issues.append(
                 _issue(
                     "missing_mappings",
@@ -318,19 +327,64 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
                     edge_id=edge.id,
                 )
             )
-        if edge.type == EdgeType.FEEDBACK:
+        if edge.type == EdgeType.LOOP and edge.condition is None:
+            issues.append(
+                _issue(
+                    "loop_missing_condition",
+                    f"LOOP edge '{edge.id}' requires a continuation condition",
+                    f"edges.{edge.id}.condition",
+                    edge_id=edge.id,
+                )
+            )
+        if edge.type in {EdgeType.FEEDBACK, EdgeType.LOOP}:
             if edge.guard.max_traversals is None:
-                edge.guard.max_traversals = sdl.workflow.execution.feedback_limit_default
+                edge.guard.max_traversals = (
+                    sdl.workflow.execution.loop_limit_default
+                    if edge.type == EdgeType.LOOP
+                    else sdl.workflow.execution.feedback_limit_default
+                )
             if edge.from_ in agents and edge.to in agents:
                 if edge.from_ == edge.to or not _can_reach(adjacency, edge.to, edge.from_):
+                    edge_type = str(edge.type)
                     issues.append(
                         _issue(
-                            "feedback_not_upstream",
-                            f"FEEDBACK edge '{edge.id}' must target an upstream Agent",
+                            f"{edge_type.lower()}_not_upstream",
+                            f"{edge_type} edge '{edge.id}' must target an "
+                            "upstream Agent",
                             f"edges.{edge.id}.to",
                             edge_id=edge.id,
                         )
                     )
+        if edge.type == EdgeType.AGGREGATE:
+            if edge.aggregate is None:
+                edge.aggregate = AggregateConfig()
+            aggregate_targets.add(edge.to)
+            aggregate_modes[edge.to].add(edge.aggregate.mode.value)
+        elif edge.aggregate is not None:
+            issues.append(
+                _issue(
+                    "aggregate_config_on_non_aggregate",
+                    f"Edge '{edge.id}' defines aggregate settings but is not "
+                    "AGGREGATE",
+                    f"edges.{edge.id}.aggregate",
+                    edge_id=edge.id,
+                )
+            )
+        if edge.to in agents and edge.type != EdgeType.AGGREGATE:
+            non_aggregate_targets.add(edge.to)
+        if edge.type == EdgeType.HUMAN_GATE:
+            if edge.human_gate is None:
+                edge.human_gate = HumanGateConfig()
+        elif edge.human_gate is not None:
+            issues.append(
+                _issue(
+                    "human_gate_config_on_non_gate",
+                    f"Edge '{edge.id}' defines human_gate settings but is not "
+                    "HUMAN_GATE",
+                    f"edges.{edge.id}.human_gate",
+                    edge_id=edge.id,
+                )
+            )
 
         source_agent = agents.get(edge.from_)
         target_agent = agents.get(edge.to)
@@ -376,13 +430,35 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
                             )
                         )
 
+    for agent_id, modes in aggregate_modes.items():
+        if len(modes) > 1:
+            issues.append(
+                _issue(
+                    "mixed_aggregate_modes",
+                    f"Agent '{agent_id}' has AGGREGATE edges with mixed modes",
+                    f"agents.{agent_id}.inputs",
+                    node_id=agent_id,
+                )
+            )
+    for agent_id in sorted(aggregate_targets & non_aggregate_targets):
+        issues.append(
+            _issue(
+                "mixed_aggregate_inputs",
+                f"Agent '{agent_id}' cannot mix AGGREGATE and other incoming "
+                "edge types",
+                f"agents.{agent_id}.inputs",
+                node_id=agent_id,
+            )
+        )
+
     if not issues:
         cycles = _cyclic_nodes(adjacency)
         for node in cycles:
             issues.append(
                 _issue(
                     "cycle_not_allowed",
-                    f"Agent '{node}' participates in a non-FEEDBACK cycle",
+                    f"Agent '{node}' participates in a cycle without a "
+                    "LOOP or FEEDBACK edge",
                     f"agents.{node}",
                     node_id=node,
                 )
