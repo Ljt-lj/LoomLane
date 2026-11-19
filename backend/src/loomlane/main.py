@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -51,8 +52,11 @@ from .storage import (
     ProjectNotFound,
     ProjectStore,
     RevisionConflict,
+    StorageWriteError,
 )
 from .validator import validate_sdl
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -198,6 +202,27 @@ def create_app(
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={"detail": "Workflow validation failed", "issues": exc.issues},
+        )
+
+    @app.exception_handler(StorageWriteError)
+    async def storage_write_error(
+        _: Request,
+        exc: StorageWriteError,
+    ) -> JSONResponse:
+        cause = exc.__cause__ or exc
+        logger.error(
+            "Project storage write failed for %s (errno=%s winerror=%s)",
+            exc.path,
+            exc.errno,
+            exc.winerror,
+            exc_info=(type(cause), cause, cause.__traceback__),
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "detail": str(exc),
+                "code": "project_storage_write_failed",
+            },
         )
 
     def project_or_404(project_id: str) -> ProjectDetail:
