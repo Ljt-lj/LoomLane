@@ -329,6 +329,70 @@ async def test_feedback_run_end_to_end(
     await manager.shutdown()
 
 
+def test_run_succeeds_on_windows_selector_event_loop(
+    tmp_path: Path,
+    fake_openai: str,
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows SelectorEventLoop compatibility check")
+
+    async def scenario():
+        store = ProjectStore(tmp_path / "projects")
+        project = store.create("selector loop", legacy_workflow(fake_openai))
+        manager = RunManager(store, MemoryCredentials())
+        summary = await manager.start(
+            project.id,
+            RunStartRequest(inputs={"requirement": "selector compatibility"}),
+        )
+        detail = await _wait_for_run(manager, summary.run_id)
+        await manager.shutdown()
+        return detail
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        detail = runner.run(scenario())
+
+    assert detail.status == "succeeded"
+    assert any(event["type"] == "run_started" for event in detail.events)
+    assert detail.events[-1]["type"] == "run_finished"
+
+
+@pytest.mark.asyncio
+async def test_process_start_failure_is_persisted_and_streamed(
+    tmp_path: Path,
+    fake_openai: str,
+    legacy_workflow: Callable[[str], SDL],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("process start failure", legacy_workflow(fake_openai))
+    manager = RunManager(store, MemoryCredentials())
+
+    def fail_to_start(*args: Any, **kwargs: Any):
+        raise NotImplementedError("subprocess creation unavailable")
+
+    monkeypatch.setattr("loomlane.runtime.subprocess.Popen", fail_to_start)
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"requirement": "trigger start failure"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "failed"
+    assert detail.error == "NotImplementedError: subprocess creation unavailable"
+    assert [event["type"] for event in detail.events[-2:]] == [
+        "error",
+        "run_finished",
+    ]
+    assert detail.events[-1]["data"]["error"] == detail.error
+    assert summary.run_directory is not None
+    run_root = store.project_path(project.id) / "runs" / summary.run_directory
+    assert "NotImplementedError" in (run_root / "stderr.log").read_text(
+        encoding="utf-8"
+    )
+    await manager.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_file_input_is_copied_to_readable_run_workspace(
     tmp_path: Path,

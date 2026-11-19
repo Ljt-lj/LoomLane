@@ -8,9 +8,10 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, BinaryIO
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -123,6 +124,19 @@ def _is_local_url(base_url: str) -> bool:
     return host in {"127.0.0.1", "localhost", "::1"}
 
 
+def _exception_message(exc: BaseException) -> str:
+    type_name = exc.__class__.__name__
+    message = str(exc).strip()
+    return type_name if not message or message == type_name else f"{type_name}: {message}"
+
+
+def _wait_for_process(
+    process: subprocess.Popen[bytes],
+    timeout: float | None = None,
+) -> int:
+    return process.wait(timeout=timeout)
+
+
 @dataclass
 class _LiveRun:
     run_id: str
@@ -132,7 +146,7 @@ class _LiveRun:
     subscribers: set[asyncio.Queue[dict[str, Any] | None]] = field(
         default_factory=set
     )
-    process: asyncio.subprocess.Process | None = None
+    process: subprocess.Popen[bytes] | None = None
     task: asyncio.Task[None] | None = None
     cancelled: bool = False
     finished: bool = False
@@ -369,7 +383,10 @@ class RunManager:
         stdout_task: asyncio.Task[None] | None = None
         stderr_task: asyncio.Task[str] | None = None
         error: str | None = None
+        error_type = "RuntimeError"
         status = "failed"
+        child_stderr = ""
+        process_traceback: str | None = None
         event_file = (live.run_root / "events.jsonl").open(
             "a",
             encoding="utf-8",
@@ -387,13 +404,13 @@ class RunManager:
             creation_flags = (
                 subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             )
-            live.process = await asyncio.create_subprocess_exec(
-                *command,
+            live.process = subprocess.Popen(
+                command,
                 cwd=live.run_root / "workspace",
                 env=env,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 creationflags=creation_flags,
             )
             assert live.process.stdout is not None
@@ -406,13 +423,14 @@ class RunManager:
             )
 
             try:
-                return_code = await asyncio.wait_for(
-                    live.process.wait(),
-                    timeout=self.DEFAULT_TIMEOUT_SECONDS,
+                return_code = await asyncio.to_thread(
+                    _wait_for_process,
+                    live.process,
+                    self.DEFAULT_TIMEOUT_SECONDS,
                 )
-            except TimeoutError:
+            except subprocess.TimeoutExpired:
                 live.process.kill()
-                await live.process.wait()
+                await asyncio.to_thread(live.process.wait)
                 error = (
                     "Workflow process exceeded "
                     f"{self.DEFAULT_TIMEOUT_SECONDS} seconds"
@@ -420,9 +438,7 @@ class RunManager:
                 return_code = -1
 
             await asyncio.gather(stdout_task, stderr_task)
-            stderr_text = stderr_task.result()
-            if stderr_text:
-                _atomic_write_text(live.run_root / "stderr.log", stderr_text)
+            child_stderr = stderr_task.result()
 
             result = self._read_result(live.run_root / "result.json")
             if live.cancelled:
@@ -434,18 +450,24 @@ class RunManager:
                 status = "failed"
                 error = str(result.get("error") or f"Process exited with code {return_code}")
         except Exception as exc:
-            error = str(exc) or exc.__class__.__name__
-            if live.process and live.process.returncode is None:
-                live.process.kill()
-                await live.process.wait()
+            error = _exception_message(exc)
+            error_type = exc.__class__.__name__
+            process_traceback = traceback.format_exc()
+            await self._stop_process(live.process)
         finally:
-            if live.process and live.process.returncode is None:
-                live.process.kill()
-                await live.process.wait()
-            if stdout_task and not stdout_task.done():
-                stdout_task.cancel()
-            if stderr_task and not stderr_task.done():
-                stderr_task.cancel()
+            await self._stop_process(live.process)
+            pending_tasks = [
+                task
+                for task in (stdout_task, stderr_task)
+                if task is not None and not task.done()
+            ]
+            if pending_tasks:
+                _, still_pending = await asyncio.wait(
+                    pending_tasks,
+                    timeout=2,
+                )
+                for task in still_pending:
+                    task.cancel()
             await asyncio.gather(
                 *[
                     task
@@ -454,11 +476,68 @@ class RunManager:
                 ],
                 return_exceptions=True,
             )
-            event_file.close()
+            if (
+                stderr_task
+                and stderr_task.done()
+                and not stderr_task.cancelled()
+            ):
+                try:
+                    child_stderr = stderr_task.result()
+                except Exception:
+                    pass
+
+            stderr_parts = []
+            if child_stderr:
+                stderr_parts.append(child_stderr.rstrip())
+            if process_traceback:
+                stderr_parts.append(process_traceback.rstrip())
+            if stderr_parts:
+                _atomic_write_text(
+                    live.run_root / "stderr.log",
+                    "\n\n".join(stderr_parts) + "\n",
+                )
 
             if live.cancelled:
                 status = "cancelled"
                 error = None
+
+            if not self._has_event(live, "run_finished"):
+                if status == "failed":
+                    if not self._has_event(live, "error"):
+                        await self._emit_synthetic_event(
+                            live,
+                            event_file,
+                            "error",
+                            {
+                                "type": error_type,
+                                "message": error or "Workflow run failed",
+                            },
+                        )
+                    await self._emit_synthetic_event(
+                        live,
+                        event_file,
+                        "run_finished",
+                        {
+                            "status": "failed",
+                            "error": error or "Workflow run failed",
+                        },
+                    )
+                elif status == "cancelled":
+                    await self._emit_synthetic_event(
+                        live,
+                        event_file,
+                        "run_finished",
+                        {"status": "cancelled"},
+                    )
+                elif status == "succeeded":
+                    await self._emit_synthetic_event(
+                        live,
+                        event_file,
+                        "run_finished",
+                        {"status": "succeeded"},
+                    )
+            event_file.close()
+
             await self._set_meta(
                 live,
                 status=status,
@@ -470,6 +549,38 @@ class RunManager:
                 self._active_by_project.pop(live.project_id, None)
                 for queue in list(live.subscribers):
                     queue.put_nowait(None)
+
+    async def _stop_process(self, process: subprocess.Popen[bytes] | None) -> None:
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.kill()
+        except OSError:
+            pass
+        await asyncio.to_thread(process.wait)
+
+    def _has_event(self, live: _LiveRun, event_type: str) -> bool:
+        return any(event.get("type") == event_type for event in live.events)
+
+    async def _emit_synthetic_event(
+        self,
+        live: _LiveRun,
+        event_file: Any,
+        event_type: str,
+        data: dict[str, Any],
+    ) -> None:
+        await self._publish_event(
+            live,
+            event_file,
+            {
+                "run_id": live.run_id,
+                "ts": utc_now().isoformat(),
+                "type": event_type,
+                "node_id": None,
+                "edge_id": None,
+                "data": data,
+            },
+        )
 
     async def _set_meta(
         self,
@@ -503,60 +614,108 @@ class RunManager:
     async def _read_events(
         self,
         live: _LiveRun,
-        stream: asyncio.StreamReader,
+        stream: BinaryIO,
         event_file: Any,
     ) -> None:
-        previous_seq = 0
-        while True:
-            line = await stream.readline()
-            if not line:
-                break
-            if len(line) > self.MAX_EVENT_BYTES:
-                raise RunError("Workflow emitted an oversized event")
-            text = line.decode("utf-8", errors="replace").strip()
-            if not text:
-                continue
-            try:
-                event = json.loads(text)
-            except json.JSONDecodeError as exc:
-                raise RunError(f"Workflow emitted invalid NDJSON: {exc}") from exc
-            if not isinstance(event, dict):
-                raise RunError("Workflow event must be a JSON object")
-            seq = event.get("seq")
-            if not isinstance(seq, int) or seq <= previous_seq:
-                seq = previous_seq + 1
-                event["seq"] = seq
-            previous_seq = seq
-            if len(live.events) >= self.MAX_EVENTS:
-                raise RunError("Workflow exceeded the event count limit")
-            event_file.write(json.dumps(event, ensure_ascii=False) + "\n")
-            event_file.flush()
-            event_type = event.get("type")
-            event_data = event.get("data")
-            gate_id = (
-                event_data.get("gate_id")
-                if isinstance(event_data, dict)
-                else None
-            )
-            if event_type == "human_gate_waiting" and isinstance(gate_id, str):
-                live.waiting_gate_ids.add(gate_id)
-            elif event_type == "human_gate_resolved" and isinstance(gate_id, str):
-                live.waiting_gate_ids.discard(gate_id)
-            if event_type in {"human_gate_waiting", "human_gate_resolved"}:
-                await self._set_meta(
-                    live,
-                    status="waiting" if live.waiting_gate_ids else "running",
-                )
-            async with self._lock:
-                live.events.append(event)
-                for queue in list(live.subscribers):
-                    queue.put_nowait(event)
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[bytes | BaseException | None] = asyncio.Queue()
 
-    async def _read_stderr(self, stream: asyncio.StreamReader) -> str:
+        def enqueue(item: bytes | BaseException | None) -> None:
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+            except RuntimeError:
+                pass
+
+        def pump() -> None:
+            try:
+                while line := stream.readline(self.MAX_EVENT_BYTES + 1):
+                    enqueue(line)
+            except BaseException as exc:
+                enqueue(exc)
+            finally:
+                enqueue(None)
+
+        pump_task = asyncio.create_task(asyncio.to_thread(pump))
+        try:
+            while True:
+                line = await queue.get()
+                if line is None:
+                    break
+                if isinstance(line, BaseException):
+                    raise line
+                if len(line) > self.MAX_EVENT_BYTES:
+                    raise RunError("Workflow emitted an oversized event")
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    event = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise RunError(
+                        f"Workflow emitted invalid NDJSON: {exc}"
+                    ) from exc
+                if not isinstance(event, dict):
+                    raise RunError("Workflow event must be a JSON object")
+                await self._publish_event(live, event_file, event)
+        finally:
+            if not pump_task.done():
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            await asyncio.gather(pump_task, return_exceptions=True)
+
+    async def _publish_event(
+        self,
+        live: _LiveRun,
+        event_file: Any,
+        event: dict[str, Any],
+    ) -> None:
+        previous_seq = max(
+            (
+                sequence
+                for item in live.events
+                if isinstance((sequence := item.get("seq")), int)
+            ),
+            default=0,
+        )
+        seq = event.get("seq")
+        if not isinstance(seq, int) or seq <= previous_seq:
+            seq = previous_seq + 1
+        event["seq"] = seq
+        if len(live.events) >= self.MAX_EVENTS:
+            raise RunError("Workflow exceeded the event count limit")
+        event_file.write(json.dumps(event, ensure_ascii=False) + "\n")
+        event_file.flush()
+        event_type = event.get("type")
+        event_data = event.get("data")
+        gate_id = (
+            event_data.get("gate_id")
+            if isinstance(event_data, dict)
+            else None
+        )
+        if event_type == "human_gate_waiting" and isinstance(gate_id, str):
+            live.waiting_gate_ids.add(gate_id)
+        elif event_type == "human_gate_resolved" and isinstance(gate_id, str):
+            live.waiting_gate_ids.discard(gate_id)
+        if event_type in {"human_gate_waiting", "human_gate_resolved"}:
+            await self._set_meta(
+                live,
+                status="waiting" if live.waiting_gate_ids else "running",
+            )
+        async with self._lock:
+            live.events.append(event)
+            for queue in list(live.subscribers):
+                queue.put_nowait(event)
+
+    async def _read_stderr(self, stream: BinaryIO) -> str:
+        return await asyncio.to_thread(self._read_stderr_sync, stream)
+
+    def _read_stderr_sync(self, stream: BinaryIO) -> str:
         chunks: list[bytes] = []
         size = 0
         while True:
-            chunk = await stream.read(4096)
+            chunk = stream.read(4096)
             if not chunk:
                 break
             remaining = self.MAX_STDERR_BYTES - size
