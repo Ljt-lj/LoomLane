@@ -1,6 +1,7 @@
 import type {
   ApiProfile,
   GenerateResponse,
+  GateDecisionResponse,
   ProjectDetail,
   ProjectSummary,
   RunDetail,
@@ -195,6 +196,20 @@ export const api = {
     request<RunSummary[]>(`/api/projects/${projectId}/runs`),
 
   getRun: (runId: string) => request<RunDetail>(`/api/runs/${runId}`),
+
+  decideGate: (
+    runId: string,
+    gateId: string,
+    decision: 'approve' | 'reject',
+    comment?: string,
+  ) =>
+    request<GateDecisionResponse>(
+      `/api/runs/${runId}/gates/${encodeURIComponent(gateId)}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ decision, comment: comment || null }),
+      },
+    ),
 
   cancelRun: (runId: string) =>
     request<RunSummary>(`/api/runs/${runId}/cancel`, { method: 'POST' }),
