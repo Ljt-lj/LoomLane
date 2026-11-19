@@ -939,34 +939,65 @@ function App() {
   useEffect(() => {
     if (!draft) {
       setNodes([])
-      setEdges([])
       return
     }
     const canvasNodes = makeCanvasNodes(draft.sdl, draft.canvas)
     const nodeById = new Map(draft.sdl.agents.map((agent) => [agent.id, agent]))
-    setNodes(
-      canvasNodes.map((node) => {
+    setNodes((current) => {
+      const currentById = new Map(current.map((node) => [node.id, node]))
+      return canvasNodes.map((node) => {
         const agent = nodeById.get(node.id)!
+        const currentNode = currentById.get(node.id)
+        const selected =
+          selection?.kind === 'node' && selection.id === node.id
+        const status = nodeStatuses[node.id] ?? 'idle'
+        const data = {
+          label: agent.name,
+          agentId: agent.id,
+          profile: agent.api_profile,
+          inputs: agent.inputs.map((port) => port.name),
+          outputs: agent.outputs.map((port) => port.name),
+          status,
+        }
+        if (
+          currentNode &&
+          currentNode.position.x === node.x &&
+          currentNode.position.y === node.y &&
+          currentNode.width === node.width &&
+          currentNode.height === node.height &&
+          currentNode.selected === selected &&
+          currentNode.data.label === data.label &&
+          currentNode.data.agentId === data.agentId &&
+          currentNode.data.profile === data.profile &&
+          currentNode.data.status === data.status &&
+          currentNode.data.inputs.join('\u0000') === data.inputs.join('\u0000') &&
+          currentNode.data.outputs.join('\u0000') === data.outputs.join('\u0000')
+        ) {
+          return currentNode
+        }
         return {
+          ...currentNode,
           id: node.id,
           type: 'agent',
           position: { x: node.x, y: node.y },
           width: node.width,
           height: node.height,
-          selected: selection?.kind === 'node' && selection.id === node.id,
-          data: {
-            label: agent.name,
-            agentId: agent.id,
-            profile: agent.api_profile,
-            inputs: agent.inputs.map((port) => port.name),
-            outputs: agent.outputs.map((port) => port.name),
-            status: nodeStatuses[node.id] ?? 'idle',
-          },
+          selected,
+          data,
         }
-      }),
-    )
-    setEdges(
-      draft.sdl.edges.map((workflowEdge) => {
+      })
+    })
+  }, [draft, nodeStatuses, selection])
+
+  useEffect(() => {
+    if (!draft) {
+      setEdges([])
+      return
+    }
+    setEdges((current) => {
+      const currentById = new Map(current.map((edge) => [edge.id, edge]))
+      return draft.sdl.edges.map((workflowEdge) => {
+        const currentEdge = currentById.get(workflowEdge.id)
         const traversals = edgeTraversals[workflowEdge.id] ?? 0
         const color =
           workflowEdge.type === 'FEEDBACK'
@@ -982,27 +1013,48 @@ function App() {
             : workflowEdge.type === 'CONDITIONAL'
               ? '#98752f'
               : '#267f73'
+        const selected =
+          selection?.kind === 'edge' && selection.id === workflowEdge.id
+        const animated = traversals > 0
+        const strokeWidth = traversals > 0 ? 2.4 : 1.5
+        const strokeDasharray =
+          workflowEdge.type === 'FEEDBACK' || workflowEdge.type === 'LOOP'
+            ? '7 4'
+            : undefined
+        if (
+          currentEdge &&
+          currentEdge.source === workflowEdge.from &&
+          currentEdge.target === workflowEdge.to &&
+          currentEdge.label === workflowEdge.type &&
+          currentEdge.animated === animated &&
+          currentEdge.selected === selected &&
+          typeof currentEdge.markerEnd !== 'string' &&
+          currentEdge.markerEnd?.type === MarkerType.ArrowClosed &&
+          currentEdge.markerEnd?.color === color &&
+          currentEdge.style?.stroke === color &&
+          currentEdge.style?.strokeWidth === strokeWidth &&
+          currentEdge.style?.strokeDasharray === strokeDasharray &&
+          currentEdge.labelStyle?.fill === color
+        ) {
+          return currentEdge
+        }
         return {
+          ...currentEdge,
           id: workflowEdge.id,
           source: workflowEdge.from,
           target: workflowEdge.to,
           type: 'smoothstep',
           label: workflowEdge.type,
-          animated: traversals > 0,
-          selected:
-            selection?.kind === 'edge' && selection.id === workflowEdge.id,
+          animated,
+          selected,
           markerEnd: {
             type: MarkerType.ArrowClosed,
             color,
           },
           style: {
             stroke: color,
-            strokeWidth: traversals > 0 ? 2.4 : 1.5,
-            strokeDasharray:
-              workflowEdge.type === 'FEEDBACK' ||
-              workflowEdge.type === 'LOOP'
-                ? '7 4'
-                : undefined,
+            strokeWidth,
+            strokeDasharray,
           },
           labelStyle: {
             fill: color,
@@ -1015,9 +1067,9 @@ function App() {
           },
           labelBgPadding: [5, 3] as [number, number],
         }
-      }),
-    )
-  }, [draft, edgeTraversals, nodeStatuses, selection])
+      })
+    })
+  }, [draft, edgeTraversals, selection])
 
   useEffect(() => {
     return () => {

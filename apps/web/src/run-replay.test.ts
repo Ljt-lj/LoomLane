@@ -164,4 +164,30 @@ describe('run replay', () => {
     expect(initial.nodeStatuses.writer).toBe('running')
     expect(initial.events).toHaveLength(1)
   })
+
+  it('keeps unaffected visualization slices stable between events', () => {
+    const entered = applyRunEvent(
+      createEmptyRunReplayState(),
+      event(1, 'node_enter', {}, 'writer'),
+    )
+    const statuses = entered.nodeStatuses
+    const traversals = entered.edgeTraversals
+
+    const tokenUsage = applyRunEvent(
+      entered,
+      event(2, 'token_usage', { total_tokens: 12 }, 'writer'),
+    )
+
+    expect(tokenUsage.nodeStatuses).toBe(statuses)
+    expect(tokenUsage.edgeTraversals).toBe(traversals)
+
+    const traversed = applyRunEvent(
+      tokenUsage,
+      event(3, 'edge_traversed', {}, null, 'draft-to-review'),
+    )
+
+    expect(traversed.nodeStatuses).toBe(statuses)
+    expect(traversed.edgeTraversals).not.toBe(traversals)
+    expect(traversed.edgeTraversals['draft-to-review']).toBe(1)
+  })
 })
