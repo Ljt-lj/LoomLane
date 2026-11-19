@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import threading
+import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,9 +15,18 @@ from typing import Any
 
 import pytest
 
-from loomlane.models import AgentJsonOutput, RunStartRequest
-from loomlane.runtime import RunManager
-from loomlane.storage import ProjectStore, default_canvas, default_sdl
+from loomlane.models import (
+    AgentJsonOutput,
+    GateDecisionRequest,
+    Port,
+    PortType,
+    RunStartRequest,
+    SDL,
+    WorkflowInput,
+)
+from loomlane.runtime import GateConflict, RunManager
+from loomlane.storage import ProjectStore
+from loomlane.compiler import WorkflowCompiler
 
 
 class MemoryCredentials:
@@ -44,6 +58,7 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
     calls: list[dict[str, Any]] = []
     reviewer_calls = 0
     forced_status: int | None = None
+    forced_finish_reason: str | None = None
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -70,7 +85,14 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
                 "outline": {"sections": ["intro", "body"]},
             }
         payload = {
-            "choices": [{"message": {"content": json.dumps(outputs, ensure_ascii=False)}}],
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(outputs, ensure_ascii=False)
+                    },
+                    "finish_reason": type(self).forced_finish_reason or "stop",
+                }
+            ],
             "usage": {
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
@@ -85,16 +107,83 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
 
+class ScriptedOpenAIHandler(BaseHTTPRequestHandler):
+    responder: Any = None
+    calls: list[dict[str, Any]] = []
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def do_POST(self) -> None:
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with type(self).lock:
+            type(self).calls.append(body)
+            type(self).active += 1
+            type(self).max_active = max(type(self).max_active, type(self).active)
+        try:
+            result = type(self).responder(body)
+            outputs, usage = result if isinstance(result, tuple) else (result, None)
+            payload = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(outputs, ensure_ascii=False)
+                        }
+                    }
+                ],
+                "usage": usage
+                or {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            }
+            encoded = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        finally:
+            with type(self).lock:
+                type(self).active -= 1
+
+
 @pytest.fixture
 def fake_openai() -> str:
     FakeOpenAIHandler.calls = []
     FakeOpenAIHandler.reviewer_calls = 0
     FakeOpenAIHandler.forced_status = None
+    FakeOpenAIHandler.forced_finish_reason = None
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenAIHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         yield f"http://127.0.0.1:{server.server_port}/v1"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.fixture
+def scripted_openai():
+    ScriptedOpenAIHandler.calls = []
+    ScriptedOpenAIHandler.active = 0
+    ScriptedOpenAIHandler.max_active = 0
+    ScriptedOpenAIHandler.responder = None
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ScriptedOpenAIHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def configure(responder: Any) -> None:
+        ScriptedOpenAIHandler.responder = responder
+
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1", configure
     finally:
         server.shutdown()
         server.server_close()
@@ -110,12 +199,91 @@ async def _wait_for_run(manager: RunManager, run_id: str):
     raise AssertionError("run did not finish")
 
 
+async def _wait_until(predicate: Any, timeout: float = 10) -> Any:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = await predicate()
+        if value:
+            return value
+        await asyncio.sleep(0.05)
+    raise AssertionError("condition was not reached")
+
+
+def _agent_marker(body: dict[str, Any]) -> str:
+    system = body["messages"][0]["content"]
+    for line in system.splitlines():
+        if line.startswith("AGENT:"):
+            return line.removeprefix("AGENT:").strip()
+    raise AssertionError(f"missing agent marker: {system}")
+
+
+def _agent_inputs(body: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(body["messages"][1]["content"])
+
+
+def _graph_sdl(
+    base_url: str,
+    *,
+    agents: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    start: list[str],
+    workflow_inputs: list[dict[str, Any]] | None = None,
+    workflow_outputs: list[dict[str, Any]] | None = None,
+    execution: dict[str, Any] | None = None,
+) -> SDL:
+    return SDL.model_validate(
+        {
+            "sdl_version": "0.2",
+            "workflow": {
+                "id": "v02-test",
+                "name": "v0.2 test",
+                "inputs": workflow_inputs or [],
+                "outputs": workflow_outputs or [],
+                "execution": {
+                    "feedback_limit_default": 3,
+                    "loop_limit_default": 5,
+                    "max_steps": 50,
+                    "max_total_tokens": 100_000,
+                    "max_parallel": 4,
+                    **(execution or {}),
+                },
+            },
+            "start": start,
+            "api_profiles": [
+                {
+                    "id": "local",
+                    "name": "Local",
+                    "base_url": base_url,
+                    "model": "test-model",
+                }
+            ],
+            "agents": [
+                {
+                    "api_profile": "local",
+                    "limits": {
+                        "max_tokens": None,
+                        "max_total_tokens": None,
+                    },
+                    "json_output": {"enabled": False, "template": {}},
+                    **agent,
+                }
+                for agent in agents
+            ],
+            "edges": edges,
+        }
+    )
+
+
 @pytest.mark.asyncio
-async def test_feedback_run_end_to_end(tmp_path: Path, fake_openai: str) -> None:
+async def test_feedback_run_end_to_end(
+    tmp_path: Path,
+    fake_openai: str,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
     store = ProjectStore(tmp_path / "projects")
-    sdl = default_sdl()
-    sdl.api_profiles[0].base_url = fake_openai
-    project = store.create("feedback test", sdl, default_canvas())
+    sdl = legacy_workflow(fake_openai)
+    project = store.create("feedback test", sdl)
     manager = RunManager(store, MemoryCredentials())
 
     summary = await manager.start(
@@ -129,15 +297,91 @@ async def test_feedback_run_end_to_end(tmp_path: Path, fake_openai: str) -> None
     assert detail.result["edge_traversals"]["review-feedback"] == 1
     assert [event["type"] for event in detail.events][0] == "run_started"
     assert [event["type"] for event in detail.events][-1] == "run_finished"
+    assert summary.run_directory is not None
+    assert summary.run_directory.startswith("feedback test__")
+    artifacts = [
+        event["data"]
+        for event in detail.events
+        if event["type"] == "artifact_written"
+    ]
+    assert artifacts
+    run_root = store.project_path(project.id) / "runs" / summary.run_directory
+    assert all((run_root / "workspace" / item["path"]).is_file() for item in artifacts)
     event_file = (
         store.project_path(project.id)
         / "runs"
-        / summary.run_id
+        / summary.run_directory
         / "events.jsonl"
     )
     assert len(event_file.read_text(encoding="utf-8").splitlines()) == len(
         detail.events
     )
+    assert any(Path(detail.output_directory).iterdir())
+
+    launched: list[Path] = []
+    monkeypatch.setattr(
+        "loomlane.runtime._launch_directory",
+        lambda path: launched.append(path),
+    )
+    opened = await manager.open_output_folder(summary.run_id)
+    assert opened == detail.output_directory
+    assert launched == [Path(opened)]
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_file_input_is_copied_to_readable_run_workspace(
+    tmp_path: Path,
+    fake_openai: str,
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    sdl = legacy_workflow(fake_openai)
+    sdl.workflow.inputs.append(
+        WorkflowInput(name="source", type=PortType.FILE, required=True)
+    )
+    sdl.agents[0].inputs.append(
+        Port(name="source", type=PortType.FILE, required=True)
+    )
+    project = store.create("file input test", sdl)
+    manager = RunManager(store, MemoryCredentials())
+
+    uploaded = manager.stage_input_file(
+        project.id,
+        "source",
+        "source notes.txt",
+        b"reference material",
+    )
+    source_path = store.project_path(project.id) / uploaded.path
+    assert source_path.read_bytes() == b"reference material"
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(
+            inputs={
+                "requirement": "根据附件写一段摘要",
+                "source": {
+                    "path": uploaded.path,
+                    "name": uploaded.name,
+                    "size": uploaded.size,
+                },
+            }
+        ),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    assert summary.run_directory is not None
+    assert summary.run_directory.startswith("file input test__")
+    run_root = (
+        store.project_path(project.id)
+        / "runs"
+        / summary.run_directory
+    )
+    assert (run_root / "workspace" / uploaded.path).read_bytes() == (
+        b"reference material"
+    )
+    assert not source_path.exists()
     await manager.shutdown()
 
 
@@ -145,12 +389,12 @@ async def test_feedback_run_end_to_end(tmp_path: Path, fake_openai: str) -> None
 async def test_non_retryable_4xx_is_not_retried(
     tmp_path: Path,
     fake_openai: str,
+    legacy_workflow: Callable[[str], SDL],
 ) -> None:
     FakeOpenAIHandler.forced_status = 400
     store = ProjectStore(tmp_path / "projects")
-    sdl = default_sdl()
-    sdl.api_profiles[0].base_url = fake_openai
-    project = store.create("4xx test", sdl, default_canvas())
+    sdl = legacy_workflow(fake_openai)
+    project = store.create("4xx test", sdl)
     manager = RunManager(store, MemoryCredentials())
 
     summary = await manager.start(
@@ -166,13 +410,42 @@ async def test_non_retryable_4xx_is_not_retried(
 
 
 @pytest.mark.asyncio
+async def test_max_tokens_finish_reason_is_reported_as_truncation(
+    tmp_path: Path,
+    fake_openai: str,
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    FakeOpenAIHandler.forced_finish_reason = "length"
+    store = ProjectStore(tmp_path / "projects")
+    sdl = legacy_workflow(fake_openai)
+    sdl.agents[0].limits.max_tokens = 1_600
+    project = store.create("truncation test", sdl)
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"requirement": "test"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "failed"
+    error_event = next(event for event in detail.events if event["type"] == "error")
+    message = error_event["data"]["message"]
+    assert "max_tokens was reached" in message
+    assert "completion_tokens=5" in message
+    assert "max_tokens=1600" in message
+    assert "invalid JSON" not in message
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_agent_json_output_enables_response_format(
     tmp_path: Path,
     fake_openai: str,
+    legacy_workflow: Callable[[str], SDL],
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    sdl = default_sdl()
-    sdl.api_profiles[0].base_url = fake_openai
+    sdl = legacy_workflow(fake_openai)
     sdl.api_profiles[0].capabilities.structured_output = False
     for agent in sdl.agents:
         agent.json_output.enabled = False
@@ -183,7 +456,7 @@ async def test_agent_json_output_enables_response_format(
             "outline": {"sections": "章节标题字符串数组"},
         },
     )
-    project = store.create("json output test", sdl, default_canvas())
+    project = store.create("json output test", sdl)
     manager = RunManager(store, MemoryCredentials())
 
     summary = await manager.start(
@@ -214,9 +487,10 @@ async def test_agent_json_output_enables_response_format(
 
 def test_runtime_environment_uses_linked_library_credential(
     tmp_path: Path,
+    legacy_workflow: Callable[[str], SDL],
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
-    sdl = default_sdl()
+    sdl = legacy_workflow()
     profile = sdl.api_profiles[0]
     previous_id = profile.id
     profile.id = "deepseek-flash"
@@ -224,13 +498,805 @@ def test_runtime_environment_uses_linked_library_credential(
     for agent in sdl.agents:
         if agent.api_profile == previous_id:
             agent.api_profile = profile.id
-    project = store.create("library credential test", sdl, default_canvas())
+    project = store.create("library credential test", sdl)
     manager = RunManager(store, LibraryMemoryCredentials())
 
     env = manager._runtime_environment(
         project,
         "run-id",
         SimpleNamespace(compiler_key="test-hash"),
+        tmp_path / "run",
     )
 
     assert env["LOOMLANE_SECRET_DEEPSEEK_FLASH"] == "library-secret"
+
+
+@pytest.mark.asyncio
+async def test_loop_condition_stops_after_convergence(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, configure = scripted_openai
+
+    def respond(body: dict[str, Any]) -> dict[str, Any]:
+        marker = _agent_marker(body)
+        value = _agent_inputs(body)["count"]
+        if marker == "loop-a":
+            return {"count": value + 1}
+        return {"count": value, "result": f"done-{value}"}
+
+    configure(respond)
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "a",
+                "name": "A",
+                "system_prompt": "AGENT: loop-a",
+                "inputs": [{"name": "count", "type": "DATA", "required": True}],
+                "outputs": [{"name": "count", "type": "DATA"}],
+            },
+            {
+                "id": "b",
+                "name": "B",
+                "system_prompt": "AGENT: loop-b",
+                "inputs": [{"name": "count", "type": "DATA", "required": True}],
+                "outputs": [
+                    {"name": "count", "type": "DATA"},
+                    {"name": "result", "type": "TEXT"},
+                ],
+            },
+        ],
+        edges=[
+            {
+                "id": "a-to-b",
+                "from": "a",
+                "to": "b",
+                "type": "PIPE",
+                "mappings": [{"from": "count", "to": "count"}],
+            },
+            {
+                "id": "b-to-a-loop",
+                "from": "b",
+                "to": "a",
+                "type": "LOOP",
+                "mappings": [{"from": "count", "to": "count"}],
+                "condition": {
+                    "op": "lt",
+                    "left": "$.agents.b.outputs.count",
+                    "right": 2,
+                },
+                "guard": {"max_traversals": 5},
+            },
+        ],
+        start=["a"],
+        workflow_inputs=[
+            {"name": "count", "type": "DATA", "required": True}
+        ],
+        workflow_outputs=[
+            {"name": "final", "agent": "b", "port": "result"}
+        ],
+    )
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("loop", sdl)
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"count": 0}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    assert detail.result["workflow_outputs"]["final"] == "done-2"
+    assert detail.result["edge_traversals"]["b-to-a-loop"] == 1
+    assert len(
+        [
+            event
+            for event in detail.events
+            if event["type"] == "node_enter" and event["node_id"] == "a"
+        ]
+    ) == 2
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_loop_guard_fails_run(tmp_path: Path, scripted_openai) -> None:
+    base_url, configure = scripted_openai
+    configure(
+        lambda body: (
+            {"value": _agent_inputs(body)["value"] + 1}
+            if _agent_marker(body) == "guard-a"
+            else {"value": _agent_inputs(body)["value"]}
+        )
+    )
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "a",
+                "name": "A",
+                "system_prompt": "AGENT: guard-a",
+                "inputs": [{"name": "value", "type": "DATA", "required": True}],
+                "outputs": [{"name": "value", "type": "DATA"}],
+            },
+            {
+                "id": "b",
+                "name": "B",
+                "system_prompt": "AGENT: guard-b",
+                "inputs": [{"name": "value", "type": "DATA", "required": True}],
+                "outputs": [{"name": "value", "type": "DATA"}],
+            },
+        ],
+        edges=[
+            {
+                "id": "a-to-b",
+                "from": "a",
+                "to": "b",
+                "type": "PIPE",
+                "mappings": [{"from": "value", "to": "value"}],
+            },
+            {
+                "id": "guard-loop",
+                "from": "b",
+                "to": "a",
+                "type": "LOOP",
+                "mappings": [{"from": "value", "to": "value"}],
+                "condition": {
+                    "op": "gte",
+                    "left": "$.agents.b.outputs.value",
+                    "right": 0,
+                },
+                "guard": {"max_traversals": 1},
+            },
+        ],
+        start=["a"],
+        workflow_inputs=[
+            {"name": "value", "type": "DATA", "required": True}
+        ],
+        workflow_outputs=[
+            {"name": "final", "agent": "b", "port": "value"}
+        ],
+    )
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("guard", sdl)
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"value": 0}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "failed"
+    assert "exceeded max_traversals=1" in detail.error
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fan_out_runs_agents_in_parallel_and_aggregate_waits_for_all(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, configure = scripted_openai
+    join_calls = 0
+    count_lock = threading.Lock()
+
+    def respond(body: dict[str, Any]) -> dict[str, Any]:
+        nonlocal join_calls
+        marker = _agent_marker(body)
+        if marker == "split":
+            return {"seed": "seed"}
+        if marker in {"left", "right"}:
+            time.sleep(0.25)
+            return {"token": f"{marker}-token"}
+        with count_lock:
+            join_calls += 1
+        inputs = _agent_inputs(body)
+        return {"summary": f"{inputs['left']}+{inputs['right']}"}
+
+    configure(respond)
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "split",
+                "name": "Split",
+                "system_prompt": "AGENT: split",
+                "inputs": [{"name": "seed", "type": "DATA", "required": True}],
+                "outputs": [{"name": "seed", "type": "DATA"}],
+            },
+            {
+                "id": "left",
+                "name": "Left",
+                "system_prompt": "AGENT: left",
+                "inputs": [{"name": "seed", "type": "DATA", "required": True}],
+                "outputs": [{"name": "token", "type": "DATA"}],
+            },
+            {
+                "id": "right",
+                "name": "Right",
+                "system_prompt": "AGENT: right",
+                "inputs": [{"name": "seed", "type": "DATA", "required": True}],
+                "outputs": [{"name": "token", "type": "DATA"}],
+            },
+            {
+                "id": "join",
+                "name": "Join",
+                "system_prompt": "AGENT: join",
+                "inputs": [
+                    {"name": "left", "type": "DATA", "required": True},
+                    {"name": "right", "type": "DATA", "required": True},
+                ],
+                "outputs": [{"name": "summary", "type": "TEXT"}],
+            },
+        ],
+        edges=[
+            {
+                "id": "fan-left",
+                "from": "split",
+                "to": "left",
+                "type": "FAN_OUT",
+                "mappings": [{"from": "seed", "to": "seed"}],
+            },
+            {
+                "id": "fan-right",
+                "from": "split",
+                "to": "right",
+                "type": "FAN_OUT",
+                "mappings": [{"from": "seed", "to": "seed"}],
+            },
+            {
+                "id": "aggregate-left",
+                "from": "left",
+                "to": "join",
+                "type": "AGGREGATE",
+                "aggregate": {"mode": "all"},
+                "mappings": [{"from": "token", "to": "left"}],
+            },
+            {
+                "id": "aggregate-right",
+                "from": "right",
+                "to": "join",
+                "type": "AGGREGATE",
+                "aggregate": {"mode": "all"},
+                "mappings": [{"from": "token", "to": "right"}],
+            },
+        ],
+        start=["split"],
+        workflow_inputs=[
+            {"name": "seed", "type": "DATA", "required": True}
+        ],
+        workflow_outputs=[
+            {"name": "summary", "agent": "join", "port": "summary"}
+        ],
+        execution={"max_parallel": 2},
+    )
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("fanout", sdl)
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"seed": "start"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    assert detail.result["workflow_outputs"]["summary"] == "left-token+right-token"
+    assert ScriptedOpenAIHandler.max_active >= 2
+    assert join_calls == 1
+    fanout_batches = {
+        event["data"]["batch_id"]
+        for event in detail.events
+        if event["type"] == "edge_traversed"
+        and event["edge_id"] in {"fan-left", "fan-right"}
+    }
+    assert len(fanout_batches) == 1
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_any_executes_once_per_batch(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, configure = scripted_openai
+    join_calls = 0
+
+    def respond(body: dict[str, Any]) -> dict[str, Any]:
+        nonlocal join_calls
+        marker = _agent_marker(body)
+        if marker == "split":
+            return {"seed": "seed"}
+        if marker == "left":
+            time.sleep(0.05)
+            return {"token": "left-token"}
+        if marker == "right":
+            time.sleep(0.3)
+            return {"token": "right-token"}
+        join_calls += 1
+        return {"summary": _agent_inputs(body)["token"]}
+
+    configure(respond)
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "split",
+                "name": "Split",
+                "system_prompt": "AGENT: split",
+                "inputs": [{"name": "seed", "type": "DATA", "required": True}],
+                "outputs": [{"name": "seed", "type": "DATA"}],
+            },
+            {
+                "id": "left",
+                "name": "Left",
+                "system_prompt": "AGENT: left",
+                "inputs": [{"name": "seed", "type": "DATA", "required": True}],
+                "outputs": [{"name": "token", "type": "DATA"}],
+            },
+            {
+                "id": "right",
+                "name": "Right",
+                "system_prompt": "AGENT: right",
+                "inputs": [{"name": "seed", "type": "DATA", "required": True}],
+                "outputs": [{"name": "token", "type": "DATA"}],
+            },
+            {
+                "id": "join",
+                "name": "Join",
+                "system_prompt": "AGENT: join",
+                "inputs": [{"name": "token", "type": "DATA", "required": True}],
+                "outputs": [{"name": "summary", "type": "TEXT"}],
+            },
+        ],
+        edges=[
+            {
+                "id": "fan-left",
+                "from": "split",
+                "to": "left",
+                "type": "FAN_OUT",
+                "mappings": [{"from": "seed", "to": "seed"}],
+            },
+            {
+                "id": "fan-right",
+                "from": "split",
+                "to": "right",
+                "type": "FAN_OUT",
+                "mappings": [{"from": "seed", "to": "seed"}],
+            },
+            {
+                "id": "any-left",
+                "from": "left",
+                "to": "join",
+                "type": "AGGREGATE",
+                "aggregate": {"mode": "any"},
+                "mappings": [{"from": "token", "to": "token"}],
+            },
+            {
+                "id": "any-right",
+                "from": "right",
+                "to": "join",
+                "type": "AGGREGATE",
+                "aggregate": {"mode": "any"},
+                "mappings": [{"from": "token", "to": "token"}],
+            },
+        ],
+        start=["split"],
+        workflow_inputs=[
+            {"name": "seed", "type": "DATA", "required": True}
+        ],
+        workflow_outputs=[
+            {"name": "summary", "agent": "join", "port": "summary"}
+        ],
+        execution={"max_parallel": 2},
+    )
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("aggregate-any", sdl)
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"seed": "start"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    assert join_calls == 1
+    assert detail.result["workflow_outputs"]["summary"] == "left-token"
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_multiple_gates_keep_run_waiting_until_all_are_resolved(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, configure = scripted_openai
+    def respond(body: dict[str, Any]) -> dict[str, Any]:
+        marker = _agent_marker(body)
+        seed = _agent_inputs(body)["seed"]
+        if marker == "split":
+            return {"seed": seed}
+        if marker == "gate-a":
+            return {"seed": seed, "done_a": "A"}
+        return {"seed": seed, "done_b": "B"}
+
+    configure(respond)
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "split",
+                "name": "Split",
+                "system_prompt": "AGENT: split",
+                "inputs": [{"name": "seed", "type": "TEXT", "required": True}],
+                "outputs": [{"name": "seed", "type": "TEXT"}],
+            },
+            {
+                "id": "gate-a",
+                "name": "Gate A",
+                "system_prompt": "AGENT: gate-a",
+                "inputs": [{"name": "seed", "type": "TEXT", "required": True}],
+                "outputs": [
+                    {"name": "seed", "type": "TEXT"},
+                    {"name": "done_a", "type": "TEXT"},
+                ],
+            },
+            {
+                "id": "gate-b",
+                "name": "Gate B",
+                "system_prompt": "AGENT: gate-b",
+                "inputs": [{"name": "seed", "type": "TEXT", "required": True}],
+                "outputs": [
+                    {"name": "seed", "type": "TEXT"},
+                    {"name": "done_b", "type": "TEXT"},
+                ],
+            },
+        ],
+        edges=[
+            {
+                "id": "gate-a-edge",
+                "from": "split",
+                "to": "gate-a",
+                "type": "HUMAN_GATE",
+                "mappings": [{"from": "seed", "to": "seed"}],
+                "human_gate": {
+                    "prompt": "Approve A",
+                    "timeout_seconds": 10,
+                },
+            },
+            {
+                "id": "gate-b-edge",
+                "from": "split",
+                "to": "gate-b",
+                "type": "HUMAN_GATE",
+                "mappings": [{"from": "seed", "to": "seed"}],
+                "human_gate": {
+                    "prompt": "Approve B",
+                    "timeout_seconds": 10,
+                },
+            },
+        ],
+        start=["split"],
+        workflow_inputs=[
+            {"name": "seed", "type": "TEXT", "required": True}
+        ],
+        workflow_outputs=[
+            {"name": "a", "agent": "gate-a", "port": "done_a"},
+            {"name": "b", "agent": "gate-b", "port": "done_b"},
+        ],
+    )
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("gates", sdl)
+    manager = RunManager(store, MemoryCredentials())
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"seed": "start"}),
+    )
+
+    detail = await _wait_until(
+        lambda: _pending_gate_detail(manager, summary.run_id, count=2)
+    )
+    first_gate, second_gate = detail.pending_gates
+    await manager.decide_gate(
+        summary.run_id,
+        first_gate.gate_id,
+        GateDecisionRequest(decision="approve"),
+    )
+    detail = await _wait_until(
+        lambda: _pending_gate_detail(manager, summary.run_id, count=1)
+    )
+    assert detail.status == "waiting"
+    await manager.decide_gate(
+        summary.run_id,
+        second_gate.gate_id,
+        GateDecisionRequest(decision="approve", comment="looks good"),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    assert detail.result["workflow_outputs"] == {"a": "A", "b": "B"}
+    resolved = [
+        event
+        for event in detail.events
+        if event["type"] == "human_gate_resolved"
+    ]
+    assert len(resolved) == 2
+    assert all(event["data"]["decision"] == "approve" for event in resolved)
+    await manager.shutdown()
+
+
+async def _pending_gate_detail(
+    manager: RunManager,
+    run_id: str,
+    *,
+    count: int,
+):
+    detail = await manager.get(run_id)
+    if detail.status == "waiting" and len(detail.pending_gates) == count:
+        return detail
+    return None
+
+
+@pytest.mark.asyncio
+async def test_gate_timeout_marks_decision_and_rejects_late_approval(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, configure = scripted_openai
+    configure(
+        lambda body: (
+            {"seed": _agent_inputs(body)["seed"], "final": "never"}
+            if _agent_marker(body) == "source"
+            else {"final": "unexpected"}
+        )
+    )
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "source",
+                "name": "Source",
+                "system_prompt": "AGENT: source",
+                "inputs": [{"name": "seed", "type": "TEXT", "required": True}],
+                "outputs": [
+                    {"name": "seed", "type": "TEXT"},
+                    {"name": "final", "type": "TEXT"},
+                ],
+            },
+            {
+                "id": "target",
+                "name": "Target",
+                "system_prompt": "AGENT: target",
+                "inputs": [{"name": "seed", "type": "TEXT", "required": True}],
+                "outputs": [{"name": "final", "type": "TEXT"}],
+            },
+        ],
+        edges=[
+            {
+                "id": "timeout-gate",
+                "from": "source",
+                "to": "target",
+                "type": "HUMAN_GATE",
+                "mappings": [{"from": "seed", "to": "seed"}],
+                "human_gate": {
+                    "prompt": "Will time out",
+                    "timeout_seconds": 1,
+                    "on_timeout": "fail",
+                },
+            }
+        ],
+        start=["source"],
+        workflow_inputs=[
+            {"name": "seed", "type": "TEXT", "required": True}
+        ],
+        workflow_outputs=[
+            {"name": "final", "agent": "target", "port": "final"}
+        ],
+    )
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("gate-timeout", sdl)
+    manager = RunManager(store, MemoryCredentials())
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"seed": "start"}),
+    )
+    waiting = await _wait_until(
+        lambda: _pending_gate_detail(manager, summary.run_id, count=1)
+    )
+    gate_id = waiting.pending_gates[0].gate_id
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "failed"
+    assert "timed out" in detail.error
+    with pytest.raises(GateConflict):
+        await manager.decide_gate(
+            summary.run_id,
+            gate_id,
+            GateDecisionRequest(decision="approve"),
+        )
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agent_and_workflow_token_limits_fail_runs(
+    tmp_path: Path,
+    fake_openai: str,
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    agent_limited = legacy_workflow(fake_openai)
+    agent_limited.agents[0].limits.max_total_tokens = 10
+    project = store.create("agent token limit", agent_limited)
+    manager = RunManager(store, MemoryCredentials())
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"requirement": "test"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+    assert detail.status == "failed"
+    assert "Agent 'drafter' exceeded max_total_tokens=10" in detail.error
+    await manager.shutdown()
+
+    workflow_limited = legacy_workflow(fake_openai)
+    workflow_limited.workflow.execution.max_total_tokens = 10
+    project = store.create("workflow token limit", workflow_limited)
+    manager = RunManager(store, MemoryCredentials())
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"requirement": "test"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+    assert detail.status == "failed"
+    assert "Workflow exceeded max_total_tokens=10" in detail.error
+    await manager.shutdown()
+
+
+def test_file_artifact_is_copied_under_custom_output_dir(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, configure = scripted_openai
+    configure(
+        lambda _: {
+            "text_value": "hello",
+            "data_value": {"ok": True},
+            "file_value": {"path": "uploads/source.txt"},
+        }
+    )
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "writer",
+                "name": "Writer",
+                "system_prompt": "AGENT: writer",
+                "inputs": [
+                    {"name": "source", "type": "FILE", "required": True}
+                ],
+                "outputs": [
+                    {"name": "text_value", "type": "TEXT"},
+                    {"name": "data_value", "type": "DATA"},
+                    {"name": "file_value", "type": "FILE"},
+                ],
+                "output_dir": "custom-output",
+            }
+        ],
+        edges=[],
+        start=["writer"],
+        workflow_inputs=[
+            {"name": "source", "type": "FILE", "required": True}
+        ],
+        workflow_outputs=[
+            {"name": "text", "agent": "writer", "port": "text_value"}
+        ],
+    )
+    project_dir = tmp_path / "project"
+    compiler = WorkflowCompiler()
+    generated = compiler.compile(sdl, project_dir)
+    workspace = tmp_path / "workspace"
+    (workspace / "uploads").mkdir(parents=True)
+    (workspace / "uploads" / "source.txt").write_text("source", encoding="utf-8")
+    input_path = tmp_path / "input.json"
+    result_path = tmp_path / "result.json"
+    input_path.write_text(
+        json.dumps({"source": {"path": "uploads/source.txt"}}),
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "LOOMLANE_GATE_DIR": str(workspace / "gates"),
+        "PYTHONUTF8": "1",
+    }
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(generated.generated_path) / "workflow.py"),
+            "--input",
+            str(input_path),
+            "--result",
+            str(result_path),
+        ],
+        cwd=workspace,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    artifacts = {item["port"]: item for item in result["artifacts"]}
+    assert artifacts["text_value"]["path"].endswith(".txt")
+    assert artifacts["data_value"]["path"].endswith(".json")
+    assert artifacts["file_value"]["path"].endswith(".txt")
+    for artifact in artifacts.values():
+        assert artifact["path"].startswith("custom-output/")
+        assert (workspace / artifact["path"]).is_file()
+    events = [
+        json.loads(line)
+        for line in completed.stdout.splitlines()
+        if line.strip()
+    ]
+    assert len(
+        [event for event in events if event["type"] == "artifact_written"]
+    ) == 3
+
+
+def test_file_artifact_rejects_workspace_escape(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, configure = scripted_openai
+    configure(lambda _: {"file_value": {"path": "../outside.txt"}})
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "writer",
+                "name": "Writer",
+                "system_prompt": "AGENT: writer",
+                "inputs": [],
+                "outputs": [{"name": "file_value", "type": "FILE"}],
+            }
+        ],
+        edges=[],
+        start=["writer"],
+        workflow_outputs=[
+            {"name": "file", "agent": "writer", "port": "file_value"}
+        ],
+    )
+    project_dir = tmp_path / "project"
+    generated = WorkflowCompiler().compile(sdl, project_dir)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    input_path = tmp_path / "input.json"
+    result_path = tmp_path / "result.json"
+    input_path.write_text("{}", encoding="utf-8")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(generated.generated_path) / "workflow.py"),
+            "--input",
+            str(input_path),
+            "--result",
+            str(result_path),
+        ],
+        cwd=workspace,
+        env={
+            **os.environ,
+            "LOOMLANE_GATE_DIR": str(workspace / "gates"),
+            "PYTHONUTF8": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert "escaped the run workspace" in result["error"]

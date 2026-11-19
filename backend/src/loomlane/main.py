@@ -13,8 +13,12 @@ from . import __version__
 from .compiler import COMPILER_VERSION, WorkflowCompiler
 from .models import (
     ApiProfile,
+    GateDecisionRequest,
+    GateDecisionResponse,
     GenerateResponse,
     ImportSDLRequest,
+    InputFileRef,
+    OpenFolderResponse,
     ProjectCreateRequest,
     ProjectDetail,
     ProjectSummary,
@@ -30,6 +34,10 @@ from .models import (
 )
 from .runtime import (
     ActiveRunExists,
+    GateConflict,
+    GateNotFound,
+    InputFileError,
+    RunFolderError,
     RunConfigurationError,
     RunManager,
     RunNotFound,
@@ -86,6 +94,7 @@ def create_app(
             "http://127.0.0.1:5173",
             "http://localhost:5173",
         ],
+        allow_origin_regex=r"^http://(?:127\.0\.0\.1|localhost):\d+$",
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -146,6 +155,34 @@ def create_app(
     ) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": str(exc)},
+        )
+
+    @app.exception_handler(InputFileError)
+    async def input_file_error(_: Request, exc: InputFileError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": str(exc)},
+        )
+
+    @app.exception_handler(RunFolderError)
+    async def run_folder_error(_: Request, exc: RunFolderError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": str(exc)},
+        )
+
+    @app.exception_handler(GateNotFound)
+    async def gate_not_found(_: Request, exc: GateNotFound) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": "Human gate not found", "gate_id": str(exc)},
+        )
+
+    @app.exception_handler(GateConflict)
+    async def gate_conflict(_: Request, exc: GateConflict) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exc)},
         )
 
@@ -425,6 +462,25 @@ def create_app(
         project_or_404(project_id)
         return await run_manager.start(project_id, payload)
 
+    @app.post(
+        "/api/projects/{project_id}/input-files",
+        response_model=InputFileRef,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def upload_input_file(
+        project_id: str,
+        request: Request,
+        input_name: str = Query(min_length=1),
+        file_name: str = Query(min_length=1, max_length=255),
+    ) -> InputFileRef:
+        project_or_404(project_id)
+        return run_manager.stage_input_file(
+            project_id,
+            input_name,
+            file_name,
+            await request.body(),
+        )
+
     @app.get(
         "/api/projects/{project_id}/runs",
         response_model=list[RunSummary],
@@ -436,6 +492,27 @@ def create_app(
     @app.get("/api/runs/{run_id}", response_model=RunDetail)
     async def get_run(run_id: str) -> RunDetail:
         return await run_manager.get(run_id)
+
+    @app.post(
+        "/api/runs/{run_id}/open-folder",
+        response_model=OpenFolderResponse,
+    )
+    async def open_run_folder(run_id: str) -> OpenFolderResponse:
+        return OpenFolderResponse(
+            path=await run_manager.open_output_folder(run_id),
+            opened=True,
+        )
+
+    @app.post(
+        "/api/runs/{run_id}/gates/{gate_id}",
+        response_model=GateDecisionResponse,
+    )
+    async def decide_gate(
+        run_id: str,
+        gate_id: str,
+        payload: GateDecisionRequest,
+    ) -> GateDecisionResponse:
+        return await run_manager.decide_gate(run_id, gate_id, payload)
 
     @app.get("/api/runs/{run_id}/events")
     async def run_events(

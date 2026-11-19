@@ -1,6 +1,8 @@
 import type {
   ApiProfile,
   GenerateResponse,
+  InputFileRef,
+  OpenFolderResponse,
   ProjectDetail,
   ProjectSummary,
   RunDetail,
@@ -191,10 +193,44 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  uploadInputFile: async (
+    projectId: string,
+    inputName: string,
+    file: File,
+  ): Promise<InputFileRef> => {
+    const query = new URLSearchParams({
+      input_name: inputName,
+      file_name: file.name,
+    })
+    const response = await fetch(
+      `${API_BASE}/api/projects/${projectId}/input-files?${query}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: file,
+      },
+    )
+    if (!response.ok) {
+      let payload: Record<string, unknown> = {}
+      try {
+        payload = await response.json()
+      } catch {
+        payload = { detail: response.statusText }
+      }
+      throw new ApiError(response.status, payload)
+    }
+    return response.json() as Promise<InputFileRef>
+  },
+
   listRuns: (projectId: string) =>
     request<RunSummary[]>(`/api/projects/${projectId}/runs`),
 
   getRun: (runId: string) => request<RunDetail>(`/api/runs/${runId}`),
+
+  openRunFolder: (runId: string) =>
+    request<OpenFolderResponse>(`/api/runs/${runId}/open-folder`, {
+      method: 'POST',
+    }),
 
   cancelRun: (runId: string) =>
     request<RunSummary>(`/api/runs/${runId}/cancel`, { method: 'POST' }),

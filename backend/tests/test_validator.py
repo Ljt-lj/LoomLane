@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 
 from loomlane.condition import (
@@ -7,7 +8,13 @@ from loomlane.condition import (
     evaluate_condition,
     validate_condition,
 )
-from loomlane.models import Condition, EdgeGuard
+from loomlane.models import (
+    AggregateConfig,
+    Condition,
+    EdgeGuard,
+    EdgeType,
+    SDL,
+)
 from loomlane.storage import default_sdl
 from loomlane.validator import validate_sdl
 
@@ -18,10 +25,17 @@ def test_default_workflow_is_valid() -> None:
     assert result.valid
     assert result.normalized_sdl is not None
     assert result.issues == []
+    assert len(result.normalized_sdl["agents"]) == 8
+    assert len(result.normalized_sdl["edges"]) == 10
+    assert {edge["type"] for edge in result.normalized_sdl["edges"]} == {
+        edge_type.value for edge_type in EdgeType
+    }
 
 
-def test_non_feedback_cycle_is_rejected() -> None:
-    sdl = deepcopy(default_sdl())
+def test_non_feedback_cycle_is_rejected(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
     sdl.edges.append(
         sdl.edges[0].model_copy(
             update={
@@ -45,8 +59,10 @@ def test_non_feedback_cycle_is_rejected() -> None:
     assert {issue.code for issue in result.issues} >= {"cycle_not_allowed"}
 
 
-def test_feedback_default_guard_and_edge_order_are_stable() -> None:
-    sdl = deepcopy(default_sdl())
+def test_feedback_default_guard_and_edge_order_are_stable(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
     feedback = next(edge for edge in sdl.edges if edge.id == "review-feedback")
     feedback.guard.max_traversals = None
     sdl.edges.reverse()
@@ -62,8 +78,10 @@ def test_feedback_default_guard_and_edge_order_are_stable() -> None:
     assert normalized_feedback["guard"]["max_traversals"] == 3
 
 
-def test_feedback_must_target_an_upstream_agent() -> None:
-    sdl = deepcopy(default_sdl())
+def test_feedback_must_target_an_upstream_agent(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
     sdl.edges.append(
         sdl.edges[0].model_copy(
             update={
@@ -86,6 +104,68 @@ def test_feedback_must_target_an_upstream_agent() -> None:
 
     assert not result.valid
     assert "feedback_not_upstream" in {issue.code for issue in result.issues}
+
+
+def test_loop_requires_a_continuation_condition(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    loop_edge = next(edge for edge in sdl.edges if edge.id == "review-feedback")
+    loop_edge.type = EdgeType.LOOP
+    loop_edge.condition = None
+
+    result = validate_sdl(sdl)
+
+    assert not result.valid
+    assert "loop_missing_condition" in {issue.code for issue in result.issues}
+
+
+def test_aggregate_rejects_mixed_modes_for_one_target(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    first_edge = next(edge for edge in sdl.edges if edge.id == "draft-to-review")
+    first_edge.type = EdgeType.AGGREGATE
+    first_edge.aggregate = AggregateConfig(mode="all")
+    sdl.edges.append(
+        first_edge.model_copy(
+            update={
+                "id": "review-to-review-aggregate",
+                "from_": "reviewer",
+                "aggregate": AggregateConfig(mode="any"),
+            }
+        )
+    )
+
+    result = validate_sdl(sdl)
+
+    assert not result.valid
+    assert "mixed_aggregate_modes" in {issue.code for issue in result.issues}
+
+
+def test_aggregate_cannot_mix_with_regular_incoming_edges(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    aggregate_edge = next(
+        edge for edge in sdl.edges if edge.id == "draft-to-review"
+    )
+    aggregate_edge.type = EdgeType.AGGREGATE
+    aggregate_edge.aggregate = AggregateConfig(mode="all")
+    sdl.edges.append(
+        aggregate_edge.model_copy(
+            update={
+                "id": "draft-to-review-pipe",
+                "type": EdgeType.PIPE,
+                "aggregate": None,
+            }
+        )
+    )
+
+    result = validate_sdl(sdl)
+
+    assert not result.valid
+    assert "mixed_aggregate_inputs" in {issue.code for issue in result.issues}
 
 
 def test_condition_rejects_unlisted_paths() -> None:
@@ -143,8 +223,10 @@ def test_multi_predicate_condition_validates_and_evaluates() -> None:
     assert not evaluate_condition(condition, root)
 
 
-def test_port_type_mismatch_is_rejected() -> None:
-    sdl = deepcopy(default_sdl())
+def test_port_type_mismatch_is_rejected(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
     sdl.edges[0].mappings[0].from_ = "outline"
 
     result = validate_sdl(sdl)

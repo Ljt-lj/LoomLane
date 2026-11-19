@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
+import shutil
 import sys
+import threading
 import time
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +24,51 @@ from config import SDL
 
 class WorkflowError(RuntimeError):
     pass
+
+
+class AgentCallError(WorkflowError):
+    """An Agent error carrying usage that was already reported by the API."""
+
+    def __init__(
+        self,
+        message: str,
+        usage: dict[str, int] | None = None,
+        agent_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.agent_id = agent_id
+        self.usage = usage or {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+
+class GateTimeoutError(WorkflowError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        gate_id: str,
+        comment: str,
+    ) -> None:
+        super().__init__(message)
+        self.gate_id = gate_id
+        self.comment = comment
+
+
+@dataclass(frozen=True)
+class GateResult:
+    decision: str
+    comment: str | None
+    timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class AgentExecution:
+    agent_id: str
+    batch_id: str
+    inputs: dict[str, Any]
 
 
 class _Missing:
@@ -35,6 +86,7 @@ class EventWriter:
     def __init__(self) -> None:
         self.seq = 0
         self.run_id = os.getenv("LOOMLANE_RUN_ID", "run")
+        self._lock = threading.Lock()
 
     def emit(
         self,
@@ -44,18 +96,19 @@ class EventWriter:
         edge_id: str | None = None,
         data: dict[str, Any] | None = None,
     ) -> None:
-        self.seq += 1
-        event = {
-            "seq": self.seq,
-            "run_id": self.run_id,
-            "ts": _now(),
-            "type": event_type,
-            "node_id": node_id,
-            "edge_id": edge_id,
-            "data": data or {},
-        }
-        sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+        with self._lock:
+            self.seq += 1
+            event = {
+                "seq": self.seq,
+                "run_id": self.run_id,
+                "ts": _now(),
+                "type": event_type,
+                "node_id": node_id,
+                "edge_id": edge_id,
+                "data": data or {},
+            }
+            sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
 
 
 def _path_parts(path: str) -> list[str]:
@@ -137,6 +190,14 @@ def _extract_json(content: str) -> dict[str, Any]:
     return value
 
 
+def _safe_path(root: Path, relative: str) -> Path:
+    resolved_root = root.resolve()
+    target = (resolved_root / relative).resolve()
+    if target != resolved_root and resolved_root not in target.parents:
+        raise WorkflowError(f"Path '{relative}' escaped the run workspace")
+    return target
+
+
 def _validate_value(value: Any, port: dict[str, Any], workspace: Path) -> None:
     port_type = port["type"]
     if port_type == "MIXED":
@@ -150,9 +211,7 @@ def _validate_value(value: Any, port: dict[str, Any], workspace: Path) -> None:
     if port_type == "FILE":
         if not isinstance(value, dict) or not isinstance(value.get("path"), str):
             raise WorkflowError(f"Port '{port['name']}' requires a FILE reference")
-        target = (workspace / value["path"]).resolve()
-        if workspace.resolve() not in {target, *target.parents}:
-            raise WorkflowError(f"File port '{port['name']}' escaped the workspace")
+        _safe_path(workspace, value["path"])
 
     hint = port.get("schema_hint")
     if not hint:
@@ -189,10 +248,7 @@ def _json_output_contract(agent: dict[str, Any]) -> str | None:
         return None
     template = config.get("template") or {}
     if not template:
-        return (
-            "Structured output mode is enabled. "
-            "Return exactly one valid JSON object."
-        )
+        return "Structured output mode is enabled. Return exactly one valid JSON object."
     rendered = json.dumps(template, ensure_ascii=False, indent=2)
     return (
         "Use the following JSON template as the required response shape. "
@@ -255,9 +311,8 @@ def _call_agent(
     if max_tokens:
         body["max_tokens"] = max_tokens
     json_output = agent.get("json_output") or {}
-    if (
-        json_output.get("enabled")
-        or profile.get("capabilities", {}).get("structured_output")
+    if json_output.get("enabled") or profile.get("capabilities", {}).get(
+        "structured_output"
     ):
         body["response_format"] = {"type": "json_object"}
 
@@ -292,7 +347,6 @@ def _call_agent(
             content = payload["choices"][0]["message"]["content"]
             if not isinstance(content, str):
                 raise WorkflowError("Agent response content is not text")
-            outputs = _extract_json(content)
             usage = payload.get("usage") or {}
             normalized_usage = {
                 "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
@@ -300,17 +354,84 @@ def _call_agent(
                 "total_tokens": int(usage.get("total_tokens", 0) or 0),
             }
             events.emit("token_usage", node_id=agent["id"], data=normalized_usage)
+            finish_reason = payload["choices"][0].get("finish_reason")
+            if finish_reason in {"length", "max_tokens"}:
+                max_tokens_label = max_tokens or "unknown"
+                raise AgentCallError(
+                    "Agent output was truncated because max_tokens was reached "
+                    f"(completion_tokens={normalized_usage['completion_tokens']}, "
+                    f"max_tokens={max_tokens_label}). Increase limits.max_tokens "
+                    "for this agent.",
+                    normalized_usage,
+                )
+            try:
+                outputs = _extract_json(content)
+            except WorkflowError as exc:
+                raise AgentCallError(str(exc), normalized_usage) from exc
             return outputs, normalized_usage
+        except AgentCallError:
+            raise
         except (httpx.HTTPStatusError, KeyError, TypeError, ValueError, WorkflowError) as exc:
             last_error = exc
             break
     raise WorkflowError(f"Agent request failed: {last_error}") from last_error
 
 
+def _write_artifacts(
+    agent: dict[str, Any],
+    outputs: dict[str, Any],
+    workspace: Path,
+    step: int,
+    batch_id: str,
+) -> list[dict[str, Any]]:
+    output_dir = agent.get("output_dir") or "artifacts"
+    directory = _safe_path(workspace, output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    artifacts: list[dict[str, Any]] = []
+    for port in agent["outputs"]:
+        safe_batch = re.sub(r"[^A-Za-z0-9_.-]", "_", batch_id)
+        name = re.sub(
+            r"[^A-Za-z0-9_.-]",
+            "_",
+            f"{step:05d}-{safe_batch}-{agent['id']}-{port['name']}",
+        )
+        port_type = port["type"]
+        extension = ".json" if port_type == "DATA" else ".txt"
+        target = directory / f"{name}{extension}"
+        value = outputs[port["name"]]
+        if port_type == "FILE":
+            source = _safe_path(workspace, value["path"])
+            if not source.is_file():
+                raise WorkflowError(
+                    f"File output '{port['name']}' does not exist: {value['path']}"
+                )
+            target = directory / f"{name}{source.suffix}"
+            shutil.copy2(source, target)
+        elif port_type == "DATA":
+            target.write_text(
+                json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            target.write_text(str(value), encoding="utf-8")
+        artifacts.append(
+            {
+                "agent_id": agent["id"],
+                "port": port["name"],
+                "path": target.relative_to(workspace.resolve()).as_posix(),
+                "type": port_type,
+                "step": step,
+                "batch_id": batch_id,
+                "bytes": target.stat().st_size,
+            }
+        )
+    return artifacts
+
+
 class WorkflowRuntime:
     def __init__(self, run_inputs: dict[str, Any], workspace: Path) -> None:
         self.run_inputs = run_inputs
-        self.workspace = workspace
+        self.workspace = workspace.resolve()
         self.events = EventWriter()
         self.agents = {agent["id"]: agent for agent in SDL["agents"]}
         self.profiles = {
@@ -319,8 +440,8 @@ class WorkflowRuntime:
         self.inputs: dict[str, dict[str, Any]] = {
             agent_id: {} for agent_id in self.agents
         }
-        self.dirty: dict[str, set[str]] = {
-            agent_id: set() for agent_id in self.agents
+        self.input_batches: dict[str, dict[str, dict[str, Any]]] = {
+            agent_id: {} for agent_id in self.agents
         }
         self.outputs: dict[str, dict[str, Any]] = {}
         self.traversals: dict[str, int] = {
@@ -331,35 +452,127 @@ class WorkflowRuntime:
             "completion_tokens": 0,
             "total_tokens": 0,
         }
+        self.agent_usage: dict[str, dict[str, int]] = {
+            agent_id: {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
+            for agent_id in self.agents
+        }
+        self.artifacts: list[dict[str, Any]] = []
+        self.pending: deque[AgentExecution] = deque()
+        self.scheduled_batches: set[tuple[str, str]] = set()
+        self.aggregate_arrivals: dict[tuple[str, str], set[str]] = {}
+        self.aggregate_edges: dict[str, list[dict[str, Any]]] = {
+            agent_id: [
+                edge
+                for edge in SDL["edges"]
+                if edge["to"] == agent_id and edge["type"] == "AGGREGATE"
+            ]
+            for agent_id in self.agents
+        }
+        self._gate_executor: ThreadPoolExecutor | None = None
+        self._stop_event = threading.Event()
+        self._batch_counter = itertools.count(1)
         self.step = 0
-        self.current_agent: str | None = None
+        self.failed_node_id: str | None = None
+        self._active_agents: set[str] = set()
+        execution = SDL["workflow"]["execution"]
+        self.max_steps = int(execution.get("max_steps", 200))
+        self.max_parallel = max(1, int(execution.get("max_parallel", 4)))
+        self.max_total_tokens = execution.get("max_total_tokens")
+        self.gate_dir = Path(
+            os.getenv("LOOMLANE_GATE_DIR", str(workspace / "gates"))
+        ).resolve()
+        self.gate_dir.mkdir(parents=True, exist_ok=True)
+        self.gate_counters: dict[str, int] = {}
+
+    def _new_batch_id(self, prefix: str) -> str:
+        return f"{prefix}-{next(self._batch_counter)}"
+
+    def _set_input(
+        self,
+        agent_id: str,
+        batch_id: str,
+        port_name: str,
+        value: Any,
+    ) -> None:
+        batch_inputs = self.input_batches[agent_id].setdefault(batch_id, {})
+        batch_inputs[port_name] = value
+        self.inputs[agent_id][port_name] = value
+
+    def _batch_inputs(self, agent_id: str, batch_id: str) -> dict[str, Any]:
+        return dict(self.input_batches[agent_id].get(batch_id, {}))
+
+    def _seed_batch_inputs(self, agent_id: str, batch_id: str) -> None:
+        batches = self.input_batches[agent_id]
+        if batch_id in batches:
+            return
+        latest_batch_id = next(reversed(batches), None)
+        batches[batch_id] = (
+            dict(batches[latest_batch_id])
+            if latest_batch_id is not None
+            else {}
+        )
+
+    def _aggregate_ready(self, agent_id: str, batch_id: str) -> bool:
+        incoming = self.aggregate_edges[agent_id]
+        if not incoming:
+            return True
+        arrived = self.aggregate_arrivals.get((agent_id, batch_id), set())
+        mode = incoming[0].get("aggregate", {}).get("mode", "all")
+        if mode == "any":
+            return bool(arrived)
+        return {edge["id"] for edge in incoming}.issubset(arrived)
+
+    def _required_inputs_ready(self, agent_id: str, batch_id: str) -> bool:
+        values = self.input_batches[agent_id].get(batch_id, {})
+        return all(
+            port["name"] in values
+            for port in self.agents[agent_id]["inputs"]
+            if port.get("required", True)
+        )
+
+    def _enqueue_if_ready(self, agent_id: str, batch_id: str) -> None:
+        key = (agent_id, batch_id)
+        if key in self.scheduled_batches:
+            return
+        if not self._required_inputs_ready(agent_id, batch_id):
+            return
+        if not self._aggregate_ready(agent_id, batch_id):
+            return
+        self.scheduled_batches.add(key)
+        self.pending.append(
+            AgentExecution(
+                agent_id=agent_id,
+                batch_id=batch_id,
+                inputs=self._batch_inputs(agent_id, batch_id),
+            )
+        )
 
     def _initialize_inputs(self) -> None:
+        start_batch = "batch-start"
         for agent_id in SDL["start"]:
             agent = self.agents[agent_id]
             for port in agent["inputs"]:
                 if port["name"] in self.run_inputs:
-                    self.inputs[agent_id][port["name"]] = self.run_inputs[port["name"]]
-                    self.dirty[agent_id].add(port["name"])
+                    self._set_input(
+                        agent_id,
+                        start_batch,
+                        port["name"],
+                        self.run_inputs[port["name"]],
+                    )
             for port in agent["inputs"]:
-                if port.get("required", True) and port["name"] not in self.inputs[agent_id]:
+                if (
+                    port.get("required", True)
+                    and port["name"]
+                    not in self.input_batches[agent_id].get(start_batch, {})
+                ):
                     raise WorkflowError(
                         f"Missing workflow input '{port['name']}' for '{agent_id}'"
                     )
-
-    def _ready_agent(self) -> str | None:
-        for agent in SDL["agents"]:
-            agent_id = agent["id"]
-            if not self.dirty[agent_id]:
-                continue
-            required = [
-                port["name"]
-                for port in agent["inputs"]
-                if port.get("required", True)
-            ]
-            if all(name in self.inputs[agent_id] for name in required):
-                return agent_id
-        return None
+            self._enqueue_if_ready(agent_id, start_batch)
 
     def _condition_root(self) -> dict[str, Any]:
         return {
@@ -375,73 +588,348 @@ class WorkflowRuntime:
             "run": {"step": self.step},
         }
 
-    def _run_agent(self, agent_id: str) -> dict[str, Any]:
+    def _run_agent(self, execution: AgentExecution, step: int) -> dict[str, Any]:
+        agent_id = execution.agent_id
         agent = self.agents[agent_id]
         profile = self.profiles[agent["api_profile"]]
-        self.current_agent = agent_id
-        self.dirty[agent_id].clear()
-        self.events.emit("node_enter", node_id=agent_id)
-        agent_outputs, usage = _call_agent(
-            agent,
-            profile,
-            self.inputs[agent_id],
-            self.events,
-        )
-        for port in agent["outputs"]:
-            if port["name"] not in agent_outputs:
-                raise WorkflowError(
-                    f"Agent '{agent_id}' omitted output port '{port['name']}'"
-                )
-            _validate_value(agent_outputs[port["name"]], port, self.workspace)
-        extra_keys = set(agent_outputs) - {port["name"] for port in agent["outputs"]}
-        if extra_keys:
-            raise WorkflowError(
-                f"Agent '{agent_id}' returned unexpected ports: "
-                + ", ".join(sorted(extra_keys))
-            )
-        for key, value in usage.items():
-            self.usage[key] += value
-        self.outputs[agent_id] = agent_outputs
         self.events.emit(
-            "node_exit",
+            "node_enter",
             node_id=agent_id,
-            data={"status": "succeeded"},
+            data={"batch_id": execution.batch_id, "step": step},
         )
-        return agent_outputs
-
-    def _traverse_edges(self, agent_id: str, agent_outputs: dict[str, Any]) -> None:
-        root = self._condition_root()
-        for edge in SDL["edges"]:
-            if edge["from"] != agent_id:
-                continue
-            condition = edge.get("condition")
-            if condition is not None and not evaluate_condition(condition, root):
-                continue
-            if edge["type"] == "FEEDBACK":
-                self.traversals[edge["id"]] += 1
-                limit = edge.get("guard", {}).get("max_traversals")
-                if limit is None:
-                    limit = SDL["workflow"]["execution"]["feedback_limit_default"]
-                if self.traversals[edge["id"]] > limit:
+        try:
+            outputs, usage = _call_agent(
+                agent,
+                profile,
+                execution.inputs,
+                self.events,
+            )
+            for port in agent["outputs"]:
+                if port["name"] not in outputs:
                     raise WorkflowError(
-                        f"Feedback edge '{edge['id']}' exceeded max_traversals={limit}"
+                        f"Agent '{agent_id}' omitted output port '{port['name']}'"
                     )
-
-            mapped: dict[str, Any] = {}
-            for mapping in edge["mappings"]:
-                source_value = agent_outputs[mapping["from"]]
-                self.inputs[edge["to"]][mapping["to"]] = source_value
-                self.dirty[edge["to"]].add(mapping["to"])
-                mapped[mapping["to"]] = source_value
+                _validate_value(outputs[port["name"]], port, self.workspace)
+            extra_keys = set(outputs) - {port["name"] for port in agent["outputs"]}
+            if extra_keys:
+                raise WorkflowError(
+                    f"Agent '{agent_id}' returned unexpected ports: "
+                    + ", ".join(sorted(extra_keys))
+                )
+            artifacts = _write_artifacts(
+                agent,
+                outputs,
+                self.workspace,
+                step,
+                execution.batch_id,
+            )
+            for artifact in artifacts:
+                self.events.emit("artifact_written", node_id=agent_id, data=artifact)
             self.events.emit(
-                "edge_traversed",
-                edge_id=edge["id"],
+                "node_exit",
+                node_id=agent_id,
                 data={
-                    "from": edge["from"],
-                    "to": edge["to"],
-                    "mapped_ports": list(mapped),
+                    "status": "succeeded",
+                    "batch_id": execution.batch_id,
+                    "step": step,
                 },
             )
+            return {"outputs": outputs, "usage": usage, "artifacts": artifacts}
+        except AgentCallError as exc:
+            if exc.agent_id is None:
+                exc.agent_id = agent_id
+            raise
+        except Exception as exc:
+            usage = getattr(exc, "usage", None)
+            raise AgentCallError(str(exc), usage, agent_id) from exc
+
+    def _merge_usage(
+        self,
+        target: dict[str, int],
+        usage: dict[str, int],
+    ) -> None:
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            target[key] += int(usage.get(key, 0) or 0)
+
+    def _check_token_limits(self, agent_id: str) -> None:
+        agent_limit = self.agents[agent_id].get("limits", {}).get("max_total_tokens")
+        if agent_limit is not None and self.agent_usage[agent_id]["total_tokens"] > agent_limit:
+            raise WorkflowError(
+                f"Agent '{agent_id}' exceeded max_total_tokens={agent_limit}"
+            )
+        if self.max_total_tokens is not None and self.usage["total_tokens"] > self.max_total_tokens:
+            raise WorkflowError(
+                f"Workflow exceeded max_total_tokens={self.max_total_tokens}"
+            )
+
+    def _propagate_edge(
+        self,
+        edge: dict[str, Any],
+        agent_outputs: dict[str, Any],
+        batch_id: str,
+        fanout_batch_id: str | None = None,
+    ) -> None:
+        if edge["type"] in {"FEEDBACK", "LOOP"}:
+            self.traversals[edge["id"]] += 1
+            limit = edge.get("guard", {}).get("max_traversals")
+            if limit is None:
+                limit = SDL["workflow"]["execution"].get(
+                    "loop_limit_default" if edge["type"] == "LOOP" else "feedback_limit_default",
+                    10,
+                )
+            if self.traversals[edge["id"]] > limit:
+                label = "Loop" if edge["type"] == "LOOP" else "Feedback"
+                raise WorkflowError(
+                    f"{label} edge '{edge['id']}' exceeded max_traversals={limit}"
+                )
+
+        if edge["type"] == "FAN_OUT":
+            target_batch_id = fanout_batch_id or self._new_batch_id("fanout")
+        elif edge["type"] in {"FEEDBACK", "LOOP"}:
+            target_batch_id = self._new_batch_id("loop")
+        else:
+            target_batch_id = batch_id
+
+        if target_batch_id != batch_id:
+            self._seed_batch_inputs(edge["to"], target_batch_id)
+        mapped: dict[str, Any] = {}
+        for mapping in edge["mappings"]:
+            source_value = agent_outputs[mapping["from"]]
+            self._set_input(
+                edge["to"],
+                target_batch_id,
+                mapping["to"],
+                source_value,
+            )
+            mapped[mapping["to"]] = source_value
+        if edge["type"] == "AGGREGATE":
+            self.aggregate_arrivals.setdefault(
+                (edge["to"], target_batch_id),
+                set(),
+            ).add(edge["id"])
+        self.events.emit(
+            "edge_traversed",
+            edge_id=edge["id"],
+            data={
+                "from": edge["from"],
+                "to": edge["to"],
+                "mapped_ports": list(mapped),
+                "batch_id": target_batch_id,
+            },
+        )
+        self._enqueue_if_ready(edge["to"], target_batch_id)
+
+    def _gate_path(self, gate_id: str) -> Path:
+        return self.gate_dir / f"{gate_id}.json"
+
+    def _write_gate(self, gate_id: str, payload: dict[str, Any]) -> None:
+        path = self._gate_path(gate_id)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+    def _locked_gate_update(
+        self,
+        gate_id: str,
+        updater: Any,
+    ) -> dict[str, Any]:
+        path = self._gate_path(gate_id)
+        lock_path = path.with_suffix(".lock")
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                lock = lock_path.open("x", encoding="utf-8")
+                break
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise WorkflowError(
+                        f"Timed out waiting to update human gate '{gate_id}'"
+                    )
+                time.sleep(0.02)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = updater(payload)
+            self._write_gate(gate_id, payload)
+            return payload
+        finally:
+            lock.close()
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _wait_for_gate(
+        self,
+        edge: dict[str, Any],
+        gate_id: str,
+        timeout_seconds: int,
+    ) -> GateResult:
+        path = self._gate_path(gate_id)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if self._stop_event.is_set():
+                raise WorkflowError(
+                    f"Workflow stopped while waiting for human gate '{gate_id}'"
+                )
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                payload = {}
+            decision = payload.get("decision")
+            if decision in {"approve", "reject"}:
+                return GateResult(str(decision), payload.get("comment"))
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+
+        config = edge.get("human_gate") or {}
+        on_timeout = config.get("on_timeout", "fail")
+        comment = f"Gate timed out after {timeout_seconds}s"
+
+        def mark_timeout(payload: dict[str, Any]) -> dict[str, Any]:
+            existing = payload.get("decision")
+            if existing in {"approve", "reject"}:
+                return payload
+            payload.update(
+                {
+                    "decision": "timeout",
+                    "effective_decision": on_timeout,
+                    "comment": comment,
+                    "resolved_by": "timeout",
+                    "decided_at": _now(),
+                }
+            )
+            return payload
+
+        payload = self._locked_gate_update(gate_id, mark_timeout)
+        existing = payload.get("decision")
+        if existing in {"approve", "reject"}:
+            return GateResult(str(existing), payload.get("comment"))
+        if on_timeout == "approve":
+            return GateResult("approve", comment, timed_out=True)
+        if on_timeout == "reject":
+            return GateResult("reject", comment, timed_out=True)
+        raise GateTimeoutError(
+            f"Human gate '{gate_id}' timed out after {timeout_seconds}s",
+            gate_id=gate_id,
+            comment=comment,
+        )
+
+    def _start_gate(
+        self,
+        edge: dict[str, Any],
+        agent_outputs: dict[str, Any],
+        batch_id: str,
+        executor: ThreadPoolExecutor,
+        gate_futures: dict[Future[Any], dict[str, Any]],
+    ) -> None:
+        edge_id = edge["id"]
+        counter = self.gate_counters.get(edge_id, 0) + 1
+        self.gate_counters[edge_id] = counter
+        gate_id = f"gate-{edge_id}-{counter}"
+        config = edge.get("human_gate") or {}
+        timeout_seconds = int(config.get("timeout_seconds", 300))
+        payload = {
+            "gate_id": gate_id,
+            "run_id": os.getenv("LOOMLANE_RUN_ID", "run"),
+            "edge_id": edge_id,
+            "from": edge["from"],
+            "to": edge["to"],
+            "batch_id": batch_id,
+            "prompt": config.get("prompt", "Approve this workflow step before it continues."),
+            "requested_at": _now(),
+            "timeout_seconds": timeout_seconds,
+            "decision": None,
+            "comment": None,
+        }
+        self._write_gate(gate_id, payload)
+        self.events.emit(
+            "human_gate_waiting",
+            edge_id=edge_id,
+            data={"gate_id": gate_id, "prompt": payload["prompt"], "timeout_seconds": timeout_seconds},
+        )
+        future = executor.submit(self._wait_for_gate, edge, gate_id, timeout_seconds)
+        gate_futures[future] = {
+            "edge": edge,
+            "agent_outputs": agent_outputs,
+            "batch_id": batch_id,
+            "gate_id": gate_id,
+        }
+
+    def _process_outgoing(
+        self,
+        agent_id: str,
+        agent_outputs: dict[str, Any],
+        batch_id: str,
+        executor: ThreadPoolExecutor,
+        gate_futures: dict[Future[Any], dict[str, Any]],
+    ) -> None:
+        root = self._condition_root()
+        passed_edges = [
+            edge
+            for edge in SDL["edges"]
+            if edge["from"] == agent_id
+            and (
+                edge.get("condition") is None
+                or evaluate_condition(edge["condition"], root)
+            )
+        ]
+        fanout_batch_id = (
+            self._new_batch_id("fanout")
+            if any(edge["type"] == "FAN_OUT" for edge in passed_edges)
+            else None
+        )
+        for edge in passed_edges:
+            if edge["type"] == "HUMAN_GATE":
+                self._start_gate(
+                    edge,
+                    agent_outputs,
+                    batch_id,
+                    executor,
+                    gate_futures,
+                )
+            else:
+                self._propagate_edge(
+                    edge,
+                    agent_outputs,
+                    batch_id,
+                    fanout_batch_id,
+                )
+
+    def _apply_gate_result(
+        self,
+        context: dict[str, Any],
+        result: GateResult,
+    ) -> None:
+        edge = context["edge"]
+        gate_id = context["gate_id"]
+        decision = result.decision
+        comment = result.comment
+        self.events.emit(
+            "human_gate_resolved",
+            edge_id=edge["id"],
+            data={
+                "gate_id": gate_id,
+                "decision": decision,
+                "comment": comment,
+                "timed_out": result.timed_out,
+                "batch_id": context["batch_id"],
+            },
+        )
+        if decision == "approve":
+            self._propagate_edge(
+                edge,
+                context["agent_outputs"],
+                context["batch_id"],
+            )
+            return
+        policy = (edge.get("human_gate") or {}).get("on_reject", "fail")
+        if policy == "skip":
+            return
+        raise WorkflowError(f"Human gate '{gate_id}' was rejected")
 
     def _workflow_outputs(self) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -457,29 +945,113 @@ class WorkflowRuntime:
     def run(self) -> dict[str, Any]:
         self.events.emit("run_started", data={"workflow": SDL["workflow"]["id"]})
         self._initialize_inputs()
-        max_steps = int(SDL["workflow"]["execution"].get("max_steps", 200))
-        while True:
-            agent_id = self._ready_agent()
-            if agent_id is None:
-                break
-            if self.step >= max_steps:
-                raise WorkflowError(f"Workflow exceeded max_steps={max_steps}")
-            self.step += 1
-            agent_outputs = self._run_agent(agent_id)
-            self._traverse_edges(agent_id, agent_outputs)
-        self.current_agent = None
-        workflow_outputs = self._workflow_outputs()
-        result = {
-            "status": "succeeded",
-            "workflow_outputs": workflow_outputs,
-            "agent_outputs": self.outputs,
-            "usage": self.usage,
-            "steps": self.step,
-            "edge_traversals": self.traversals,
-            "error": None,
-        }
-        self.events.emit("run_finished", data={"status": "succeeded"})
-        return result
+        executor = ThreadPoolExecutor(max_workers=self.max_parallel)
+        self._gate_executor = ThreadPoolExecutor(max_workers=self.max_parallel)
+        agent_futures: dict[Future[Any], AgentExecution] = {}
+        gate_futures: dict[Future[Any], dict[str, Any]] = {}
+        try:
+            while True:
+                if self.max_total_tokens is not None and self.usage["total_tokens"] > self.max_total_tokens:
+                    raise WorkflowError(
+                        f"Workflow exceeded max_total_tokens={self.max_total_tokens}"
+                    )
+                slots = self.max_parallel - len(agent_futures)
+                while slots > 0 and self.pending:
+                    if self.step >= self.max_steps:
+                        raise WorkflowError(
+                            f"Workflow exceeded max_steps={self.max_steps}"
+                        )
+                    execution = self.pending.popleft()
+                    self.step += 1
+                    self._active_agents.add(execution.agent_id)
+                    agent_futures[
+                        executor.submit(self._run_agent, execution, self.step)
+                    ] = execution
+                    slots -= 1
+
+                if not agent_futures and not gate_futures:
+                    if self.pending:
+                        continue
+                    break
+                completed, _ = wait(
+                    [*agent_futures, *gate_futures],
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in completed:
+                    if future in gate_futures:
+                        context = gate_futures.pop(future)
+                        try:
+                            result = future.result()
+                        except GateTimeoutError as exc:
+                            self.failed_node_id = context["edge"]["from"]
+                            self.events.emit(
+                                "human_gate_resolved",
+                                edge_id=context["edge"]["id"],
+                                data={
+                                    "gate_id": context["gate_id"],
+                                    "decision": "timeout",
+                                    "effective_decision": "fail",
+                                    "comment": exc.comment,
+                                    "timed_out": True,
+                                    "batch_id": context["batch_id"],
+                                },
+                            )
+                            raise
+                        except Exception:
+                            self.failed_node_id = context["edge"]["from"]
+                            raise
+                        self._apply_gate_result(context, result)
+                        continue
+                    execution = agent_futures.pop(future)
+                    self._active_agents.discard(execution.agent_id)
+                    try:
+                        payload = future.result()
+                    except AgentCallError as exc:
+                        self._merge_usage(self.usage, exc.usage)
+                        self._merge_usage(
+                            self.agent_usage[execution.agent_id],
+                            exc.usage,
+                        )
+                        self.failed_node_id = exc.agent_id or execution.agent_id
+                        self._check_token_limits(execution.agent_id)
+                        raise
+                    except Exception:
+                        self.failed_node_id = execution.agent_id
+                        raise
+                    self._merge_usage(self.usage, payload["usage"])
+                    self._merge_usage(
+                        self.agent_usage[execution.agent_id],
+                        payload["usage"],
+                    )
+                    self.outputs[execution.agent_id] = payload["outputs"]
+                    self.artifacts.extend(payload["artifacts"])
+                    self._check_token_limits(execution.agent_id)
+                    self._process_outgoing(
+                        execution.agent_id,
+                        payload["outputs"],
+                        execution.batch_id,
+                        self._gate_executor,
+                        gate_futures,
+                    )
+
+            workflow_outputs = self._workflow_outputs()
+            result = {
+                "status": "succeeded",
+                "workflow_outputs": workflow_outputs,
+                "agent_outputs": self.outputs,
+                "agent_usage": self.agent_usage,
+                "usage": self.usage,
+                "steps": self.step,
+                "edge_traversals": self.traversals,
+                "artifacts": self.artifacts,
+                "error": None,
+            }
+            self.events.emit("run_finished", data={"status": "succeeded"})
+            return result
+        finally:
+            self._stop_event.set()
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._gate_executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _write_result(path: Path, result: dict[str, Any]) -> None:
@@ -504,6 +1076,7 @@ def main() -> None:
     result_path = Path(args.result)
     workspace = Path.cwd()
 
+    runtime: WorkflowRuntime | None = None
     try:
         run_inputs = json.loads(input_path.read_text(encoding="utf-8"))
         runtime = WorkflowRuntime(run_inputs, workspace)
@@ -516,11 +1089,15 @@ def main() -> None:
         )
         _write_result(result_path, result)
     except Exception as exc:
-        current_agent = locals().get("runtime").current_agent if "runtime" in locals() else None
-        events = locals().get("runtime").events if "runtime" in locals() else EventWriter()
+        failed_node_id = (
+            runtime.failed_node_id
+            if runtime
+            else getattr(exc, "agent_id", None)
+        )
+        events = runtime.events if runtime else EventWriter()
         events.emit(
             "error",
-            node_id=current_agent,
+            node_id=failed_node_id,
             data={"type": exc.__class__.__name__, "message": str(exc)},
         )
         result = {
@@ -528,13 +1105,14 @@ def main() -> None:
             "workflow_hash": os.getenv("LOOMLANE_WORKFLOW_HASH", ""),
             "status": "failed",
             "workflow_outputs": {},
-            "agent_outputs": {},
-            "usage": {},
-            "steps": 0,
-            "edge_traversals": {},
+            "agent_outputs": runtime.outputs if runtime else {},
+            "agent_usage": runtime.agent_usage if runtime else {},
+            "usage": runtime.usage if runtime else {},
+            "steps": runtime.step if runtime else 0,
+            "edge_traversals": runtime.traversals if runtime else {},
+            "artifacts": runtime.artifacts if runtime else [],
             "error": str(exc),
         }
         _write_result(result_path, result)
         events.emit("run_finished", data={"status": "failed", "error": str(exc)})
         raise SystemExit(1)
-

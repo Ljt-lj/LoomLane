@@ -28,7 +28,9 @@ import {
   CirclePlay,
   Code2,
   FileCode2,
+  FileUp,
   Folder,
+  FolderOpen,
   FolderPlus,
   GitBranch,
   KeyRound,
@@ -136,8 +138,60 @@ interface EventState {
   tokenUsage: number
 }
 
+interface UploadedRunFile {
+  name: string
+  path: string
+  size: number
+  uploading?: boolean
+}
+
+type RunInputValue = string | UploadedRunFile
+
+interface RunArtifact {
+  name: string
+  path: string
+  size: number
+}
+
 function classNames(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(' ')
+}
+
+function initialRunInputs(
+  inputs: SDL['workflow']['inputs'],
+): Record<string, RunInputValue> {
+  return Object.fromEntries(
+    inputs
+      .filter((input) => input.type !== 'FILE')
+      .map((input) => [input.name, input.type === 'DATA' ? '{}' : '']),
+  )
+}
+
+function isUploadedRunFile(
+  value: RunInputValue | undefined,
+): value is UploadedRunFile {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      typeof value.name === 'string' &&
+      typeof value.path === 'string' &&
+      typeof value.size === 'number',
+  )
+}
+
+function runArtifacts(run: RunSummary | RunDetail | null): RunArtifact[] {
+  if (!run || !('result' in run) || !run.result) return []
+  const value = run.result.artifacts
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is RunArtifact => {
+    if (!item || typeof item !== 'object') return false
+    const artifact = item as Record<string, unknown>
+    return (
+      typeof artifact.name === 'string' &&
+      typeof artifact.path === 'string' &&
+      typeof artifact.size === 'number'
+    )
+  })
 }
 
 function issueFromError(error: unknown): ValidationIssue[] {
@@ -186,6 +240,124 @@ function formatTime(value: string | null | undefined) {
     minute: '2-digit',
     second: '2-digit',
   }).format(new Date(value))
+}
+
+function formatFileSize(size: number) {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function RunFileInput({
+  name,
+  required,
+  value,
+  onSelect,
+  onRemove,
+}: {
+  name: string
+  required: boolean
+  value?: UploadedRunFile
+  onSelect: (file: File) => void
+  onRemove: () => void
+}) {
+  const [dragging, setDragging] = useState(false)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  const uploading = value?.uploading === true
+
+  function pickFile() {
+    if (!uploading) inputRef.current?.click()
+  }
+
+  return (
+    <div
+      className={classNames(
+        'file-dropzone',
+        dragging && 'dragging',
+        value && 'has-file',
+        uploading && 'uploading',
+      )}
+      role="button"
+      tabIndex={0}
+      aria-label={`为 ${name} 选择文件`}
+      onClick={pickFile}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          pickFile()
+        }
+      }}
+      onDragEnter={(event) => {
+        event.preventDefault()
+        if (!uploading) setDragging(true)
+      }}
+      onDragOver={(event) => {
+        event.preventDefault()
+        if (!uploading) setDragging(true)
+      }}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+          setDragging(false)
+        }
+      }}
+      onDrop={(event) => {
+        event.preventDefault()
+        setDragging(false)
+        if (uploading) return
+        const file = event.dataTransfer.files[0]
+        if (file) onSelect(file)
+      }}
+    >
+      <input
+        ref={inputRef}
+        className="file-picker"
+        type="file"
+        onChange={(event) => {
+          const file = event.target.files?.[0]
+          if (file) onSelect(file)
+          event.target.value = ''
+        }}
+      />
+      {value ? (
+        <>
+          <span className="file-dropzone-icon">
+            {uploading ? (
+              <LoaderCircle className="spin" size={17} />
+            ) : (
+              <FileCode2 size={17} />
+            )}
+          </span>
+          <span className="file-dropzone-copy">
+            <strong title={value.name}>{value.name}</strong>
+            <small>{uploading ? '上传中' : formatFileSize(value.size)}</small>
+          </span>
+          {!uploading && (
+            <button
+              className="icon-button file-remove"
+              type="button"
+              title="移除文件"
+              onClick={(event) => {
+                event.stopPropagation()
+                onRemove()
+              }}
+            >
+              <X size={13} />
+            </button>
+          )}
+        </>
+      ) : (
+        <>
+          <span className="file-dropzone-icon">
+            <FileUp size={17} />
+          </span>
+          <span className="file-dropzone-copy">
+            <strong>拖入文件或点击选择</strong>
+            <small>{required ? '必填' : '可选'}</small>
+          </span>
+        </>
+      )}
+    </div>
+  )
 }
 
 function runStatusLabel(status: string) {
@@ -362,7 +534,7 @@ function App() {
   const [edgeTraversals, setEdgeTraversals] = useState<Record<string, number>>(
     {},
   )
-  const [runInputs, setRunInputs] = useState<Record<string, string>>({})
+  const [runInputs, setRunInputs] = useState<Record<string, RunInputValue>>({})
   const [currentRun, setCurrentRun] = useState<RunSummary | RunDetail | null>(
     null,
   )
@@ -395,6 +567,7 @@ function App() {
   >(null)
   const [generatedFiles, setGeneratedFiles] = useState<string[]>([])
   const eventSourceRef = useRef<EventSource | null>(null)
+  const fileUploadIdsRef = useRef<Record<string, number>>({})
   const noticeTimerRef = useRef<number | null>(null)
   const viewportRef = useRef<Viewport | null>(null)
   const inspectorResizeRef = useRef<{
@@ -584,6 +757,50 @@ function App() {
     [],
   )
 
+  async function uploadRunFile(inputName: string, file: File) {
+    if (!projectId) return
+    const uploadId = (fileUploadIdsRef.current[inputName] ?? 0) + 1
+    fileUploadIdsRef.current[inputName] = uploadId
+    setRunInputs((current) => ({
+      ...current,
+      [inputName]: {
+        name: file.name,
+        path: '',
+        size: file.size,
+        uploading: true,
+      },
+    }))
+    try {
+      const uploaded = await api.uploadInputFile(projectId, inputName, file)
+      if (fileUploadIdsRef.current[inputName] !== uploadId) return
+      setRunInputs((current) => ({
+        ...current,
+        [inputName]: uploaded,
+      }))
+    } catch (error) {
+      if (fileUploadIdsRef.current[inputName] !== uploadId) return
+      setRunInputs((current) => {
+        const next = { ...current }
+        delete next[inputName]
+        return next
+      })
+      showNotice(
+        'error',
+        error instanceof Error ? error.message : '文件上传失败',
+      )
+    }
+  }
+
+  function removeRunFile(inputName: string) {
+    fileUploadIdsRef.current[inputName] =
+      (fileUploadIdsRef.current[inputName] ?? 0) + 1
+    setRunInputs((current) => {
+      const next = { ...current }
+      delete next[inputName]
+      return next
+    })
+  }
+
   useEffect(() => {
     if (!projectId && projectsQuery.data?.length) {
       setProjectId(projectsQuery.data[0].id)
@@ -604,11 +821,8 @@ function App() {
     setTokenUsage(0)
     setGeneratedFiles([])
     viewportRef.current = projectQuery.data.canvas.viewport
-    setRunInputs(
-      Object.fromEntries(
-        projectQuery.data.sdl.workflow.inputs.map((input) => [input.name, '']),
-      ),
-    )
+    fileUploadIdsRef.current = {}
+    setRunInputs(initialRunInputs(projectQuery.data.sdl.workflow.inputs))
   }, [draft?.id, projectId, projectQuery.data])
 
   useEffect(() => {
@@ -979,6 +1193,51 @@ function App() {
       showNotice('error', 'SDL 未通过校验，无法启动运行')
       return
     }
+    const fileInputs = saved.sdl.workflow.inputs.filter(
+      (input) => input.type === 'FILE',
+    )
+    const pendingFiles = fileInputs.filter((input) => {
+      const value = runInputs[input.name]
+      return isUploadedRunFile(value) && value.uploading
+    })
+    if (pendingFiles.length) {
+      showNotice(
+        'error',
+        `文件仍在处理中：${pendingFiles.map((input) => input.name).join('、')}`,
+      )
+      return
+    }
+    const missingFiles = fileInputs.filter((input) => {
+      const value = runInputs[input.name]
+      return (
+        input.required &&
+        (!isUploadedRunFile(value) || !value.path)
+      )
+    })
+    if (missingFiles.length) {
+      showNotice(
+        'error',
+        `请选择必填文件：${missingFiles.map((input) => input.name).join('、')}`,
+      )
+      return
+    }
+
+    const inputs: Record<string, unknown> = {}
+    for (const input of saved.sdl.workflow.inputs) {
+      const value = runInputs[input.name]
+      if (input.type === 'FILE') {
+        if (isUploadedRunFile(value) && value.path) {
+          inputs[input.name] = {
+            path: value.path,
+            name: value.name,
+            size: value.size,
+          }
+        }
+      } else {
+        inputs[input.name] = typeof value === 'string' ? value : ''
+      }
+    }
+
     eventSourceRef.current?.close()
     setRunEvents([])
     setNodeStatuses(
@@ -989,12 +1248,7 @@ function App() {
     setDrawerTab('events')
     try {
       const summary = await api.startRun(saved.id, {
-        inputs: Object.fromEntries(
-          saved.sdl.workflow.inputs.map((input) => [
-            input.name,
-            runInputs[input.name] ?? '',
-          ]),
-        ),
+        inputs,
       })
       setCurrentRun(summary)
       connectRunEvents(summary.run_id)
@@ -1013,6 +1267,19 @@ function App() {
       showNotice('info', '运行已取消')
     } catch (error) {
       showNotice('error', error instanceof Error ? error.message : '取消失败')
+    }
+  }
+
+  async function openRunFolder(run: RunSummary | RunDetail | null) {
+    if (!run) return
+    try {
+      const result = await api.openRunFolder(run.run_id)
+      showNotice('success', `已打开输出目录：${result.path}`)
+    } catch (error) {
+      showNotice(
+        'error',
+        error instanceof Error ? error.message : '无法打开输出目录',
+      )
     }
   }
 
@@ -3174,37 +3441,63 @@ function App() {
                 <Activity size={14} />
               </div>
               <div className="run-inputs">
-                {draft?.sdl.workflow.inputs.map((input) => (
-                  <label key={input.name}>
-                    <span>
-                      {input.name}
-                      <small>{input.type}</small>
-                    </span>
-                    {input.type === 'TEXT' || input.type === 'MIXED' ? (
-                      <textarea
-                        rows={3}
-                        value={runInputs[input.name] ?? ''}
-                        onChange={(event) =>
-                          setRunInputs((current) => ({
-                            ...current,
-                            [input.name]: event.target.value,
-                          }))
-                        }
-                      />
-                    ) : (
-                      <textarea
-                        rows={3}
-                        value={runInputs[input.name] ?? '{}'}
-                        onChange={(event) =>
-                          setRunInputs((current) => ({
-                            ...current,
-                            [input.name]: event.target.value,
-                          }))
-                        }
-                      />
-                    )}
-                  </label>
-                ))}
+                {draft?.sdl.workflow.inputs.map((input) => {
+                  const inputValue = runInputs[input.name]
+                  return (
+                    <div className="run-input-field" key={input.name}>
+                      <span>
+                        {input.name}
+                        <small>{input.type}</small>
+                      </span>
+                      {input.type === 'FILE' ? (
+                        <RunFileInput
+                          name={input.name}
+                          required={input.required}
+                          value={
+                            isUploadedRunFile(inputValue)
+                              ? inputValue
+                              : undefined
+                          }
+                          onSelect={(file) => {
+                            void uploadRunFile(input.name, file)
+                          }}
+                          onRemove={() => removeRunFile(input.name)}
+                        />
+                      ) : input.type === 'TEXT' ||
+                        input.type === 'MIXED' ? (
+                        <textarea
+                          rows={3}
+                          aria-label={`${input.name} 输入`}
+                          value={
+                            typeof inputValue === 'string' ? inputValue : ''
+                          }
+                          onChange={(event) =>
+                            setRunInputs((current) => ({
+                              ...current,
+                              [input.name]: event.target.value,
+                            }))
+                          }
+                        />
+                      ) : (
+                        <textarea
+                          rows={3}
+                          aria-label={`${input.name} JSON 输入`}
+                          value={
+                            typeof inputValue === 'string'
+                              ? inputValue
+                              : '{}'
+                          }
+                          onChange={(event) =>
+                            setRunInputs((current) => ({
+                              ...current,
+                              [input.name]: event.target.value,
+                            }))
+                          }
+                        />
+                      )}
+                    </div>
+                  )
+                })}
               </div>
               <div className="run-summary">
                 <span
@@ -3213,8 +3506,30 @@ function App() {
                   <CirclePlay size={13} />
                   {currentRun ? runStatusLabel(currentRun.status) : '未运行'}
                 </span>
-                <span>{tokenUsage.toLocaleString()} tokens</span>
+                <span className="run-summary-actions">
+                  <span>{tokenUsage.toLocaleString()} tokens</span>
+                  <button
+                    className="icon-button"
+                    type="button"
+                    title="打开生成物目录"
+                    disabled={!currentRun}
+                    onClick={() => void openRunFolder(currentRun)}
+                  >
+                    <FolderOpen size={14} />
+                  </button>
+                </span>
               </div>
+              {currentRun?.run_directory && (
+                <button
+                  className="run-output-folder"
+                  type="button"
+                  title={currentRun.output_directory ?? undefined}
+                  onClick={() => void openRunFolder(currentRun)}
+                >
+                  <FolderOpen size={13} />
+                  <span>{currentRun.run_directory}</span>
+                </button>
+              )}
               <div className="run-history">
                 {runsQuery.data?.slice(0, 4).map((run) => (
                   <button
@@ -3404,14 +3719,8 @@ function App() {
                   setDirty(false)
                   setIssues([])
                   setSelection(null)
-                  setRunInputs(
-                    Object.fromEntries(
-                      detail.sdl.workflow.inputs.map((input) => [
-                        input.name,
-                        '',
-                      ]),
-                    ),
-                  )
+                  fileUploadIdsRef.current = {}
+                  setRunInputs(initialRunInputs(detail.sdl.workflow.inputs))
                   queryClient.invalidateQueries({ queryKey: ['projects'] })
                   showNotice('success', `SDL 已导入 revision ${detail.revision}`)
                 }}
@@ -3484,7 +3793,34 @@ function App() {
                   </pre>
                 </div>
                 <div>
-                  <span className="eyebrow">GENERATED FILES</span>
+                  <div className="result-heading">
+                    <span className="eyebrow">RUN ARTIFACTS</span>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      title="打开生成物目录"
+                      disabled={!currentRun}
+                      onClick={() => void openRunFolder(currentRun)}
+                    >
+                      <FolderOpen size={14} />
+                    </button>
+                  </div>
+                  <div className="artifact-list">
+                    {runArtifacts(currentRun).length ? (
+                      runArtifacts(currentRun).map((artifact) => (
+                        <div className="artifact-row" key={artifact.path}>
+                          <FileCode2 size={13} />
+                          <span title={artifact.path}>{artifact.path}</span>
+                          <small>{formatFileSize(artifact.size)}</small>
+                        </div>
+                      ))
+                    ) : (
+                      <span className="result-empty">尚无运行产物</span>
+                    )}
+                  </div>
+                  <span className="eyebrow generated-heading">
+                    GENERATED FILES
+                  </span>
                   <pre>{generatedFiles.join('\n') || '尚未生成'}</pre>
                 </div>
               </div>

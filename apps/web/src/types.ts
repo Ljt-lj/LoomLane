@@ -191,11 +191,25 @@ export interface RunSummary {
   started_at: string | null
   finished_at: string | null
   error: string | null
+  run_directory: string | null
+  output_directory: string | null
 }
 
 export interface RunDetail extends RunSummary {
   result: Record<string, unknown> | null
   events: RunEvent[]
+}
+
+export interface InputFileRef {
+  input_name: string
+  name: string
+  path: string
+  size: number
+}
+
+export interface OpenFolderResponse {
+  path: string
+  opened: boolean
 }
 
 export interface SecretStatus {

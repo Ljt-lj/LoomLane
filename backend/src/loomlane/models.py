@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -22,6 +23,30 @@ class EdgeType(StrEnum):
     PIPE = "PIPE"
     CONDITIONAL = "CONDITIONAL"
     FEEDBACK = "FEEDBACK"
+    LOOP = "LOOP"
+    FAN_OUT = "FAN_OUT"
+    AGGREGATE = "AGGREGATE"
+    HUMAN_GATE = "HUMAN_GATE"
+
+
+class AggregateMode(StrEnum):
+    ALL = "all"
+    ANY = "any"
+
+
+class AggregateConfig(StrictModel):
+    mode: AggregateMode = AggregateMode.ALL
+
+
+class HumanGateConfig(StrictModel):
+    prompt: str = Field(
+        default="Approve this workflow step before it continues.",
+        min_length=1,
+        max_length=2_000,
+    )
+    timeout_seconds: int = Field(default=300, ge=1, le=86_400)
+    on_reject: Literal["fail", "skip"] = "fail"
+    on_timeout: Literal["fail", "approve", "reject"] = "fail"
 
 
 class GlobalContext(StrictModel):
@@ -45,7 +70,10 @@ class WorkflowOutput(StrictModel):
 
 class ExecutionConfig(StrictModel):
     feedback_limit_default: int = Field(default=3, ge=1, le=100)
+    loop_limit_default: int = Field(default=10, ge=1, le=100)
     max_steps: int = Field(default=200, ge=1, le=10_000)
+    max_total_tokens: int | None = Field(default=None, ge=1)
+    max_parallel: int = Field(default=4, ge=1, le=64)
 
 
 class WorkflowMeta(StrictModel):
@@ -98,6 +126,7 @@ class Port(StrictModel):
 
 class AgentLimits(StrictModel):
     max_tokens: int | None = Field(default=None, ge=1)
+    max_total_tokens: int | None = Field(default=None, ge=1)
 
 
 class AgentJsonOutput(StrictModel):
@@ -115,6 +144,21 @@ class Agent(StrictModel):
     limits: AgentLimits = Field(default_factory=AgentLimits)
     json_output: AgentJsonOutput = Field(default_factory=AgentJsonOutput)
     output_dir: str | None = None
+
+    @field_validator("output_dir")
+    @classmethod
+    def validate_output_dir(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().replace("\\", "/")
+        if not normalized or normalized.startswith("/"):
+            raise ValueError("output_dir must be a relative path")
+        windows_path = PureWindowsPath(value)
+        if windows_path.is_absolute() or windows_path.drive:
+            raise ValueError("output_dir must be a relative path")
+        if ".." in PurePosixPath(normalized).parts:
+            raise ValueError("output_dir cannot escape the run workspace")
+        return normalized.rstrip("/")
 
 
 class Condition(StrictModel):
@@ -154,10 +198,12 @@ class Edge(StrictModel):
     mappings: list[EdgeMapping] = Field(default_factory=list)
     condition: Condition | None = None
     guard: EdgeGuard = Field(default_factory=EdgeGuard)
+    aggregate: AggregateConfig | None = None
+    human_gate: HumanGateConfig | None = None
 
 
 class SDL(StrictModel):
-    sdl_version: Literal["0.1"] = "0.1"
+    sdl_version: Literal["0.1", "0.2"] = "0.2"
     workflow: WorkflowMeta
     start: list[str] = Field(default_factory=list)
     api_profiles: list[ApiProfile] = Field(default_factory=list)
@@ -271,19 +317,54 @@ class RunStartRequest(StrictModel):
     inputs: dict[str, Any] = Field(default_factory=dict)
 
 
+class GateDecisionRequest(StrictModel):
+    decision: Literal["approve", "reject"]
+    comment: str | None = Field(default=None, max_length=2_000)
+
+
+class GateDecisionResponse(StrictModel):
+    run_id: str
+    gate_id: str
+    decision: Literal["approve", "reject"]
+    accepted_at: datetime
+
+
+class PendingHumanGate(StrictModel):
+    gate_id: str
+    edge_id: str
+    prompt: str
+    requested_at: datetime
+    timeout_seconds: int | None = None
+
+
+class InputFileRef(StrictModel):
+    input_name: str
+    name: str
+    path: str
+    size: int
+
+
 class RunSummary(StrictModel):
     run_id: str
     project_id: str
     status: Literal[
-        "queued", "running", "succeeded", "failed", "cancelled"
+        "queued", "running", "waiting", "succeeded", "failed", "cancelled"
     ] = "queued"
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
     error: str | None = None
+    run_directory: str | None = None
+    output_directory: str | None = None
 
 
 class RunDetail(RunSummary):
     result: dict[str, Any] | None = None
     events: list[dict[str, Any]] = Field(default_factory=list)
+    pending_gates: list[PendingHumanGate] = Field(default_factory=list)
+
+
+class OpenFolderResponse(StrictModel):
+    path: str
+    opened: bool = True
 
