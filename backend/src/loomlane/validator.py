@@ -542,7 +542,6 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
                 "missing_workflow_output",
                 "Workflow must declare at least one output",
                 "workflow.outputs",
-                severity="error",
             )
         )
 

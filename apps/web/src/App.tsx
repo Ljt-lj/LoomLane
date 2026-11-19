@@ -27,6 +27,7 @@ import {
   CircleAlert,
   CirclePlay,
   Code2,
+  Copy,
   FileCode2,
   FileUp,
   Folder,
@@ -114,6 +115,7 @@ import {
   type InspectorTab,
 } from './uiStore'
 import {
+  cloneAgent,
   conditionPaths,
   defaultCondition,
   firstCompatibleMapping,
@@ -216,6 +218,22 @@ function issueFromError(error: unknown): ValidationIssue[] {
   if (!(error instanceof ApiError)) return []
   const issues = error.payload.issues
   return Array.isArray(issues) ? (issues as ValidationIssue[]) : []
+}
+
+function validationIssueMessage(issues: ValidationIssue[], fallback: string) {
+  const first = issues.find((issue) => issue.severity === 'error') ?? issues[0]
+  if (!first) return fallback
+  const location = first.path ? `${first.path}: ` : ''
+  const remaining = issues.length > 1 ? `（另有 ${issues.length - 1} 项）` : ''
+  return `${location}${first.message}${remaining}`
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  const issues = issueFromError(error)
+  if (issues.length) return validationIssueMessage(issues, fallback)
+  return error instanceof Error && error.message.trim()
+    ? error.message
+    : fallback
 }
 
 function parseEvent(message: MessageEvent): RunEvent | null {
@@ -1190,15 +1208,15 @@ function App() {
       setDirty(false)
       setIssues([])
       await queryClient.invalidateQueries({ queryKey: ['projects'] })
-      showNotice('success', `已保存 revision ${updated.revision}`)
+      showNotice('success', `已保存草稿 revision ${updated.revision}`)
       return updated
     } catch (error) {
       const validationIssues = issueFromError(error)
-      if (validationIssues.length) setIssues(validationIssues)
-      showNotice(
-        'error',
-        error instanceof Error ? error.message : '保存失败',
-      )
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '保存草稿失败'))
       return null
     } finally {
       setSaving(false)
@@ -1214,11 +1232,22 @@ function App() {
       if (result.valid) {
         showNotice('success', 'SDL 校验通过')
       } else {
-        showNotice('error', `发现 ${result.issues.length} 个校验问题`)
+        showNotice(
+          'error',
+          validationIssueMessage(
+            result.issues,
+            `发现 ${result.issues.length} 个校验问题`,
+          ),
+        )
       }
       return result.valid
     } catch (error) {
-      showNotice('error', error instanceof Error ? error.message : '校验失败')
+      const validationIssues = issueFromError(error)
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '校验失败'))
       return false
     }
   }
@@ -1239,8 +1268,11 @@ function App() {
       queryClient.invalidateQueries({ queryKey: ['projects'] })
     } catch (error) {
       const validationIssues = issueFromError(error)
-      if (validationIssues.length) setIssues(validationIssues)
-      showNotice('error', error instanceof Error ? error.message : '生成失败')
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '生成失败'))
     }
   }
 
@@ -1299,16 +1331,27 @@ function App() {
   async function startRun() {
     const saved = await saveProject()
     if (!saved) return
-    const valid = await api
-      .validate(saved.id, saved.sdl)
-      .then((result) => {
-        setIssues(result.issues)
-        return result.valid
-      })
-      .catch(() => false)
-    if (!valid) {
-      setDrawerTab('issues')
-      showNotice('error', 'SDL 未通过校验，无法启动运行')
+    try {
+      const validation = await api.validate(saved.id, saved.sdl)
+      setIssues(validation.issues)
+      if (!validation.valid) {
+        setDrawerTab('issues')
+        showNotice(
+          'error',
+          validationIssueMessage(
+            validation.issues,
+            'SDL 未通过校验，无法启动运行',
+          ),
+        )
+        return
+      }
+    } catch (error) {
+      const validationIssues = issueFromError(error)
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '运行前校验失败'))
       return
     }
     const fileInputs = saved.sdl.workflow.inputs.filter(
@@ -2054,6 +2097,37 @@ function App() {
     }
   }
 
+  function duplicateAgent() {
+    if (!draft || !selectedAgent) return
+    const sourceNode = draft.canvas.nodes.find(
+      (node) => node.id === selectedAgent.id,
+    )
+    const duplicate = cloneAgent(
+      selectedAgent,
+      draft.sdl.agents.map((agent) => agent.id),
+    )
+    const node: CanvasNode = {
+      id: duplicate.id,
+      x: (sourceNode?.x ?? 100) + 32,
+      y: (sourceNode?.y ?? 120) + 32,
+      width: sourceNode?.width ?? 238,
+      height: sourceNode?.height ?? 132,
+    }
+    updateDraft((current) => ({
+      ...current,
+      sdl: {
+        ...current.sdl,
+        agents: [...current.sdl.agents, duplicate],
+      },
+      canvas: {
+        ...current.canvas,
+        nodes: [...current.canvas.nodes, node],
+      },
+    }))
+    setSelection({ kind: 'node', id: duplicate.id })
+    setInspectorTab('selection')
+  }
+
   function addAgent() {
     if (!draft) return
     const id = uniqueId(
@@ -2251,6 +2325,14 @@ function App() {
             </div>
             <div className="inspector-heading-actions">
               <span className="id-chip">{agent.id}</span>
+              <button
+                className="small-button"
+                title="复制所选 Agent"
+                onClick={duplicateAgent}
+              >
+                <Copy size={13} />
+                复制
+              </button>
               <button
                 className="small-button danger"
                 title="删除所选 Agent"
@@ -2929,7 +3011,7 @@ function App() {
             </button>
           </div>
           {workflowMeta.inputs.map((input, index) => (
-            <div className="port-editor-row" key={input.name}>
+            <div className="port-editor-row" key={`workflow-input-${index}`}>
               <input
                 value={input.name}
                 onChange={(event) =>
@@ -3020,7 +3102,10 @@ function App() {
               (item) => item.id === output.agent,
             )
             return (
-              <div className="output-editor-row" key={`${output.name}-${index}`}>
+              <div
+                className="output-editor-row"
+                key={`workflow-output-${index}`}
+              >
                 <input
                   value={output.name}
                   onChange={(event) =>
@@ -3711,13 +3796,14 @@ function App() {
             className="toolbar-button"
             disabled={!dirty || saving}
             onClick={saveProject}
+            title="保存当前编辑内容，不要求流程可运行"
           >
             {saving ? (
               <LoaderCircle size={15} className="spin" />
             ) : (
               <Save size={15} />
             )}
-            保存
+            保存草稿
           </button>
           {isRunActive ? (
             <button className="run-button cancel" onClick={cancelRun}>

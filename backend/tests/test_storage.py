@@ -9,6 +9,7 @@ import pytest
 from loomlane import storage as storage_module
 from loomlane.models import EdgeType, SDL
 from loomlane.storage import ProjectStore, StorageWriteError, _atomic_write_text
+from loomlane.validator import validate_sdl
 
 
 DEMO_NAME = "V0.2 内容生产综合演示"
@@ -65,6 +66,26 @@ def test_project_save_maps_persistent_file_lock_to_storage_error(
     assert error.value.path.name == "workflow.sdl.yaml"
     assert error.value.errno == errno.EACCES
     assert store.get(project.id).revision == project.revision
+
+
+def test_project_save_allows_semantically_incomplete_draft(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("draft project")
+    project.sdl.start = []
+
+    saved = store.save(
+        project.id,
+        project.sdl,
+        project.canvas,
+        project.revision,
+    )
+
+    reloaded = store.get(project.id)
+    assert saved.revision == project.revision + 1
+    assert reloaded.sdl.start == []
+    assert validate_sdl(reloaded.sdl).valid is False
 
 
 def test_ensure_seed_creates_complex_demo_once(tmp_path: Path) -> None:

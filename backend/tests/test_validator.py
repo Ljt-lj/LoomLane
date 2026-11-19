@@ -32,6 +32,18 @@ def test_default_workflow_is_valid() -> None:
     }
 
 
+def test_missing_workflow_output_returns_validation_issue(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    sdl.workflow.outputs.clear()
+
+    result = validate_sdl(sdl)
+
+    assert not result.valid
+    assert "missing_workflow_output" in {issue.code for issue in result.issues}
+
+
 def test_non_feedback_cycle_is_rejected(
     legacy_workflow: Callable[[str], SDL],
 ) -> None:
