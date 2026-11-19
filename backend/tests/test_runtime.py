@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from loomlane.compiler import WorkflowCompiler
 from loomlane.models import (
     AgentJsonOutput,
     GateDecisionRequest,
@@ -26,7 +27,6 @@ from loomlane.models import (
 )
 from loomlane.runtime import GateConflict, RunManager
 from loomlane.storage import ProjectStore
-from loomlane.compiler import WorkflowCompiler
 
 
 class MemoryCredentials:

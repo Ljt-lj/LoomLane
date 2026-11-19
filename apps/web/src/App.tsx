@@ -35,6 +35,7 @@ import {
   GitBranch,
   KeyRound,
   LoaderCircle,
+  Pause,
   PanelBottomClose,
   PanelBottomOpen,
   PanelLeftClose,
@@ -46,6 +47,8 @@ import {
   RefreshCw,
   Save,
   Settings2,
+  SkipBack,
+  SkipForward,
   Square,
   Terminal,
   Trash2,
@@ -71,6 +74,13 @@ import {
 } from './AgentNode'
 import ConditionEditor from './ConditionEditor'
 import JsonOutputEditor from './JsonOutputEditor'
+import {
+  dedupeAndSortRunEvents,
+  nextReplaySeq,
+  previousReplaySeq,
+  replayRunEvents,
+  type GateReplayRecord,
+} from './run-replay'
 import type {
   Agent,
   ApiProfile,
@@ -109,7 +119,15 @@ import {
 
 const nodeTypes = { agent: AgentNode }
 const PORT_TYPES: PortType[] = ['TEXT', 'DATA', 'FILE', 'MIXED']
-const EDGE_TYPES: EdgeType[] = ['PIPE', 'CONDITIONAL', 'FEEDBACK']
+const EDGE_TYPES: EdgeType[] = [
+  'PIPE',
+  'CONDITIONAL',
+  'FEEDBACK',
+  'LOOP',
+  'FAN_OUT',
+  'AGGREGATE',
+  'HUMAN_GATE',
+]
 const EVENT_TYPES = [
   'run_started',
   'node_enter',
@@ -117,6 +135,8 @@ const EVENT_TYPES = [
   'edge_traversed',
   'token_usage',
   'artifact_written',
+  'human_gate_waiting',
+  'human_gate_resolved',
   'error',
   'run_finished',
 ]
@@ -130,12 +150,6 @@ type Selection =
 interface Notice {
   tone: 'error' | 'success' | 'info'
   message: string
-}
-
-interface EventState {
-  nodeStatuses: Record<string, NodeRunStatus>
-  edgeTraversals: Record<string, number>
-  tokenUsage: number
 }
 
 interface UploadedRunFile {
@@ -364,11 +378,21 @@ function runStatusLabel(status: string) {
   const labels: Record<string, string> = {
     queued: '排队',
     running: '运行中',
+    waiting: '等待人工确认',
     succeeded: '成功',
     failed: '失败',
     cancelled: '已取消',
   }
   return labels[status] ?? status
+}
+
+function defaultHumanGate() {
+  return {
+    prompt: 'Approve this workflow step before it continues.',
+    timeout_seconds: 300,
+    on_reject: 'fail' as const,
+    on_timeout: 'fail' as const,
+  }
 }
 
 function JsonLiteralInput({
@@ -528,18 +552,16 @@ function App() {
   const [newProjectName, setNewProjectName] = useState('')
   const [nodes, setNodes] = useState<AgentFlowNode[]>([])
   const [edges, setEdges] = useState<Edge[]>([])
-  const [nodeStatuses, setNodeStatuses] = useState<
-    Record<string, NodeRunStatus>
-  >({})
-  const [edgeTraversals, setEdgeTraversals] = useState<Record<string, number>>(
-    {},
-  )
   const [runInputs, setRunInputs] = useState<Record<string, RunInputValue>>({})
   const [currentRun, setCurrentRun] = useState<RunSummary | RunDetail | null>(
     null,
   )
   const [runEvents, setRunEvents] = useState<RunEvent[]>([])
-  const [tokenUsage, setTokenUsage] = useState(0)
+  const [replaySeq, setReplaySeq] = useState<number | null>(null)
+  const [replayPlaying, setReplayPlaying] = useState(false)
+  const [replaySpeed, setReplaySpeed] = useState(1000)
+  const [gateComments, setGateComments] = useState<Record<string, string>>({})
+  const [decidingGate, setDecidingGate] = useState<string | null>(null)
   const [secretStatuses, setSecretStatuses] = useState<
     Record<string, SecretStatus>
   >({})
@@ -585,6 +607,29 @@ function App() {
   const [resizingInspector, setResizingInspector] = useState(false)
   const [resizingLeft, setResizingLeft] = useState(false)
   const [resizingDrawer, setResizingDrawer] = useState(false)
+  const replayMaxSeq = runEvents.reduce(
+    (maximum, event) => Math.max(maximum, event.seq),
+    0,
+  )
+  const replayUntilSeq = replaySeq ?? replayMaxSeq
+  const replayState = useMemo(
+    () => replayRunEvents(runEvents, replayUntilSeq),
+    [replayUntilSeq, runEvents],
+  )
+  const {
+    nodeStatuses,
+    edgeTraversals,
+    tokenUsage,
+  } = replayState
+  const pendingGates = useMemo(
+    () =>
+      Object.values(replayState.gates).filter(
+        (gate): gate is GateReplayRecord => gate.status === 'waiting',
+      ),
+    [replayState.gates],
+  )
+  const replayAtLive =
+    replaySeq === null || replayUntilSeq >= replayMaxSeq
 
   function startInspectorResize(event: ReactPointerEvent<HTMLDivElement>) {
     if (event.button !== 0) return
@@ -741,7 +786,7 @@ function App() {
     refetchInterval: (query) => {
       const data = query.state.data
       return data?.some((run) =>
-        ['queued', 'running'].includes(run.status),
+        ['queued', 'running', 'waiting'].includes(run.status),
       )
         ? 2_000
         : false
@@ -816,9 +861,9 @@ function App() {
     setIssues([])
     setCurrentRun(null)
     setRunEvents([])
-    setNodeStatuses({})
-    setEdgeTraversals({})
-    setTokenUsage(0)
+    setReplaySeq(null)
+    setReplayPlaying(false)
+    setGateComments({})
     setGeneratedFiles([])
     viewportRef.current = projectQuery.data.canvas.viewport
     fileUploadIdsRef.current = {}
@@ -909,6 +954,14 @@ function App() {
         const color =
           workflowEdge.type === 'FEEDBACK'
             ? '#d07932'
+            : workflowEdge.type === 'LOOP'
+              ? '#c14f3c'
+              : workflowEdge.type === 'FAN_OUT'
+                ? '#2f6f9f'
+                : workflowEdge.type === 'AGGREGATE'
+                  ? '#6f5b9a'
+                  : workflowEdge.type === 'HUMAN_GATE'
+                    ? '#a66d19'
             : workflowEdge.type === 'CONDITIONAL'
               ? '#98752f'
               : '#267f73'
@@ -928,7 +981,11 @@ function App() {
           style: {
             stroke: color,
             strokeWidth: traversals > 0 ? 2.4 : 1.5,
-            strokeDasharray: workflowEdge.type === 'FEEDBACK' ? '7 4' : undefined,
+            strokeDasharray:
+              workflowEdge.type === 'FEEDBACK' ||
+              workflowEdge.type === 'LOOP'
+                ? '7 4'
+                : undefined,
           },
           labelStyle: {
             fill: color,
@@ -1092,42 +1149,7 @@ function App() {
   }
 
   const applyRunEvent = useCallback((event: RunEvent) => {
-    setRunEvents((current) =>
-      current.some((item) => item.seq === event.seq)
-        ? current
-        : [...current, event].sort((left, right) => left.seq - right.seq),
-    )
-    if (event.type === 'node_enter' && event.node_id) {
-      setNodeStatuses((current) => ({
-        ...current,
-        [event.node_id!]: 'running',
-      }))
-    }
-    if (event.type === 'node_exit' && event.node_id) {
-      setNodeStatuses((current) => ({
-        ...current,
-        [event.node_id!]:
-          event.data.status === 'failed' ? 'failed' : 'succeeded',
-      }))
-    }
-    if (event.type === 'edge_traversed' && event.edge_id) {
-      setEdgeTraversals((current) => ({
-        ...current,
-        [event.edge_id!]: (current[event.edge_id!] ?? 0) + 1,
-      }))
-    }
-    if (event.type === 'token_usage') {
-      setTokenUsage(
-        (current) =>
-          current + Number(event.data.total_tokens ?? 0),
-      )
-    }
-    if (event.type === 'error' && event.node_id) {
-      setNodeStatuses((current) => ({
-        ...current,
-        [event.node_id!]: 'failed',
-      }))
-    }
+    setRunEvents((current) => dedupeAndSortRunEvents([...current, event]))
   }, [])
 
   const finishRun = useCallback(
@@ -1135,15 +1157,15 @@ function App() {
       try {
         const detail = await api.getRun(runId)
         setCurrentRun(detail)
-        if (detail.events.length && runEvents.length === 0) {
-          for (const event of detail.events) applyRunEvent(event)
-        }
+        setRunEvents((current) =>
+          current.length ? current : dedupeAndSortRunEvents(detail.events),
+        )
       } catch {
         // The SSE event still carries the terminal state.
       }
       queryClient.invalidateQueries({ queryKey: ['runs', projectId] })
     },
-    [applyRunEvent, projectId, queryClient, runEvents.length],
+    [projectId, queryClient],
   )
 
   const connectRunEvents = useCallback(
@@ -1240,11 +1262,9 @@ function App() {
 
     eventSourceRef.current?.close()
     setRunEvents([])
-    setNodeStatuses(
-      Object.fromEntries(saved.sdl.start.map((agentId) => [agentId, 'ready'])),
-    )
-    setEdgeTraversals({})
-    setTokenUsage(0)
+    setReplaySeq(null)
+    setReplayPlaying(false)
+    setGateComments({})
     setDrawerTab('events')
     try {
       const summary = await api.startRun(saved.id, {
@@ -1289,11 +1309,10 @@ function App() {
       const detail = await api.getRun(run.run_id)
       setCurrentRun(detail)
       setRunEvents(detail.events)
+      setReplaySeq(null)
+      setReplayPlaying(false)
+      setGateComments({})
       setDrawerTab('events')
-      setNodeStatuses({})
-      setEdgeTraversals({})
-      setTokenUsage(0)
-      for (const event of detail.events) applyRunEvent(event)
       if (!TERMINAL_RUN_STATUSES.has(detail.status)) {
         connectRunEvents(detail.run_id)
       }
@@ -1301,6 +1320,51 @@ function App() {
       showNotice('error', error instanceof Error ? error.message : '运行记录读取失败')
     }
   }
+
+  async function decideGate(
+    gateId: string,
+    decision: 'approve' | 'reject',
+  ) {
+    if (!currentRun) return
+    setDecidingGate(gateId)
+    try {
+      await api.decideGate(
+        currentRun.run_id,
+        gateId,
+        decision,
+        gateComments[gateId],
+      )
+      const detail = await api.getRun(currentRun.run_id)
+      setCurrentRun(detail)
+      setGateComments((current) => {
+        const next = { ...current }
+        delete next[gateId]
+        return next
+      })
+      showNotice(
+        'success',
+        decision === 'approve' ? '人工节点已通过' : '人工节点已拒绝',
+      )
+    } catch (error) {
+      showNotice(
+        'error',
+        error instanceof Error ? error.message : '人工节点操作失败',
+      )
+    } finally {
+      setDecidingGate(null)
+    }
+  }
+
+  useEffect(() => {
+    if (!replayPlaying) return
+    const next = nextReplaySeq(runEvents, replayUntilSeq)
+    if (next === null) {
+      setReplayPlaying(false)
+      return
+    }
+    const timer = window.setTimeout(() => setReplaySeq(next), replaySpeed)
+    return () => window.clearTimeout(timer)
+  }, [replayPlaying, replaySpeed, replayUntilSeq, runEvents])
 
   async function changeProject(nextProjectId: string) {
     if (nextProjectId === projectId) return
@@ -1904,7 +1968,7 @@ function App() {
       system_prompt: '你是一个负责处理输入并返回结构化输出的 Agent。',
       inputs: [{ name: 'input', type: 'TEXT', required: true }],
       outputs: [{ name: 'output', type: 'TEXT' }],
-      limits: { max_tokens: null },
+      limits: { max_tokens: null, max_total_tokens: null },
       json_output: { enabled: false, template: {} },
       output_dir: null,
     }
@@ -2134,7 +2198,7 @@ function App() {
             />
           </label>
           <label>
-            Max tokens
+            单次 Max tokens
             <input
               type="number"
               min={1}
@@ -2144,10 +2208,44 @@ function App() {
                 updateAgent(agent.id, (current) => ({
                   ...current,
                   limits: {
+                    ...current.limits,
                     max_tokens: event.target.value
                       ? Number(event.target.value)
                       : null,
                   },
+                }))
+              }
+            />
+          </label>
+          <label>
+            累计 Max tokens
+            <input
+              type="number"
+              min={1}
+              placeholder="不限制"
+              value={agent.limits.max_total_tokens ?? ''}
+              onChange={(event) =>
+                updateAgent(agent.id, (current) => ({
+                  ...current,
+                  limits: {
+                    ...current.limits,
+                    max_total_tokens: event.target.value
+                      ? Number(event.target.value)
+                      : null,
+                  },
+                }))
+              }
+            />
+          </label>
+          <label>
+            产物目录
+            <input
+              value={agent.output_dir ?? ''}
+              placeholder="artifacts"
+              onChange={(event) =>
+                updateAgent(agent.id, (current) => ({
+                  ...current,
+                  output_dir: event.target.value.trim() || null,
                 }))
               }
             />
@@ -2172,6 +2270,14 @@ function App() {
       const edge = selectedEdge
       const source = draft?.sdl.agents.find((agent) => agent.id === edge.from)
       const target = draft?.sdl.agents.find((agent) => agent.id === edge.to)
+      const supportsCondition = [
+        'CONDITIONAL',
+        'FEEDBACK',
+        'LOOP',
+      ].includes(edge.type)
+      const requiresCondition =
+        edge.type === 'CONDITIONAL' || edge.type === 'LOOP'
+      const supportsGuard = edge.type === 'FEEDBACK' || edge.type === 'LOOP'
       return (
         <div className="inspector-body">
           <div className="inspector-heading">
@@ -2199,25 +2305,42 @@ function App() {
               value={edge.type}
               onChange={(event) => {
                 const type = event.target.value as EdgeType
+                const conditionAllowed =
+                  type === 'CONDITIONAL' ||
+                  type === 'FEEDBACK' ||
+                  type === 'LOOP'
+                const conditionRequired =
+                  type === 'CONDITIONAL' || type === 'LOOP'
+                const guardAllowed =
+                  type === 'FEEDBACK' || type === 'LOOP'
                 updateEdge(edge.id, (current) => ({
                   ...current,
                   type,
-                  condition:
-                    type === 'PIPE'
-                      ? null
-                      : current.condition ??
-                        (type === 'CONDITIONAL'
-                          ? defaultCondition(draft!.sdl)
-                          : null),
-                  guard:
-                    type === 'FEEDBACK'
-                      ? {
-                          max_traversals:
-                            current.guard?.max_traversals ??
-                            draft!.sdl.workflow.execution
-                              .feedback_limit_default,
-                        }
-                      : current.guard,
+                  condition: conditionAllowed
+                    ? current.condition ??
+                      (conditionRequired
+                        ? defaultCondition(draft!.sdl)
+                        : null)
+                    : null,
+                  guard: guardAllowed
+                    ? {
+                        max_traversals:
+                          current.guard?.max_traversals ??
+                          (type === 'LOOP'
+                            ? draft!.sdl.workflow.execution
+                                .loop_limit_default
+                            : draft!.sdl.workflow.execution
+                                .feedback_limit_default),
+                      }
+                    : undefined,
+                  aggregate:
+                    type === 'AGGREGATE'
+                      ? current.aggregate ?? { mode: 'all' }
+                      : null,
+                  human_gate:
+                    type === 'HUMAN_GATE'
+                      ? current.human_gate ?? defaultHumanGate()
+                      : null,
                 }))
               }}
             >
@@ -2301,11 +2424,11 @@ function App() {
               </div>
             ))}
           </div>
-          {edge.type !== 'PIPE' && (
+          {supportsCondition && (
             <div className="condition-section">
               <div className="section-line">
                 <span>触发条件</span>
-                {edge.type === 'CONDITIONAL' && !edge.condition && (
+                {!edge.condition && (
                   <button
                     className="small-button"
                     onClick={() =>
@@ -2348,9 +2471,9 @@ function App() {
               </details>
             </div>
           )}
-          {edge.type === 'FEEDBACK' && (
+          {supportsGuard && (
             <label>
-              最大回注次数
+              {edge.type === 'LOOP' ? '最大循环次数' : '最大回注次数'}
               <input
                 type="number"
                 min={1}
@@ -2367,6 +2490,110 @@ function App() {
                 }
               />
             </label>
+          )}
+          {edge.type === 'AGGREGATE' && (
+            <label>
+              聚合模式
+              <select
+                value={edge.aggregate?.mode ?? 'all'}
+                onChange={(event) =>
+                  updateEdge(edge.id, (current) => ({
+                    ...current,
+                    aggregate: {
+                      mode: event.target.value as 'all' | 'any',
+                    },
+                  }))
+                }
+              >
+                <option value="all">全部输入到达</option>
+                <option value="any">任一输入到达</option>
+              </select>
+            </label>
+          )}
+          {edge.type === 'HUMAN_GATE' && (
+            <div className="gate-editor">
+              <label>
+                确认提示
+                <textarea
+                  rows={3}
+                  value={edge.human_gate?.prompt ?? ''}
+                  onChange={(event) =>
+                    updateEdge(edge.id, (current) => ({
+                      ...current,
+                      human_gate: {
+                        ...(current.human_gate ?? defaultHumanGate()),
+                        prompt: event.target.value,
+                      },
+                    }))
+                  }
+                />
+              </label>
+              <div className="two-column-fields">
+                <label>
+                  超时秒数
+                  <input
+                    type="number"
+                    min={1}
+                    max={86400}
+                    value={edge.human_gate?.timeout_seconds ?? 300}
+                    onChange={(event) =>
+                      updateEdge(edge.id, (current) => ({
+                        ...current,
+                        human_gate: {
+                          ...(current.human_gate ?? defaultHumanGate()),
+                          timeout_seconds: Number(event.target.value),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  拒绝行为
+                  <select
+                    value={edge.human_gate?.on_reject ?? 'fail'}
+                    onChange={(event) =>
+                      updateEdge(edge.id, (current) => ({
+                        ...current,
+                        human_gate: {
+                          ...(current.human_gate ?? defaultHumanGate()),
+                          on_reject: event.target.value as 'fail' | 'skip',
+                        },
+                      }))
+                    }
+                  >
+                    <option value="fail">失败</option>
+                    <option value="skip">跳过</option>
+                  </select>
+                </label>
+              </div>
+              <label>
+                超时行为
+                <select
+                  value={edge.human_gate?.on_timeout ?? 'fail'}
+                  onChange={(event) =>
+                    updateEdge(edge.id, (current) => ({
+                      ...current,
+                      human_gate: {
+                        ...(current.human_gate ?? defaultHumanGate()),
+                        on_timeout: event.target.value as
+                          | 'fail'
+                          | 'approve'
+                          | 'reject',
+                      },
+                    }))
+                  }
+                >
+                  <option value="fail">失败</option>
+                  <option value="approve">自动通过</option>
+                  <option value="reject">自动拒绝</option>
+                </select>
+              </label>
+            </div>
+          )}
+          {requiresCondition && !edge.condition && (
+            <div className="inline-warning">
+              此边需要条件，保存前请先补充。
+            </div>
           )}
         </div>
       )
@@ -2475,6 +2702,90 @@ function App() {
                     execution: {
                       ...sdl.workflow.execution,
                       feedback_limit_default: Number(event.target.value),
+                    },
+                  },
+                }))
+              }
+            />
+          </label>
+          <label>
+            Loop 默认上限
+            <input
+              type="number"
+              min={1}
+              value={workflowMeta.execution.loop_limit_default}
+              onChange={(event) =>
+                updateWorkflow((sdl) => ({
+                  ...sdl,
+                  workflow: {
+                    ...sdl.workflow,
+                    execution: {
+                      ...sdl.workflow.execution,
+                      loop_limit_default: Number(event.target.value),
+                    },
+                  },
+                }))
+              }
+            />
+          </label>
+          <label>
+            最大步骤
+            <input
+              type="number"
+              min={1}
+              value={workflowMeta.execution.max_steps}
+              onChange={(event) =>
+                updateWorkflow((sdl) => ({
+                  ...sdl,
+                  workflow: {
+                    ...sdl.workflow,
+                    execution: {
+                      ...sdl.workflow.execution,
+                      max_steps: Number(event.target.value),
+                    },
+                  },
+                }))
+              }
+            />
+          </label>
+          <label>
+            最大并行数
+            <input
+              type="number"
+              min={1}
+              max={64}
+              value={workflowMeta.execution.max_parallel}
+              onChange={(event) =>
+                updateWorkflow((sdl) => ({
+                  ...sdl,
+                  workflow: {
+                    ...sdl.workflow,
+                    execution: {
+                      ...sdl.workflow.execution,
+                      max_parallel: Number(event.target.value),
+                    },
+                  },
+                }))
+              }
+            />
+          </label>
+          <label>
+            累计 Token 上限
+            <input
+              type="number"
+              min={1}
+              placeholder="不限制"
+              value={workflowMeta.execution.max_total_tokens ?? ''}
+              onChange={(event) =>
+                updateWorkflow((sdl) => ({
+                  ...sdl,
+                  workflow: {
+                    ...sdl.workflow,
+                    execution: {
+                      ...sdl.workflow.execution,
+                      max_total_tokens: event.target.value
+                        ? Number(event.target.value)
+                        : null,
                     },
                   },
                 }))
@@ -3225,7 +3536,9 @@ function App() {
 
   const currentRunStatus = currentRun?.status
   const isRunActive =
-    currentRunStatus === 'queued' || currentRunStatus === 'running'
+    currentRunStatus === 'queued' ||
+    currentRunStatus === 'running' ||
+    currentRunStatus === 'waiting'
   const canRun = Boolean(draft) && !isRunActive
 
   if (projectsQuery.isLoading) {
@@ -3530,6 +3843,73 @@ function App() {
                   <span>{currentRun.run_directory}</span>
                 </button>
               )}
+              {pendingGates.length > 0 && (
+                <div className="gate-list">
+                  {pendingGates.map((gate) => {
+                    const canDecide =
+                      currentRunStatus === 'waiting' && replayAtLive
+                    return (
+                      <div className="gate-card" key={gate.gateId}>
+                        <div className="gate-card-title">
+                          <span>人工确认</span>
+                          <code>{gate.edgeId ?? gate.gateId}</code>
+                        </div>
+                        <p>{gate.prompt}</p>
+                        {gate.timeoutSeconds && (
+                          <small>超时 {gate.timeoutSeconds} 秒</small>
+                        )}
+                        <textarea
+                          rows={2}
+                          placeholder="可选评论"
+                          value={gateComments[gate.gateId] ?? ''}
+                          disabled={!canDecide}
+                          onChange={(event) =>
+                            setGateComments((current) => ({
+                              ...current,
+                              [gate.gateId]: event.target.value,
+                            }))
+                          }
+                        />
+                        <div className="gate-actions">
+                          <button
+                            className="small-button"
+                            disabled={
+                              !canDecide ||
+                              decidingGate === gate.gateId
+                            }
+                            onClick={() =>
+                              void decideGate(gate.gateId, 'approve')
+                            }
+                          >
+                            {decidingGate === gate.gateId ? (
+                              <LoaderCircle size={13} className="spin" />
+                            ) : (
+                              <Check size={13} />
+                            )}
+                            通过
+                          </button>
+                          <button
+                            className="small-button danger"
+                            disabled={
+                              !canDecide ||
+                              decidingGate === gate.gateId
+                            }
+                            onClick={() =>
+                              void decideGate(gate.gateId, 'reject')
+                            }
+                          >
+                            <X size={13} />
+                            拒绝
+                          </button>
+                        </div>
+                        {!canDecide && (
+                          <small>回放到运行末尾后可操作</small>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
               <div className="run-history">
                 {runsQuery.data?.slice(0, 4).map((run) => (
                   <button
@@ -3759,23 +4139,136 @@ function App() {
               </div>
             )}
             {drawerTab === 'events' && (
-              <div className="event-console">
-                {runEvents.length === 0 ? (
-                  <div className="drawer-empty">
-                    <Terminal size={17} />
-                    尚无运行事件
+              <div className="event-view">
+                <div className="replay-toolbar">
+                  <div className="replay-buttons">
+                    <button
+                      className="icon-button"
+                      title="回到开始"
+                      disabled={runEvents.length === 0}
+                      onClick={() => {
+                        setReplayPlaying(false)
+                        setReplaySeq(0)
+                      }}
+                    >
+                      <SkipBack size={14} />
+                    </button>
+                    <button
+                      className="icon-button"
+                      title="上一步"
+                      disabled={runEvents.length === 0}
+                      onClick={() => {
+                        setReplayPlaying(false)
+                        setReplaySeq(previousReplaySeq(runEvents, replayUntilSeq))
+                      }}
+                    >
+                      <ChevronDown
+                        size={14}
+                        style={{ transform: 'rotate(90deg)' }}
+                      />
+                    </button>
+                    <button
+                      className="icon-button replay-play"
+                      title={replayPlaying ? '暂停回放' : '播放回放'}
+                      disabled={runEvents.length === 0}
+                      onClick={() => {
+                        if (!replayPlaying && replayUntilSeq >= replayMaxSeq) {
+                          setReplaySeq(0)
+                        }
+                        setReplayPlaying((value) => !value)
+                      }}
+                    >
+                      {replayPlaying ? (
+                        <Pause size={14} />
+                      ) : (
+                        <Play size={14} fill="currentColor" />
+                      )}
+                    </button>
+                    <button
+                      className="icon-button"
+                      title="下一步"
+                      disabled={runEvents.length === 0}
+                      onClick={() => {
+                        setReplayPlaying(false)
+                        const next = nextReplaySeq(runEvents, replayUntilSeq)
+                        setReplaySeq(next ?? replayMaxSeq)
+                      }}
+                    >
+                      <ChevronUp
+                        size={14}
+                        style={{ transform: 'rotate(90deg)' }}
+                      />
+                    </button>
+                    <button
+                      className="small-button"
+                      title="跳到运行末尾"
+                      disabled={runEvents.length === 0}
+                      onClick={() => {
+                        setReplayPlaying(false)
+                        setReplaySeq(null)
+                      }}
+                    >
+                      <SkipForward size={14} />
+                      实时
+                    </button>
                   </div>
-                ) : (
-                  runEvents.map((event) => (
-                    <div className="event-row" key={`${event.run_id}-${event.seq}`}>
-                      <span>{String(event.seq).padStart(3, '0')}</span>
-                      <time>{formatTime(event.ts)}</time>
-                      <code>{event.type}</code>
-                      <span>{event.node_id ?? event.edge_id ?? 'workflow'}</span>
-                      <small>{JSON.stringify(event.data)}</small>
+                  <input
+                    className="replay-slider"
+                    type="range"
+                    min={0}
+                    max={Math.max(replayMaxSeq, 1)}
+                    value={replayUntilSeq}
+                    aria-label="回放进度"
+                    disabled={runEvents.length === 0}
+                    onChange={(event) => {
+                      setReplayPlaying(false)
+                      const value = Number(event.target.value)
+                      setReplaySeq(
+                        value >= replayMaxSeq ? null : value,
+                      )
+                    }}
+                  />
+                  <span className="replay-position">
+                    {String(replayUntilSeq).padStart(3, '0')} /{' '}
+                    {String(replayMaxSeq).padStart(3, '0')}
+                  </span>
+                  <select
+                    className="replay-speed"
+                    value={replaySpeed}
+                    aria-label="回放速度"
+                    onChange={(event) =>
+                      setReplaySpeed(Number(event.target.value))
+                    }
+                  >
+                    <option value={250}>0.25s</option>
+                    <option value={500}>0.5s</option>
+                    <option value={1000}>1s</option>
+                    <option value={2000}>2s</option>
+                  </select>
+                </div>
+                <div className="event-console">
+                  {replayState.events.length === 0 ? (
+                    <div className="drawer-empty">
+                      <Terminal size={17} />
+                      尚无运行事件
                     </div>
-                  ))
-                )}
+                  ) : (
+                    replayState.events.map((event) => (
+                      <div
+                        className={`event-row event-${event.type}`}
+                        key={`${event.run_id}-${event.seq}`}
+                      >
+                        <span>{String(event.seq).padStart(3, '0')}</span>
+                        <time>{formatTime(event.ts)}</time>
+                        <code>{event.type}</code>
+                        <span>
+                          {event.node_id ?? event.edge_id ?? 'workflow'}
+                        </span>
+                        <small>{JSON.stringify(event.data)}</small>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
             )}
             {drawerTab === 'result' && (
@@ -3818,10 +4311,48 @@ function App() {
                       <span className="result-empty">尚无运行产物</span>
                     )}
                   </div>
-                  <span className="eyebrow generated-heading">
-                    GENERATED FILES
-                  </span>
-                  <pre>{generatedFiles.join('\n') || '尚未生成'}</pre>
+                  {replayState.artifacts.length > 0 && (
+                    <details className="generated-files">
+                      <summary>
+                        回放产物 {replayState.artifacts.length}
+                      </summary>
+                      <div className="artifact-list">
+                        {replayState.artifacts.map((artifact) => (
+                          <div
+                            className="artifact-row"
+                            key={`${artifact.seq}-${artifact.path}`}
+                          >
+                            <div>
+                              <strong>{artifact.port}</strong>
+                              <span>{artifact.type}</span>
+                            </div>
+                            <code>
+                              runs/
+                              {currentRun?.run_directory ??
+                                currentRun?.run_id ??
+                                'current'}
+                              /workspace/{artifact.path}
+                            </code>
+                            <small>
+                              {artifact.agentId ?? 'workflow'}
+                              {artifact.batchId
+                                ? ` · ${artifact.batchId}`
+                                : ''}
+                              {artifact.bytes !== null
+                                ? ` · ${artifact.bytes} B`
+                                : ''}
+                            </small>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  )}
+                  {generatedFiles.length > 0 && (
+                    <details className="generated-files">
+                      <summary>生成文件</summary>
+                      <pre>{generatedFiles.join('\n')}</pre>
+                    </details>
+                  )}
                 </div>
               </div>
             )}

@@ -362,8 +362,6 @@ class RunDetail(RunSummary):
     result: dict[str, Any] | None = None
     events: list[dict[str, Any]] = Field(default_factory=list)
     pending_gates: list[PendingHumanGate] = Field(default_factory=list)
-
-
 class OpenFolderResponse(StrictModel):
     path: str
     opened: bool = True

@@ -1,9 +1,9 @@
-# LoomLane V0.1 技术方案与落地记录
+# LoomLane V0.2 技术方案与落地记录
 
-- 状态：V0.1 已落地，本文档作为当前实现基线与后续演进依据
-- 目标版本：V0.1
+- 状态：V0.2 已落地，本文档作为当前实现基线与后续演进依据
+- 目标版本：V0.2
 - 输入材料：`LL.json`
-- 更新时间：2026-11-18
+- 更新时间：2026-11-19
 
 ## 1. 方案摘要
 
@@ -22,53 +22,56 @@ LoomLane 是一个本地优先的多 Agent 流水线可视化编排与编译系�
 
 从现有材料看，项目要实现的是完整的 LoomLane 产品，而不是一个单独的 Codex `SKILL.md` 技能包。下文按产品工程方案设计；如果最终还需要提供 Codex Skill，应另做一层调用和交付封装，不与本方案的应用程序架构混在一起。
 
-### 1.1 V0.1 已实现能力
+### 1.1 V0.2 已实现能力
 
 | 模块 | 当前实现 |
 | --- | --- |
 | 项目与画布 | 创建、打开、保存、导入/导出 SDL，React Flow 画布与 SDL/canvas 分离持久化 |
-| Agent 与边 | Agent、端口、`PIPE`、`CONDITIONAL`、`FEEDBACK` 编辑，Agent 和边选中删除 |
+| Agent 与边 | Agent、端口及 `PIPE`、`CONDITIONAL`、`FEEDBACK`、`LOOP`、`FAN_OUT`、`AGGREGATE`、`HUMAN_GATE` 编辑 |
 | 条件 | 受限条件 AST，前端支持 `AND`、`OR`、`NOT`、多谓词添加/删除/嵌套和高级 JSON 编辑 |
-| 检查器 | 右侧检查器可折叠，展开时可拖拽或键盘调整宽度，状态持久化到浏览器 |
+| 面板 | 左、右、底部面板均可收纳；左右面板可调宽度，底部面板可调高度，偏好持久化到浏览器 |
 | API Profile | 增删改、密钥状态查询、密钥写入/删除；删除被引用 Profile 时自动迁移或阻止 |
 | 模型 JSON 输出 | 每个 Agent 可独立启用层次化 JSON 模板，并通过 `response_format={"type":"json_object"}` 请求 JSON |
 | 编译 | 从规范化 SDL 确定性生成独立 Python 项目 |
-| 运行 | 子进程执行、条件分支、有界 Feedback、Token 统计、取消和失败记录 |
-| 事件 | NDJSON 落盘并通过 SSE 回传节点、边、用量和错误事件 |
+| 运行 | 子进程执行、条件分支、有界 Feedback/Loop、Fan-out、Aggregate、人工确认、并行度和取消 |
+| 限额 | 单次请求 `max_tokens`、Agent 累计 `max_total_tokens`、Workflow 累计 `max_total_tokens`、`max_steps` |
+| 产物 | `TEXT`、`DATA`、`FILE` 输出自动写入运行工作区，生成 `artifact_written` 事件并记录字节数 |
+| 事件与回放 | NDJSON 落盘、SSE 实时推送、序号回放、播放/暂停、单步拖动、倍速和实时跳转 |
 | 密钥 | OS 凭据库优先，Windows DPAPI 加密回退，按项目与 Profile 隔离并绑定 origin |
 | 测试 | 前端 Vitest、后端 pytest，覆盖校验、运行、密钥和关键编辑工具 |
 
 ### 1.2 阅读约定
 
 - “已实现”表示当前仓库中存在对应代码和行为。
-- “约束”表示 V0.1 的明确边界，不应被理解为前端 Bug。
-- “后续预留”表示尚未纳入 V0.1 交付范围的能力。
+- “约束”表示 V0.2 的明确边界，不应被理解为前端 Bug。
+- “后续预留”表示尚未纳入 V0.2 交付范围的能力。
 - 示例中的 API Key 一律使用占位符，不得把真实密钥写入 SDL、Markdown、Git 或日志。
 
 ## 2. 目标与范围
 
-### 2.1 V0.1 已实现范围
+### 2.1 V0.2 已实现范围
 
 1. 支持创建、保存、导入和导出工作流。
 2. 支持 Agent 角色、API Profile、全局背景 Prompt 的配置。
-3. 支持 `PIPE`、`CONDITIONAL`、`FEEDBACK` 三种边。
-4. 支持输入输出端口类型检查，以及反馈回路的边界检查。
+3. 支持 `PIPE`、`CONDITIONAL`、`FEEDBACK`、`LOOP`、`FAN_OUT`、`AGGREGATE`、`HUMAN_GATE` 七种边。
+4. 支持输入输出端口类型检查、反馈/循环回路边界，以及聚合入边一致性检查。
 5. 从 SDL 生成可独立运行的 Python 项目。
 6. 通过 OpenAI 兼容接口执行 Agent。
-7. 将运行事件以流式方式反馈到前端，并持久化为 `events.jsonl`。
-8. 在本地项目目录中保存画布布局、SDL、生成物和运行记录。
+7. 支持批次感知的并行调度、Fan-out、全量/任一聚合和人工确认暂停。
+8. 将运行事件流式反馈到前端、持久化为 `events.jsonl`，并按事件序号进行运行回放。
+9. 在本地项目目录中保存画布布局、SDL、生成物、运行记录和自动落盘产物。
+10. 对单次模型调用、Agent 累计、Workflow 累计和运行步数实施分层限额。
 
-### 2.2 v0.1 非目标
+### 2.2 V0.2 非目标
 
 - 不做多租户、云端协作、权限系统。
 - 不支持任意 Python、JavaScript 或 Jinja2 表达式执行。
-- 不支持 `LOOP`、`FAN_OUT`、`AGGREGATE`、`HUMAN_GATE` 正式执行语义。
-- 不做并行节点调度；v0.1 采用确定性的串行就绪队列。
 - 不做 token 级模型流式输出，只回传节点、边、用量和错误等运行事件。
-- 不做多 provider 完整适配；v0.1 只实现 OpenAI 兼容接口。
+- 不做多 provider 完整适配；V0.2 只实现 OpenAI 兼容接口。
 - 不实现 Agent 内 Python 精细规则。
-- `FILE` 端口在 v0.1 只传递工作区内的文件引用，不自动把模型文本转换为文件产物。
-- `max_tokens` 在 v0.1 记录并透传给模型请求，但累计超限中断放到 v0.2。
+- 不提供分布式执行或跨主机调度；并行仅限单个生成项目的本地线程池。
+- 不提供产物的在线编辑、版本管理或对象存储；产物文件由本地运行工作区管理。
+- 不校验 `AGGREGATE` 映射是否覆盖目标 Agent 的全部必要输入，仍需用户在保存前补齐。
 
 ## 3. 关键设计决策
 
@@ -82,15 +85,21 @@ LoomLane 是一个本地优先的多 Agent 流水线可视化编排与编译系�
 | 调度模型 | 显式就绪队列和运行状态机 | 比拓扑排序更适合条件分支和有界反馈 |
 | 执行隔离 | 生成项目 + 独立 Python 子进程 | 崩溃、取消和日志边界清晰 |
 | 事件协议 | NDJSON 写入 stdout，由服务端转 SSE | 协议简单，方便实时消费和落盘 |
-| 持久化 | 文件系统 + JSON/YAML，不引入业务数据库 | v0.1 本地单用户场景足够，项目天然可迁移 |
+| 持久化 | 文件系统 + JSON/YAML，不引入业务数据库 | V0.2 本地单用户场景足够，项目天然可迁移 |
+| 批次模型 | 每次 Agent 执行都绑定 `batch_id` | 同时表达普通流程、Fan-out 分支、Loop/Feedback 重入和聚合等待 |
+| 并发调度 | 有界线程池 + 显式就绪队列 | 在单机本地执行中获得可控并行，不引入分布式运行时 |
+| 人工暂停 | Gate 文件 + 进程内等待线程 | 子进程可暂停、状态可落盘，API 可在独立请求中批准或拒绝 |
+| 运行回放 | 原始事件流 + 纯函数推导视图 | 回放与实时消费共用一套状态机，支持任意事件序号重建 |
 
-与初始 JSON 方案相比，V0.1 落地时已经收敛以下细节：
+与初始 JSON 方案相比，V0.2 落地时已经收敛以下细节：
 
 1. 不再维护独立的 `api_profiles.local.yaml`。SDL 保存 profile 的非敏感配置，系统凭据库保存密钥。
 2. 不再同时使用 `from_port`、`to_port` 和 `data_mapping` 描述同一个映射。统一使用 `mappings` 列表。
-3. 不把 Jinja2 直接用作条件执行引擎。v0.1 使用可枚举、可校验的条件 AST。
+3. 不把 Jinja2 直接用作条件执行引擎。V0.2 使用可枚举、可校验的条件 AST。
 4. 生成项目不依赖 LoomLane Python 包。调度器和 Agent 调用代码由模板生成，第三方运行依赖只保留 `httpx`。
-5. v0.1 不宣称支持任意图。忽略 `FEEDBACK` 边后，工作流必须是 DAG。
+5. V0.2 仍不宣称支持任意图。忽略 `FEEDBACK` 和 `LOOP` 边后，工作流必须是 DAG。
+6. 并行、人工确认和聚合只在本机单个生成项目进程内实现，不引入消息队列或分布式协调。
+7. 运行回放只重放已记录事件，不重新请求模型，也不重新执行副作用。
 
 ## 4. 总体架构
 
@@ -214,14 +223,14 @@ projects/{project_id}/
 - 导入其他项目时不自动复用原项目密钥；即使 `profile_id` 相同，也要求用户在确认 `base_url` 后重新补充凭据。
 - Profile 配置和密钥分两步保存：先保存项目使 SDL 中的 `base_url` 生效，再在 API 检查器中保存密钥。
 
-## 6. SDL 0.1 设计
+## 6. SDL 0.2 设计
 
 SDL 使用 YAML 保存，解析时必须使用 `safe_load`，并限制文件大小、锚点展开和嵌套深度。
 
 ### 6.1 示例
 
 ```yaml
-sdl_version: "0.1"
+sdl_version: "0.2"
 
 workflow:
   id: content-review
@@ -240,7 +249,10 @@ workflow:
       port: draft
   execution:
     feedback_limit_default: 3
+    loop_limit_default: 10
     max_steps: 200
+    max_total_tokens: 50000
+    max_parallel: 4
 
 start:
   - drafter
@@ -277,13 +289,14 @@ agents:
         type: DATA
     limits:
       max_tokens: null
+      max_total_tokens: 12000
     json_output:
       enabled: true
       template:
         draft: 完整的 Markdown 草稿文本
         outline:
           sections: 章节标题字符串数组
-    output_dir: null
+    output_dir: artifacts/drafter
 
   - id: reviewer
     name: 质量审查
@@ -307,6 +320,10 @@ agents:
       template:
         review: 具体、可执行的审查意见
         score: 0 到 1 之间的数字
+    limits:
+      max_tokens: null
+      max_total_tokens: 8000
+    output_dir: null
 
 edges:
   - id: draft-to-review
@@ -332,6 +349,9 @@ edges:
       max_traversals: 3
 ```
 
+`sdl_version` 目前接受 `"0.1"` 和 `"0.2"`，新建项目默认写入 `"0.2"`。
+新增强执行语义要求 `"0.2"`；读取旧版 `"0.1"` 时仍由同一套运行时按兼容字段执行。
+
 ### 6.2 标识符约束
 
 - `workflow.id`、`agent.id`、`edge.id`、`api_profile.id` 使用 `^[a-z][a-z0-9_-]{0,63}$`。
@@ -354,11 +374,11 @@ edges:
 - 相同类型可以直接连接。
 - `MIXED` 可以与任意类型连接。
 - 其他跨类型连接默认报错，不做隐式字符串化。
-- `schema_hint` 在 v0.1 可保存任意 JSON Schema 子集；运行时可用于附加校验，不替代端口类型。
+- `schema_hint` 在 V0.2 可保存任意 JSON Schema 子集；运行时可用于附加校验，不替代端口类型。
 
 ### 6.4 条件表达式
 
-v0.1 不支持原始字符串表达式。条件使用 AST：
+V0.2 不支持原始字符串表达式。条件使用 AST：
 
 ```json
 {
@@ -386,9 +406,122 @@ v0.1 不支持原始字符串表达式。条件使用 AST：
 
 禁止函数调用、属性写入、任意索引表达式和动态求值。前端条件编辑器支持添加、删除和嵌套多个谓词，并通过 `AND`/`OR` 条件组组合；高级 JSON 编辑仅作为复杂条件的补充入口。
 
-### 6.5 Agent JSON 输出配置
+边与条件的关系：
 
-V0.1 为每个 Agent 提供独立的 JSON 输出配置：
+- `PIPE` 不允许配置条件。
+- `CONDITIONAL` 必须配置条件。
+- `FEEDBACK` 可以有条件；不配置时首次成功传播即触发反馈。
+- `LOOP` 必须配置条件，条件为真时继续回注，为假时退出回路。
+- `FAN_OUT`、`AGGREGATE`、`HUMAN_GATE` 可以通过通用 `condition` 决定这条边是否参与本轮传播。
+
+### 6.5 七种边与批次语义
+
+一次 Agent 执行绑定一个不可变的 `batch_id`。普通边沿用当前批次；Fan-out 和循环边创建新批次：
+
+| 边类型 | 触发与路由 | 批次 | 关键约束 |
+| --- | --- | --- | --- |
+| `PIPE` | 源 Agent 成功后直接传播 | 沿用当前批次 | 必须至少有一条 mapping |
+| `CONDITIONAL` | 条件为真时传播 | 沿用当前批次 | 必须配置条件 |
+| `FEEDBACK` | 条件满足时回注上游 | 新建 `loop-*` 批次 | 目标必须是源节点的上游祖先 |
+| `LOOP` | 条件为真时继续回注，条件为假时退出 | 新建 `loop-*` 批次 | 必须有条件、目标必须是上游祖先 |
+| `FAN_OUT` | 把同一源节点的多个并行出口路由到新批次 | 新建一次 `fanout-*` 批次，同一源节点的所有 Fan-out 出口共享 | 适合后续并行分支 |
+| `AGGREGATE` | 按目标 Agent 和批次等待所有/任一聚合入边 | 沿用 fan-out 批次 | 目标不能同时混用普通入边；同一目标的模式必须一致 |
+| `HUMAN_GATE` | 创建待办 Gate 并暂停该路径 | 批准后沿用原批次 | 拒绝和超时策略必须显式定义 |
+
+`FEEDBACK` 与 `LOOP` 在运行时都使用新批次，并受边级 `guard.max_traversals` 限制。区别是 `LOOP` 强制要求继续条件，且未显式设置 guard 时继承 `loop_limit_default`；`FEEDBACK` 继承 `feedback_limit_default`。
+
+`FAN_OUT` 示例：
+
+```yaml
+edges:
+  - id: split-research
+    from: planner
+    to: researcher
+    type: FAN_OUT
+    mappings:
+      - from: brief
+        to: brief
+
+  - id: split-review
+    from: planner
+    to: reviewer
+    type: FAN_OUT
+    mappings:
+      - from: brief
+        to: brief
+```
+
+两条 Fan-out 边由同一次 `planner` 执行传播时共享同一个 fan-out 批次。后端最多同时运行 `workflow.execution.max_parallel` 个 Agent。
+
+`AGGREGATE` 示例：
+
+```yaml
+edges:
+  - id: research-join
+    from: researcher
+    to: synthesizer
+    type: AGGREGATE
+    aggregate:
+      mode: all
+    mappings:
+      - from: findings
+        to: research
+
+  - id: review-join
+    from: reviewer
+    to: synthesizer
+    type: AGGREGATE
+    aggregate:
+      mode: all
+    mappings:
+      - from: review
+        to: review
+```
+
+`all` 等待同一批次内所有 AGGREGATE 入边到达；`any` 在第一条入边到达后即调度目标 Agent。由于 `any` 不会等待其余分支，后到映射若复用同一端口，会以最后写入值为准。当前校验器尚未检查 Aggregate 映射是否覆盖目标 Agent 的全部必填输入，用户仍需补齐映射。
+
+`HUMAN_GATE` 示例：
+
+```yaml
+edges:
+  - id: production-approval
+    from: reviewer
+    to: publisher
+    type: HUMAN_GATE
+    mappings:
+      - from: review
+        to: approval_context
+    human_gate:
+      prompt: 请确认内容是否可以发布
+      timeout_seconds: 300
+      on_reject: fail
+      on_timeout: fail
+```
+
+Gate 支持的策略：
+
+- `on_reject: fail | skip`
+- `on_timeout: fail | approve | reject`
+
+批准后该边继续传播；`skip` 只停止该路径。若后续工作流输出依赖被跳过的路径，最终仍会因输出未生成而失败。
+
+### 6.6 运行限额
+
+限额分为三层：
+
+| 配置 | 作用域 | 行为 |
+| --- | --- | --- |
+| `agents[].limits.max_tokens` | 单次模型请求 | 作为请求体的 `max_tokens` |
+| `agents[].limits.max_total_tokens` | 单个 Agent 累计 | 每次返回用量后累计检查，超限使运行失败 |
+| `workflow.execution.max_total_tokens` | 整次运行累计 | 所有 Agent 用量求和后检查，超限使运行失败 |
+| `workflow.execution.max_steps` | 整次运行 | 每调度一次 Agent 执行计一步，达到上限后失败 |
+| `workflow.execution.max_parallel` | 整次运行 | 同时运行的 Agent 任务上限，范围 `1-64` |
+
+累计限额依赖供应商返回的 `usage`。运行时在调用完成后检查累计值，因此最后一次已发出的请求仍可能让总量略微超过配置值；这不是前端显示误差，而是“事后计量”的边界。
+
+### 6.7 Agent JSON 输出配置
+
+V0.2 为每个 Agent 提供独立的 JSON 输出配置：
 
 ```yaml
 json_output:
@@ -440,7 +573,7 @@ json_output:
 
 模型回复先尝试整体 `json.loads`。若对象前后带有说明文字，提取第一个 `{` 并使用 `JSONDecoder.raw_decode` 解析第一个完整对象。该机制只容忍对象后的合法尾随文本，不会补全截断 JSON，也不会猜测缺失字段或修正键名。
 
-### 6.6 API Profile 与 DeepSeek 配置示例
+### 6.8 API Profile 与 DeepSeek 配置示例
 
 DeepSeek 通过 OpenAI 兼容接口接入时，Profile 可写为：
 
@@ -489,14 +622,19 @@ API Key 不属于 SDL 字段。配置步骤是：
 - `start` 中的 Agent 存在。
 - 每条边引用的 Agent 和端口存在。
 - 边的映射源端口属于上游输出，目标端口属于下游输入。
-- 条件只出现在 `CONDITIONAL` 和 `FEEDBACK` 边上。
+- `PIPE` 不允许条件，`CONDITIONAL` 和 `LOOP` 必须配置条件。
 - 条件 AST 的操作符和引用路径在允许范围内。
-- 忽略 `FEEDBACK` 边后不存在普通环。
-- 每条 `FEEDBACK` 边的目标必须是其源节点的上游祖先。
-- 每条 `FEEDBACK` 边必须有 `max_traversals`，或在 workflow 默认值存在时可继承。
+- 忽略 `FEEDBACK` 和 `LOOP` 边后不存在普通环。
+- 每条 `FEEDBACK` 和 `LOOP` 边的目标必须是其源节点的上游祖先。
+- 每条 `FEEDBACK`/`LOOP` 边必须有 `max_traversals`，或在 workflow 默认值存在时继承。
+- `AGGREGATE` 配置只能出现在 `AGGREGATE` 边上，`HUMAN_GATE` 配置只能出现在 `HUMAN_GATE` 边上。
+- 同一目标 Agent 的所有 `AGGREGATE` 入边必须使用相同的 `all` 或 `any` 模式。
+- `AGGREGATE` 目标不能与其他类型的入边混用。
 - 所有节点均可从 `start` 到达；不可达节点作为错误处理。
 - 工作流声明的输出引用存在。
 - SDL 中不能出现 `api_key`、`secret`、`password` 等敏感字段。
+
+校验器当前不检查 AGGREGATE 映射是否覆盖目标 Agent 的全部必填输入。该问题会在运行时就绪判断阶段表现为节点不执行，或在最终工作流输出缺失时失败；V0.2 通过文档约束和用户检查补齐，后续可增加静态覆盖检查。
 
 ### 7.2 编译产物
 
@@ -533,15 +671,18 @@ generated/{compiler_key}/
 ```text
 RunState
 ├─ run_id
-├─ status: queued | running | succeeded | failed | cancelled
+├─ status: queued | running | waiting | succeeded | failed | cancelled
 ├─ step
-├─ workflow_inputs
-├─ agent_outputs
-├─ node_inputs
-├─ dirty_inputs
-├─ edge_traversals
-├─ usage
+├─ inputs[agent_id][port]
+├─ input_batches[agent_id][batch_id][port]
+├─ outputs[agent_id][port]
+├─ scheduled_batches
+├─ aggregate_arrivals
+├─ edge_traversals[edge_id]
+├─ usage / agent_usage
 ├─ artifacts
+├─ pending
+├─ waiting_gate_ids
 └─ errors
 ```
 
@@ -560,28 +701,31 @@ RunState
 
 ### 8.2 调度语义
 
-v0.1 使用确定性的串行就绪队列：
+V0.2 使用批次感知的并行就绪队列：
 
-1. 用 workflow inputs 初始化所有 `start` Agent 的输入。
-2. 从就绪队列中按 SDL 中的 Agent 顺序取出一个节点执行。
-3. 节点成功后，保存输出并发送 `node_exit` 事件。
-4. 按 SDL 中的边顺序计算所有出边。
-5. 条件为真或无条件时，按 `mappings` 将源输出写入目标 Agent 的累计输入，并标记本轮有新输入。
-6. 当目标 Agent 有新输入、没有正在执行，且累计输入已满足全部必填端口时，将其加入就绪队列。
-7. 节点执行结束后清空 `dirty_inputs`，但保留 `node_inputs`。这样 Feedback 重入时，原始输入和反馈输入可以同时参与下一次调用。
-8. 队列为空且没有运行中的节点时，运行结束。
+1. 用 workflow inputs 初始化所有 `start` Agent 的 `batch-start` 输入。
+2. 调度器在 `pending` 队列非空时按 SDL Agent 顺序填充可运行任务，最多同时运行 `max_parallel` 个 Agent。
+3. 每次调度 Agent 时 `step` 加一并发送 `node_enter`；完成后保存输出、累计 Token、写产物，再发送 `node_exit`。
+4. Agent 成功后按 SDL 中的边顺序计算所有出边；每条边先判断通用条件，再按边类型传播。
+5. 普通边把映射写入当前批次；`FAN_OUT` 为本次源节点执行创建新的 `fanout-*` 批次；`FEEDBACK`/`LOOP` 创建新的 `loop-*` 批次。
+6. 目标 Agent/批次只有同时满足必填输入和聚合条件时才会进入 `pending`；`scheduled_batches` 保证同一 Agent 的同一批次只调度一次。
+7. `HUMAN_GATE` 不占用 Agent 执行槽位。它生成 Gate 文件、发出等待事件，并在独立 Gate 线程池中等待人工决定或超时。
+8. 没有运行中的 Agent、没有待决 Gate，且 `pending` 为空时，运行进入结果汇总。
 
 关键规则：
 
 - 多个必填输入端口是 join 关系，等待全部满足。
 - 条件未触发的边不会阻塞下游。
 - 可选输入不参与就绪判断。
-- 同一输入端口再次收到值时，以最新值为准；累计输入不会因为节点执行而整体清空。
-- 一次节点执行完成后必须有新的输入事件才能再次激活，防止节点因已满足必填端口而被无条件重复调度。
-- 同一节点在一次运行中可以有多次执行，但仅有反馈触发，且受边级 guard 限制。
-- `FEEDBACK` 边每命中一次，`edges.{edge_id}.traversals` 加一；达到上限后运行失败，错误码为 `feedback_limit_exceeded`。
+- 进入新批次时会复制目标 Agent 上一批次输入作为基线，再覆盖本边映射，因此 Loop/Feedback 重入可携带原始上下文。
+- 同一批次内同名端口再次收到值时，以最新值为准。
+- `FAN_OUT` 让多个下游 Agent 获得同一个新批次，从而可以并行执行。
+- `AGGREGATE all` 等待同一批次的所有聚合入边；`AGGREGATE any` 在第一条入边到达后调度，后续同批次入边不会再次启动目标 Agent。
+- 同一 Agent 在一次运行中可以有多次执行，例如不同 Fan-out 批次或 Loop/Feedback 批次。
+- `FEEDBACK`/`LOOP` 边每传播一次，`edges.{edge_id}.traversals` 加一；超过 guard 上限后运行失败。
 - 全局 `max_steps` 和运行超时是第二道保护。
-- 任一节点失败时默认 fail-fast，后续就绪节点不再执行。
+- Agent 或 Gate 失败时默认 fail-fast，取消尚未开始的任务并终止子进程树。
+- 并行的状态更新集中在主调度循环处理；Agent 线程只返回结果，不直接修改共享图状态。
 
 ### 8.3 Agent 调用
 
@@ -629,39 +773,104 @@ python workflow.py --input input.json
 - stdout 只输出 NDJSON 事件。
 - stderr 输出人类可读诊断日志，并做行数和大小限制。
 - API Key 通过环境变量传入子进程，不通过命令行参数传递。
+- Gate 文件目录通过 `LOOMLANE_GATE_DIR` 指向 `runs/{run_id}/gates/`，服务端与子进程通过该目录交换人工决定。
 - 服务端异步读取 stdout，逐行校验事件、追加到 `events.jsonl`，并广播给 SSE 订阅者。
 - 用户取消运行时，服务端终止整个子进程树。
 
 API 侧同一项目默认只允许一个活动运行，避免生成物或工作区相互污染。
 
-### 8.5 运行结果
+### 8.5 人工确认状态机
+
+Gate 文件名由运行时生成：`gate-{edge_id}-{counter}.json`。等待期间记录：
+
+```json
+{
+  "gate_id": "gate-production-approval-1",
+  "run_id": "...",
+  "edge_id": "production-approval",
+  "from": "reviewer",
+  "to": "publisher",
+  "batch_id": "batch-start",
+  "prompt": "请确认内容是否可以发布",
+  "requested_at": "2026-11-19T02:00:00+00:00",
+  "timeout_seconds": 300,
+  "decision": null,
+  "comment": null
+}
+```
+
+状态转换：
+
+```text
+waiting
+  -> approve  -> edge_traversed -> 下游继续
+  -> reject   -> on_reject=fail  -> run failed
+              -> on_reject=skip  -> 当前路径结束
+  -> timeout  -> on_timeout=fail | approve | reject
+```
+
+服务端使用短文件锁和原子替换避免“人工批准”和“超时写回”同时改写同一个 Gate。Gate 已决定后再次提交返回冲突；运行未处于 `waiting` 或 Gate 不存在时分别返回 `409`、`404`。
+
+运行存在一个或多个待决 Gate 时，`meta.json` 的 `status` 为 `waiting`。所有 Gate 都解决后，若仍有 Agent 任务则回到 `running`，否则进入最终状态。运行详情会从 Gate 文件重建 `pending_gates`，刷新页面不会丢失待办。
+
+### 8.6 产物自动落盘与运行结果
 
 Agent 流生成物的位置分为三类：
 
 - 编译产物：`workspace/projects/{project_id}/generated/{compiler_key}/`，包含 `workflow.py`、`config.py`、Agent 配置和运行时模板。
-- 运行数据：`workspace/projects/{project_id}/runs/{run_id}/`，包含 `input.json`、`events.jsonl`、`result.json` 和 `workspace/`。
-- Agent 输出：节点结果写入运行状态和 `result.json` 的 `outputs`。当工作流声明 `workflow.outputs` 时，`outputs` 保存最终映射结果；所有节点的中间输出可从运行详情或事件重建。
+- 运行数据：`workspace/projects/{project_id}/runs/{run_id}/`，包含 `meta.json`、`input.json`、`events.jsonl`、`result.json`、`gates/` 和 `workspace/`。
+- Agent 产物：每个成功输出端口都会自动写入运行工作区，默认目录为 `artifacts/`，也可由 `agents[].output_dir` 指定相对目录。
 
-`FILE` 端口只允许引用 `runs/{run_id}/workspace/` 内的文件；V0.1 不会自动把普通模型文本转换成文件。因此需要文件产物时，应由 Agent 返回合法文件引用，或留待后续产物落盘能力实现。
+自动落盘规则：
 
-`result.json` 至少包含：
+| 端口类型 | 扩展名 | 内容 |
+| --- | --- | --- |
+| `TEXT` | `.txt` | 原始文本 |
+| `DATA` | `.json` | 格式化 JSON |
+| `FILE` | 保留源文件扩展名 | 从工作区内的合法源文件复制 |
+| `MIXED` | `.txt` | 字符串化后的值 |
+
+文件名格式为：
+
+```text
+{step:05d}-{batch_id}-{agent_id}-{port_name}{extension}
+```
+
+`step` 和 `batch_id` 使循环、反馈和并行批次不会互相覆盖。路径中的文件名片段会做安全字符替换。
+
+安全规则：
+
+- `output_dir` 必须是相对路径，不能是绝对路径、盘符路径或包含 `..`。
+- `FILE` 源路径必须解析到 `runs/{run_id}/workspace/` 内且文件存在。
+- 所有路径在写盘前解析并检查仍位于工作区根目录内。
+
+每次落盘会发出 `artifact_written` 事件，包含 `port`、`path`、`type`、`step`、`batch_id` 和 `bytes`。文件路径相对运行工作区，前端会显示为 `runs/{run_id}/workspace/{path}`。
+
+`result.json` 的当前结构为：
 
 ```json
 {
   "run_id": "...",
   "status": "succeeded",
   "workflow_hash": "...",
-  "outputs": {},
+  "workflow_outputs": {},
+  "agent_outputs": {},
+  "agent_usage": {},
   "usage": {
     "prompt_tokens": 0,
     "completion_tokens": 0,
     "total_tokens": 0
   },
+  "steps": 0,
+  "edge_traversals": {},
+  "artifacts": [],
   "error": null
 }
 ```
 
-运行目录是排查“产物在哪里”和“为什么失败”的第一入口：先看 `events.jsonl` 定位最后成功事件和错误事件，再看 `result.json` 的 `outputs`、`usage` 和 `error`。
+`workflow_outputs` 是按 `workflow.outputs` 映射后的最终结果；`agent_outputs` 保留各 Agent 最新一次成功输出。所有批次共享 `agent_outputs`，因此早期批次会被后续同 Agent 输出覆盖。完整历史应结合 `events.jsonl`、`artifacts` 列表和文件名中的 `step`/`batch_id` 排查。
+
+运行目录是排查“产物在哪里”和“为什么失败”的第一入口：先看 `events.jsonl` 定位最后成功事件和错误事件，再看 `result.json` 的 `workflow_outputs`、`agent_outputs`、`usage`、`artifacts` 和 `error`。
 
 ## 9. 事件协议与前端可视化
 
@@ -683,7 +892,7 @@ Agent 流生成物的位置分为三类：
 }
 ```
 
-`seq` 在一次运行内单调递增。事件类型在 v0.1 固定为：
+`seq` 在一次运行内单调递增。V0.2 事件类型为：
 
 - `run_started`
 - `node_enter`
@@ -691,10 +900,25 @@ Agent 流生成物的位置分为三类：
 - `edge_traversed`
 - `token_usage`
 - `artifact_written`
+- `human_gate_waiting`
+- `human_gate_resolved`
 - `error`
 - `run_finished`
 
-后续版本再增加 `human_gate_waiting` 等事件。事件只能追加，不能原地修改。
+关键事件数据：
+
+| 事件 | 关键 data |
+| --- | --- |
+| `node_enter` / `node_exit` | `batch_id`、`step`、节点状态 |
+| `edge_traversed` | `from`、`to`、`mapped_ports`、`batch_id` |
+| `token_usage` | `prompt_tokens`、`completion_tokens`、`total_tokens` |
+| `artifact_written` | `port`、`path`、`type`、`step`、`batch_id`、`bytes` |
+| `human_gate_waiting` | `gate_id`、`prompt`、`timeout_seconds` |
+| `human_gate_resolved` | `gate_id`、`decision`、`comment`、`timed_out` |
+| `error` | `type`、`message` |
+| `run_finished` | `status`，失败时含 `error` |
+
+事件只能追加，不能原地修改。
 
 ### 9.2 SSE
 
@@ -715,16 +939,43 @@ Agent 流生成物的位置分为三类：
 
 运行事件不能修改 `WorkflowDraft`。节点运行状态、最近走过的边和错误提示只更新 `RunViewState`，从而支持运行结束后继续编辑。
 
+### 9.4 运行回放
+
+前端把 SSE 收到的事件和从 `GET /api/runs/{run_id}` 补齐的历史事件做两件事：
+
+1. 按 `seq` 去重并升序排序，避免重连补发造成重复计数。
+2. 回放到用户选择的 `untilSeq`，用纯函数从空状态重新推导节点状态、边遍历次数、Token、Gate 和 artifacts。
+
+回放能力：
+
+- 回到开始、上一步、下一步、播放/暂停、跳到实时末尾。
+- 任意序号滑块。
+- `0.25s`、`0.5s`、`1s`、`2s` 四档播放间隔。
+- 回放期间只改变视图，不再次调用模型，不再次写文件，也不能操作历史 Gate。
+- 只有回到最新事件且运行确实处于 `waiting` 时，人工确认按钮才可用。
+
+事件类型到视图状态的映射：
+
+- `node_enter` -> `running`
+- `node_exit` -> `succeeded` / `failed` / `skipped` / `cancelled`
+- `edge_traversed` -> 该边遍历次数加一
+- `token_usage` -> 运行总量和节点分量累加
+- `artifact_written` -> artifacts 列表追加
+- `human_gate_waiting` -> Gate 进入 `waiting`
+- `human_gate_resolved` -> Gate 进入 `resolved`
+- `error` -> 失败节点和错误信息
+- `run_finished` -> 写入终态
+
 ## 10. 前端编辑器
 
 ### 10.1 页面结构
 
-v0.1 只做一个实际工作界面：
+V0.2 只有一个实际工作界面：
 
 - 中央画布。
-- 左侧 Agent 节点库和运行控制。
-- 右侧节点、边、全局 Prompt、API Profile 配置面板。
-- 底部 SDL 预览和校验问题列表。
+- 左侧项目、运行输入、Gate 待办和运行历史。
+- 右侧选择项、Workflow 执行配置、API Profile 配置。
+- 底部 SDL、校验问题、事件回放和结果/产物。
 
 不需要额外 landing page。首次打开直接进入最近项目或新建项目界面。
 
@@ -733,7 +984,7 @@ v0.1 只做一个实际工作界面：
 - 从节点库拖入 Agent 节点。
 - 节点间连线后选择边类型。
 - 点击节点编辑名称、Prompt、输入输出端口、API Profile 和 JSON 输出。
-- 点击边编辑映射、条件和 feedback guard。
+- 点击边编辑类型、映射、通用条件、Feedback/Loop guard、Aggregate 模式和 Human Gate 策略。
 - 选中 Agent 或边后，可用 `Delete`/`Backspace` 或检查器中的删除按钮移除。
 - 删除 Agent 时，同时移除它的 `start` 引用、关联边、工作流输出和画布元素。
 - 删除边时，同时移除 SDL 边和 `canvas.json` 中的布局记录。
@@ -741,15 +992,21 @@ v0.1 只做一个实际工作界面：
 - 导入 SDL 时，如果没有对应 `canvas.json`，前端使用确定性自动布局生成节点位置，再要求用户确认保存。
 - 校验结果显示在具体节点或边附近，同时提供问题列表。
 
-### 10.3 右侧检查器
+### 10.3 三块面板收纳与调整
 
-- 检查器可最小化为右侧竖向入口，再次点击恢复。
-- 展开时支持拖拽左侧分隔条调整宽度，范围为 `300-560px`，默认 `360px`。
-- 分隔条可获得键盘焦点，使用方向键微调宽度；`Home`/`End` 可移动到允许的最小/最大宽度。
+- 左侧导航、右侧检查器和底部抽屉都可以收纳，再次点击入口恢复。
+- 左侧面板展开时支持拖拽右侧分隔条调整宽度，范围为 `220-420px`，默认 `270px`。
+- 右侧检查器展开时支持拖拽左侧分隔条调整宽度，范围为 `300-560px`，默认 `360px`。
+- 底部抽屉展开时支持拖拽顶部分隔条调整高度，范围为 `180-520px`，默认 `260px`。
+- 三个分隔条都可获得键盘焦点，使用方向键微调；`Home`/`End` 跳到允许的最小/最大尺寸。
 - 收起状态和宽度分别持久化到 `localStorage`：
+  - `loomlane.left-panel.open`
+  - `loomlane.left-panel.width`
   - `loomlane.inspector.open`
   - `loomlane.inspector.width`
-- 移动端不显示拖拽分隔条，检查器按单列布局展示，避免压缩画布。
+  - `loomlane.drawer.open`
+  - `loomlane.drawer.height`
+- 移动端不显示拖拽分隔条，面板按单列布局展示，避免压缩画布。
 
 ### 10.4 Agent 与边删除
 
@@ -792,7 +1049,34 @@ v0.1 只做一个实际工作界面：
 - `skipped`
 - `cancelled`
 
-边状态至少区分未执行、已遍历、条件和错误。运行期间高亮当前节点和最近一条已遍历边；运行结束后保留最终状态，直到用户开始下一次运行或手动清除。
+运行状态：
+
+- `queued`
+- `running`
+- `waiting`
+- `succeeded`
+- `failed`
+- `cancelled`
+
+边状态区分未执行、已遍历、条件和错误。运行期间高亮当前节点和已遍历边；运行结束后保留最终状态，直到用户开始下一次运行或手动清除。
+
+Gate 待办：
+
+- 左侧运行区显示所有 `pending_gates`。
+- 每张卡片显示边 ID、提示语、超时时间、可选评论、通过和拒绝按钮。
+- 回放未处于运行末尾时禁用操作，避免用户误以为正在修改历史状态。
+
+事件回放：
+
+- 事件页顶部提供回放工具条和进度滑块。
+- 事件列表只显示当前回放序号之前的事件。
+- 节点、边、Token、Gate 和 artifacts 都按同一回放进度同步重建。
+
+结果与产物：
+
+- 结果页左侧展示 `result.json`。
+- 右侧展示当前回放进度下的 artifacts，路径、Agent、批次、类型和字节数可见。
+- “生成文件”折叠区展示最近一次编译生成的文件列表。
 
 底部抽屉展示 SDL、校验问题、运行事件和最终结果。运行事件不能修改当前编辑草稿，避免执行状态污染尚未保存的工作流。
 
@@ -800,6 +1084,15 @@ v0.1 只做一个实际工作界面：
 
 ```text
 GET    /api/health
+
+GET    /api/api-profiles
+POST   /api/api-profiles
+PUT    /api/api-profiles/{profile_id}
+DELETE /api/api-profiles/{profile_id}
+GET    /api/api-profiles/{profile_id}/secret/status
+PUT    /api/api-profiles/{profile_id}/secret
+DELETE /api/api-profiles/{profile_id}/secret
+POST   /api/api-profiles/{profile_id}/secret/import-from-project
 
 GET    /api/projects
 POST   /api/projects
@@ -817,8 +1110,10 @@ PUT    /api/projects/{project_id}/secrets/{profile_id}
 DELETE /api/projects/{project_id}/secrets/{profile_id}
 
 POST   /api/projects/{project_id}/runs
+GET    /api/projects/{project_id}/runs
 GET    /api/runs/{run_id}
 GET    /api/runs/{run_id}/events
+POST   /api/runs/{run_id}/gates/{gate_id}
 POST   /api/runs/{run_id}/cancel
 ```
 
@@ -826,9 +1121,17 @@ POST   /api/runs/{run_id}/cancel
 
 关键响应语义：
 
+- 全局 API Profile 元数据持久化在数据目录的 `api-profiles.json`，不属于任何单个项目；项目 SDL 中的 Profile 可通过 `library_id` 引用全局 Profile，但密钥始终不进入该文件。
+- 全局 Profile 的 `DELETE` 删除元数据和对应凭据库记录，不会批量改写项目 SDL；如果项目仍在引用被删除的 `library_id`，该项目的凭据状态会变为未配置，前端必须提示用户重新绑定或配置项目级密钥。
+- `secret/import-from-project` 只复制兼容来源下的项目密钥到全局 Profile，不把明文密钥返回给前端。
 - 项目 `DELETE` 删除整个本地项目目录，属于不可撤销操作，前端必须二次确认。
 - 密钥 `DELETE` 只删除系统凭据库和 DPAPI 回退中的对应记录，不修改 SDL。
 - Profile 删除没有独立服务端资源；它是在 SDL 更新中删除 `api_profiles` 项，并同步重写引用它的 Agent。
+- `POST /api/projects/{project_id}/runs` 返回 `202` 和初始 `queued` 运行摘要；同一项目已有活动运行时返回 `409`。
+- `GET /api/projects/{project_id}/runs` 按创建时间倒序返回该项目的运行列表，供运行选择器和回放入口使用。
+- 运行状态包含 `queued`、`running`、`waiting`、`succeeded`、`failed`、`cancelled`。Gate 尚未全部处理时，运行保持 `waiting`。
+- Gate 决策请求体为 `{"decision":"approve|reject","comment":"..."}`。Gate 不存在返回 `404`；运行已结束、当前不在等待 Gate、Gate 已决策或并发决策锁超时返回 `409`。
+- 事件接口是 SSE。客户端可用 `?after=<seq>` 或 `Last-Event-ID` 从指定序号之后续传；已完成运行会直接回放 `events.jsonl` 中的历史事件后关闭连接。
 - 请求体被 Pydantic 拒绝时返回 `422`。响应中的 `loc` 会指出具体字段，例如 `["body","sdl","agents",0,"json_output"]`。
 - Pydantic 模型使用 `extra="forbid"`。前端提交了后端模型不存在的字段时，错误类型为 `extra_forbidden`；这通常表示后端进程仍在运行旧代码。
 
@@ -837,10 +1140,13 @@ POST   /api/runs/{run_id}/cancel
 - 不执行用户提供的 Python、Jinja2 或系统命令。
 - 条件求值器使用白名单 AST，不调用 `eval`。
 - YAML 使用 `safe_load` 并设置输入大小上限。
-- 文件路径统一经过工作区根目录校验，拒绝 `..` 和绝对路径逃逸。
+- 项目 ID、Gate ID 和产物路径都做格式与根目录校验；拒绝绝对路径、盘符路径、`..` 和解析后逃逸工作区的路径。
+- `FILE` 产物只允许复制运行工作区内的普通文件；目标目录 `output_dir` 必须是工作区内的相对路径。
 - 子进程只继承必要环境变量。
-- stdout 事件和 stderr 均设大小上限，避免日志耗尽磁盘。
-- 单次运行设置超时、最大步数和子进程输出上限。
+- 运行管理器最多保留 `10,000` 条事件，单条事件最多 `1,000,000` 字节，stderr 最多保留 `128,000` 字节。
+- 单次运行默认超时 `3,600` 秒，并受 SDL `limits.max_steps` 约束；子进程退出后统一收敛为成功、失败或取消状态。
+- Agent 累计 Token 和 Workflow 累计 Token 都在模型调用返回 usage 后检查。限额检查可以阻止后续调用，但触发超限的那一次调用可能使实际累计值略高于配置值。
+- Gate 决策使用独占锁文件 `gate-<id>.lock` 和原子 JSON 替换，防止两个审批请求同时写入同一 Gate；锁等待超时返回冲突。
 - API Key、Authorization 头和完整请求体不进入日志。
 - 生成代码、运行记录和项目文件中都不能包含密钥。
 - 本地开发默认只监听 `127.0.0.1`，并限制前端 origin。
@@ -861,28 +1167,37 @@ pnpm --dir apps/web build
 | 项目 | 结果 |
 | --- | --- |
 | 后端 Python 编译检查 | 通过 |
-| 后端 pytest | 19 passed |
-| 前端 Vitest | 13 passed |
+| 后端 pytest | 35 passed, 1 warning |
+| 前端 Vitest | 23 passed |
 | 前端生产构建 | 通过 |
-| 浏览器检查 | 检查器折叠/展开、JSON 字段连续输入焦点、Profile 删除交互正常 |
+| 浏览器检查 | 本轮未执行；当前仓库未安装 Playwright |
+
+唯一后端警告是 Starlette/httpx 测试客户端的弃用提示，不影响本轮测试结果。生产构建存在 Vite 的大 chunk 提示，属于当前单页编辑器包体积提醒，不是构建错误。
 
 ### 13.2 后端已覆盖
 
 - SDL 结构校验、错误路径和 `extra="forbid"` 行为。
-- 端口类型兼容、普通环和 Feedback 祖先规则。
+- 端口类型兼容、普通环、Feedback/Loop 祖先规则和 Aggregate 入边一致性。
 - 条件 AST 安全求值、非法路径和非法操作符拒绝。
-- 输入 join、条件分支、Feedback 重入与 guard 超限。
+- 输入 join、条件分支、Feedback/Loop 重入与 guard 超限。
 - Agent JSON 输出的 `response_format` 开关、端口校验和尾随文本提取。
+- Fan-out 分支并行执行、批次传播、Aggregate `all` 等待全部分支和 `any` 的批次级单次执行。
+- 多 Gate 等待、批准/拒绝、超时决策和迟到审批冲突。
+- Agent/Workflow 累计 Token 上限，以及失败后的运行状态收敛。
+- `TEXT`、`DATA`、`FILE` 自动落盘、自定义输出目录和路径逃逸拒绝。
 - 系统凭据库、DPAPI 回退、原子写入、origin 绑定和删除行为。
-- 项目创建、保存、revision、导入、生成、运行和删除 API。
+- 全局 API Profile CRUD、项目级/全局密钥、Profile 导入和删除行为。
+- 项目创建、保存、revision、导入、生成、运行、运行列表、Gate 决策和删除 API。
 - 生成项目哈希稳定性和密钥不进入生成物。
 
 ### 13.3 前端已覆盖
 
 - SDL 与画布状态互转。
 - API Profile 删除、Agent 自动迁移和唯一 Profile 阻止删除。
-- 检查器宽度边界和 UI 状态持久化。
+- 左、右、底部面板收纳、尺寸边界和 UI 状态持久化。
 - 条件谓词追加和多层组合。
+- 七种边的编辑器配置、删除确认和 Gate/回放相关状态映射。
+- 事件回放的时间线裁剪、节点/边/Token/Gate/artifacts 同步重建和进度边界。
 - 关键类型转换和安全默认值。
 - JSON 模板编辑使用稳定行 key，避免字段重命名导致失焦。
 
@@ -890,17 +1205,18 @@ pnpm --dir apps/web build
 
 - 已手工创建临时项目，验证包含 `json_output` 的 SDL 可以保存、重新读取并删除。
 - 已通过浏览器连续输入 JSON 字段，确认输入框不再因行 key 变化而失焦。
-- 后续应将“创建项目 -> 配置 Profile -> 连线 -> 校验 -> 生成 -> 运行 -> 查看结果”固化为 CI 中的 Playwright 全流程测试。
+- 本轮未重新执行浏览器视觉检查；补充 Playwright 后应覆盖桌面和窄屏下的三面板收纳、Gate 审批、回放拖动和 artifacts 展示。
+- 后续应将“创建项目 -> 配置 Profile -> 连线 -> 校验 -> 生成 -> 运行 -> Gate -> 回放 -> 查看产物”固化为 CI 全流程测试。
 
 ## 14. 实施状态
 
 | 阶段 | 状态 | 已落地内容 |
 | --- | --- | --- |
 | A：契约和基础工程 | 已完成 | 前后端工程、SDL 模型、示例项目、校验器、测试基础 |
-| B：编译与无界面运行 | 已完成 | Jinja2 生成、OpenAI 兼容调用、串行调度、Feedback guard、事件输出 |
+| B：编译与无界面运行 | 已完成 | Jinja2 生成、OpenAI 兼容调用、批次感知并行调度、Loop/Feedback guard、事件输出 |
 | C：API 与本地持久化 | 已完成 | 项目 CRUD、revision、原子写入、密钥存储、编译缓存、SSE、取消运行 |
-| D：可视化编辑器 | 已完成 | React Flow、节点/边配置、检查器、删除、条件树、JSON 编辑器、运行高亮 |
-| E：加固与文档 | 基本完成 | 路径安全、密钥隔离、测试、示例和故障排查；全流程 Playwright CI 留作后续 |
+| D：可视化编辑器 | 已完成 | React Flow、七种边配置、三面板收纳/调整、条件树、JSON 编辑器、Gate 待办、运行高亮、回放和 artifacts |
+| E：加固与文档 | 基本完成 | 路径安全、Gate 文件锁、Token/事件上限、密钥隔离、测试、示例和故障排查；全流程 Playwright CI 留作后续 |
 
 ## 15. 常见故障排查
 
@@ -1020,27 +1336,73 @@ Feedback 边已允许成功遍历 3 次，第 4 次仍满足条件时运行失�
 - `400` 可能表示模型名不存在、`response_format` 不受支持或请求参数超出供应商限制。
 - 若服务不支持 JSON mode，先修正供应商兼容性，不要依赖前端删除端口来绕过错误。
 
-## 16. V0.1 验收结果
+### 15.8 运行一直处于 waiting
 
-- [x] 用户可以在画布上创建至少两个 Agent，并配置 Prompt、端口和 OpenAI 兼容 API Profile。
-- [x] 工作流能保存为可读 SDL，重新打开后语义和布局正确恢复。
-- [x] 非法端口、缺失引用、普通环、非法条件和缺少 Feedback guard 会被明确拒绝。
-- [x] 同一 SDL 在相同编译器版本下生成确定性文件内容。
-- [x] 生成项目无需安装 LoomLane 包即可在独立 Python 环境运行。
-- [x] Pipe、条件分支和有界 Feedback 的行为通过后端测试。
-- [x] 前端能实时看到节点进入、节点退出、边遍历、Token 用量和最终结果。
-- [x] 运行事件完整写入 `events.jsonl`，可用于刷新后重建运行状态。
-- [x] API Key 不出现在项目文件、SDL、日志、生成代码或 Git 中。
-- [x] 运行失败时能看到节点级错误和可定位的错误消息。
-- [x] 右侧检查器支持折叠、宽度调整和 UI 偏好持久化。
-- [x] Agent、边和 API Profile 具有明确的删除及引用清理语义。
+- 检查 `GET /api/runs/{run_id}` 返回的 `pending_gates`，其中会列出 Gate、来源边、提示文案和超时时间。
+- 申请人工确认：
+
+  ```powershell
+  Invoke-RestMethod `
+    -Method Post `
+    -Uri http://127.0.0.1:8000/api/runs/<run_id>/gates/<gate_id> `
+    -ContentType application/json `
+    -Body '{"decision":"approve","comment":"确认通过"}'
+  ```
+
+- 多个 Gate 必须全部解决后运行才会继续。已决策 Gate 再次提交会返回 `409`，不存在的 Gate 返回 `404`。
+- 如果配置了 `timeout_seconds`，应检查 `on_timeout`。超时后运行时会写入默认决策，迟到的审批不会覆盖该决策。
+
+### 15.9 artifacts 没有出现或路径报错
+
+- 只处理 Agent 的 `TEXT`、`DATA`、`FILE` 输出端口；确认对应端口确实产生了值。
+- 检查 `output_dir` 是否是工作区内的相对路径，不能包含绝对路径、盘符或 `..` 逃逸。
+- `FILE` 输出引用的源文件必须是运行工作区内的已存在普通文件；不存在、目录、符号链接逃逸和越界路径都会被拒绝。
+- 默认产物目录是 `runs/{run_id}/workspace/artifacts/`，文件名为 `{step:05d}-{batch_id}-{agent_id}-{port_name}{extension}`。
+- 通过运行详情或回放查看 `artifact_written` 事件，事件中会记录相对路径、Agent、批次、类型和字节数。
+
+### 15.10 Token 累计上限被触发
+
+- Agent 限额检查该 Agent 跨所有批次和重入的累计 usage；Workflow 限额检查整个运行。
+- 限额在请求结束并拿到 usage 后检查，因此最后一次请求可能让累计值超过配置上限，但不会继续发起后续调用。
+- 检查 SDL 中的 `limits.max_total_tokens`、单次 `max_tokens` 和 `max_steps`，三者是不同层级，不能用其中一个替代另一个。
+- 如果模型不返回 usage，运行时会保留已记录的 usage，无法对缺失 usage 进行精确计费。
+
+### 15.11 Aggregate 节点不执行
+
+- `AGGREGATE all` 会等待同一批次下所有聚合入边到达；只要一个分支失败或没有产出，目标就不会执行。
+- `AGGREGATE any` 在第一条同批入边到达时执行一次，后到的同名端口可能覆盖先前值；不要依赖“所有分支都已合并”的语义。
+- 检查聚合 mapping 是否为目标必填输入提供了端口；当前校验器不检查 mapping 覆盖率。
+- 检查 Fan-out 的源 Agent、批次 ID 和聚合边是否属于同一逻辑分支。普通边与聚合边不能混用到同一个目标。
+
+## 16. V0.2 验收结果
+
+- [x] 工作流可以保存为可读 SDL，重新打开后语义和布局正确恢复。
+- [x] 端口、引用、普通环、条件、Feedback/Loop guard 和 Aggregate 入边一致性会被校验。
+- [x] 同一 SDL 在相同编译器版本下生成确定性、独立可运行的 Python 项目。
+- [x] Pipe、条件分支和有界 Feedback/Loop 通过后端测试。
+- [x] Fan-out 分支可在有界并发下执行，并按批次传播。
+- [x] Aggregate `all` 等待同批全部分支，Aggregate `any` 按批次只执行一次。
+- [x] 多 Gate 可暂停运行，支持批准、拒绝、超时决策和并发决策冲突保护。
+- [x] 运行事件写入 `events.jsonl`，运行详情可从事件重建 Gate 待办和最终状态。
+- [x] 前端回放工具条支持播放/暂停、单步、拖动、倍速和回到实时状态。
+- [x] Agent/Workflow 累计 Token、单次请求 Token 和最大步数形成分层限额。
+- [x] `TEXT`、`DATA`、`FILE` 输出自动落盘，并记录 artifacts 事件。
+- [x] API Profile 可复用，密钥不出现在项目文件、SDL、日志、生成代码或 Git 中。
+- [x] 左、右、底部面板支持收纳；左/右宽度和底部高度可调整，偏好可持久化。
+- [x] Agent、边、API Profile 和项目具有明确的删除及引用清理语义。
 - [x] 条件编辑器支持多谓词、嵌套、`AND`/`OR`/`NOT` 和高级 JSON。
 - [x] Agent 可独立启用层次化 JSON 输出，并发送 `json_object` 响应格式。
 
-## 17. 后续版本预留
+## 17. 已知限制与 V0.3 演进
 
-- v0.2：`LOOP`、`FAN_OUT`、`AGGREGATE`、`HUMAN_GATE`、并行执行、运行回放、token 累计上限、产物自动落盘。
-- v0.3：Agent 内 Python 精细规则、沙箱、多 provider、能力路由和更强条件语言。
+- `result.json.agent_outputs` 只保留每个 Agent 最新批次的输出；历史批次以事件和 artifacts 为准。
+- `AGGREGATE any` 的后到同名端口采用覆盖语义，调用方不应把它当作完整合并。
+- Validator 尚未检查 Aggregate mapping 是否覆盖目标 Agent 的全部必填输入。
+- 并行只限单机生成项目内的线程池，不提供跨主机、持久队列或资源感知调度。
+- Token 限额在 usage 返回后检查，最后一次调用可能轻微超限。
+- Gate 审批与运行等待依赖当前本地进程和文件锁；进程异常退出后需要用户重新启动运行。
+- Playwright 全流程、窄屏视觉检查和产物下载/预览尚未纳入自动化验收。
+- V0.3 计划加入 Agent 内 Python 精细规则、沙箱、多 provider、能力路由和更强条件语言。
 
 SDL 版本升级遵循以下规则：
 

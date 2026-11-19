@@ -1,8 +1,16 @@
 export type PortType = 'TEXT' | 'DATA' | 'FILE' | 'MIXED'
-export type EdgeType = 'PIPE' | 'CONDITIONAL' | 'FEEDBACK'
+export type EdgeType =
+  | 'PIPE'
+  | 'CONDITIONAL'
+  | 'FEEDBACK'
+  | 'LOOP'
+  | 'FAN_OUT'
+  | 'AGGREGATE'
+  | 'HUMAN_GATE'
 export type RunStatus =
   | 'queued'
   | 'running'
+  | 'waiting'
   | 'succeeded'
   | 'failed'
   | 'cancelled'
@@ -38,7 +46,10 @@ export interface WorkflowMeta {
   outputs: WorkflowOutput[]
   execution: {
     feedback_limit_default: number
+    loop_limit_default: number
     max_steps: number
+    max_total_tokens: number | null
+    max_parallel: number
   }
 }
 
@@ -77,6 +88,7 @@ export interface Agent {
   outputs: Port[]
   limits: {
     max_tokens: number | null
+    max_total_tokens: number | null
   }
   json_output: AgentJsonOutput
   output_dir: string | null
@@ -94,6 +106,17 @@ export interface EdgeMapping {
   to: string
 }
 
+export interface AggregateConfig {
+  mode: 'all' | 'any'
+}
+
+export interface HumanGateConfig {
+  prompt: string
+  timeout_seconds: number
+  on_reject: 'fail' | 'skip'
+  on_timeout: 'fail' | 'approve' | 'reject'
+}
+
 export interface WorkflowEdge {
   id: string
   from: string
@@ -104,10 +127,12 @@ export interface WorkflowEdge {
   guard?: {
     max_traversals?: number | null
   }
+  aggregate?: AggregateConfig | null
+  human_gate?: HumanGateConfig | null
 }
 
 export interface SDL {
-  sdl_version: '0.1'
+  sdl_version: '0.1' | '0.2'
   workflow: WorkflowMeta
   start: string[]
   api_profiles: ApiProfile[]
@@ -195,9 +220,25 @@ export interface RunSummary {
   output_directory: string | null
 }
 
+export interface PendingHumanGate {
+  gate_id: string
+  edge_id: string
+  prompt: string
+  requested_at: string
+  timeout_seconds: number | null
+}
+
 export interface RunDetail extends RunSummary {
   result: Record<string, unknown> | null
   events: RunEvent[]
+  pending_gates: PendingHumanGate[]
+}
+
+export interface GateDecisionResponse {
+  run_id: string
+  gate_id: string
+  decision: 'approve' | 'reject'
+  accepted_at: string
 }
 
 export interface InputFileRef {
