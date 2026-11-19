@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import errno
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from loomlane import storage as storage_module
 from loomlane.main import create_app
 from loomlane.models import EdgeType, Port, PortType, SecretStatus, WorkflowInput
 from loomlane.runtime import RunManager
@@ -119,6 +121,42 @@ def test_revision_conflict_returns_409(tmp_path: Path) -> None:
         )
 
     assert response.status_code == 409
+
+
+def test_project_save_returns_structured_error_for_persistent_file_lock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    app = create_app(store=store, credentials=MemoryCredentials())
+
+    with TestClient(app) as client:
+        summary = client.get("/api/projects").json()[0]
+        detail = client.get(f"/api/projects/{summary['id']}").json()
+
+        def locked_replace(_: str | Path, destination: str | Path) -> None:
+            raise PermissionError(
+                errno.EACCES,
+                "file is locked",
+                destination,
+            )
+
+        monkeypatch.setattr(storage_module.os, "replace", locked_replace)
+        monkeypatch.setattr(storage_module.time, "sleep", lambda _: None)
+        response = client.put(
+            f"/api/projects/{summary['id']}",
+            json={
+                "sdl": detail["sdl"],
+                "canvas": detail["canvas"],
+                "base_revision": detail["revision"],
+            },
+        )
+
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["code"] == "project_storage_write_failed"
+        assert "retry" in payload["detail"].lower()
+        assert client.get(f"/api/projects/{summary['id']}").json()["revision"] == 1
 
 
 def test_get_project_with_v0_2_workflow_schema(tmp_path: Path) -> None:

@@ -1240,7 +1240,7 @@ pnpm --dir apps/web build
 2. 使用 `--reload` 重新启动：
 
    ```powershell
-   .\.venv\Scripts\python -m uvicorn loomlane.main:app --app-dir backend/src --reload --port 8000
+   .\.venv\Scripts\python -m uvicorn loomlane.main:app --app-dir backend/src --reload-dir backend/src --port 8000
    ```
 
 3. 刷新前端并重试保存。
