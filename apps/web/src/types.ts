@@ -216,6 +216,8 @@ export interface RunSummary {
   started_at: string | null
   finished_at: string | null
   error: string | null
+  run_directory: string | null
+  output_directory: string | null
 }
 
 export interface PendingHumanGate {
@@ -237,6 +239,18 @@ export interface GateDecisionResponse {
   gate_id: string
   decision: 'approve' | 'reject'
   accepted_at: string
+}
+
+export interface InputFileRef {
+  input_name: string
+  name: string
+  path: string
+  size: number
+}
+
+export interface OpenFolderResponse {
+  path: string
+  opened: boolean
 }
 
 export interface SecretStatus {

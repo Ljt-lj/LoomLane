@@ -16,7 +16,15 @@ from typing import Any
 import pytest
 
 from loomlane.compiler import WorkflowCompiler
-from loomlane.models import AgentJsonOutput, GateDecisionRequest, RunStartRequest, SDL
+from loomlane.models import (
+    AgentJsonOutput,
+    GateDecisionRequest,
+    Port,
+    PortType,
+    RunStartRequest,
+    SDL,
+    WorkflowInput,
+)
 from loomlane.runtime import GateConflict, RunManager
 from loomlane.storage import ProjectStore
 
@@ -270,6 +278,7 @@ def _graph_sdl(
 async def test_feedback_run_end_to_end(
     tmp_path: Path,
     fake_openai: str,
+    monkeypatch: pytest.MonkeyPatch,
     legacy_workflow: Callable[[str], SDL],
 ) -> None:
     store = ProjectStore(tmp_path / "projects")
@@ -288,23 +297,91 @@ async def test_feedback_run_end_to_end(
     assert detail.result["edge_traversals"]["review-feedback"] == 1
     assert [event["type"] for event in detail.events][0] == "run_started"
     assert [event["type"] for event in detail.events][-1] == "run_finished"
+    assert summary.run_directory is not None
+    assert summary.run_directory.startswith("feedback test__")
     artifacts = [
         event["data"]
         for event in detail.events
         if event["type"] == "artifact_written"
     ]
     assert artifacts
-    run_root = store.project_path(project.id) / "runs" / summary.run_id
+    run_root = store.project_path(project.id) / "runs" / summary.run_directory
     assert all((run_root / "workspace" / item["path"]).is_file() for item in artifacts)
     event_file = (
         store.project_path(project.id)
         / "runs"
-        / summary.run_id
+        / summary.run_directory
         / "events.jsonl"
     )
     assert len(event_file.read_text(encoding="utf-8").splitlines()) == len(
         detail.events
     )
+    assert any(Path(detail.output_directory).iterdir())
+
+    launched: list[Path] = []
+    monkeypatch.setattr(
+        "loomlane.runtime._launch_directory",
+        lambda path: launched.append(path),
+    )
+    opened = await manager.open_output_folder(summary.run_id)
+    assert opened == detail.output_directory
+    assert launched == [Path(opened)]
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_file_input_is_copied_to_readable_run_workspace(
+    tmp_path: Path,
+    fake_openai: str,
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    sdl = legacy_workflow(fake_openai)
+    sdl.workflow.inputs.append(
+        WorkflowInput(name="source", type=PortType.FILE, required=True)
+    )
+    sdl.agents[0].inputs.append(
+        Port(name="source", type=PortType.FILE, required=True)
+    )
+    project = store.create("file input test", sdl)
+    manager = RunManager(store, MemoryCredentials())
+
+    uploaded = manager.stage_input_file(
+        project.id,
+        "source",
+        "source notes.txt",
+        b"reference material",
+    )
+    source_path = store.project_path(project.id) / uploaded.path
+    assert source_path.read_bytes() == b"reference material"
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(
+            inputs={
+                "requirement": "根据附件写一段摘要",
+                "source": {
+                    "path": uploaded.path,
+                    "name": uploaded.name,
+                    "size": uploaded.size,
+                },
+            }
+        ),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    assert summary.run_directory is not None
+    assert summary.run_directory.startswith("file input test__")
+    run_root = (
+        store.project_path(project.id)
+        / "runs"
+        / summary.run_directory
+    )
+    assert (run_root / "workspace" / uploaded.path).read_bytes() == (
+        b"reference material"
+    )
+    assert not source_path.exists()
     await manager.shutdown()
 
 
@@ -428,6 +505,7 @@ def test_runtime_environment_uses_linked_library_credential(
         project,
         "run-id",
         SimpleNamespace(compiler_key="test-hash"),
+        tmp_path / "run",
     )
 
     assert env["LOOMLANE_SECRET_DEEPSEEK_FLASH"] == "library-secret"

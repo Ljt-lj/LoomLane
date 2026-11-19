@@ -337,6 +337,13 @@ class PendingHumanGate(StrictModel):
     timeout_seconds: int | None = None
 
 
+class InputFileRef(StrictModel):
+    input_name: str
+    name: str
+    path: str
+    size: int
+
+
 class RunSummary(StrictModel):
     run_id: str
     project_id: str
@@ -347,10 +354,15 @@ class RunSummary(StrictModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     error: str | None = None
+    run_directory: str | None = None
+    output_directory: str | None = None
 
 
 class RunDetail(RunSummary):
     result: dict[str, Any] | None = None
     events: list[dict[str, Any]] = Field(default_factory=list)
     pending_gates: list[PendingHumanGate] = Field(default_factory=list)
+class OpenFolderResponse(StrictModel):
+    path: str
+    opened: bool = True
 

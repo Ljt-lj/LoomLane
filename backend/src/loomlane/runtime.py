@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -19,6 +20,7 @@ from .compiler import WorkflowCompiler
 from .models import (
     GateDecisionRequest,
     GateDecisionResponse,
+    InputFileRef,
     PendingHumanGate,
     ProjectDetail,
     RunDetail,
@@ -43,6 +45,65 @@ class ActiveRunExists(RunError):
 
 class RunConfigurationError(RunError):
     pass
+
+
+class InputFileError(RunError):
+    pass
+
+
+class RunFolderError(RunError):
+    pass
+
+
+_INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+
+
+def _safe_path_component(value: str, fallback: str) -> str:
+    cleaned = _INVALID_PATH_CHARS.sub("-", value).strip(" .")
+    if not cleaned:
+        cleaned = fallback
+    if cleaned.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned[:96].rstrip(" .")
+
+
+def _safe_file_name(value: str) -> str:
+    candidate = Path(value).name
+    cleaned = _safe_path_component(candidate, "input-file")
+    if "." in cleaned:
+        stem, suffix = cleaned.rsplit(".", 1)
+        suffix = re.sub(r"[^A-Za-z0-9._-]", "", suffix)[:16]
+        cleaned = f"{stem[:72]}.{suffix}" if suffix else stem[:72]
+    return cleaned or "input-file"
+
+
+def _launch_directory(path: Path) -> None:
+    if os.name == "nt":
+        subprocess.Popen(
+            ["explorer.exe", str(path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=(
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            ),
+        )
+        return
+    command = ["open", str(path)] if sys.platform == "darwin" else ["xdg-open", str(path)]
+    subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 class GateNotFound(RunError):
@@ -86,6 +147,7 @@ class RunManager:
     MAX_EVENTS = 10_000
     MAX_EVENT_BYTES = 1_000_000
     MAX_STDERR_BYTES = 128_000
+    MAX_INPUT_FILE_BYTES = 50 * 1024 * 1024
     DEFAULT_TIMEOUT_SECONDS = 3_600
 
     def __init__(
@@ -115,21 +177,41 @@ class RunManager:
         self.store.set_last_build(project_id, generated.compiler_key)
 
         run_id = uuid4().hex
-        env = self._runtime_environment(project, run_id, generated)
-        run_root = self.store.project_path(project_id) / "runs" / run_id
-        (run_root / "workspace").mkdir(parents=True, exist_ok=False)
-        (run_root / "gates").mkdir(parents=True, exist_ok=True)
-        _atomic_write_json(run_root / "input.json", request.inputs)
-
         started_at = utc_now()
+        project_name = _safe_path_component(project.name, "project")
+        timestamp = started_at.strftime("%Y%m%d-%H%M%S")
+        run_directory = f"{project_name}__{timestamp}__{run_id[:8]}"
+        run_root = self.store.project_path(project_id) / "runs" / run_directory
+        workspace = run_root / "workspace"
+        artifacts = workspace / "artifacts"
+        env = self._runtime_environment(project, run_id, generated, run_root)
+        staged_sources: list[Path] = []
+        try:
+            artifacts.mkdir(parents=True, exist_ok=False)
+            (run_root / "gates").mkdir(parents=True, exist_ok=False)
+            prepared_inputs, staged_sources = self._prepare_inputs(
+                project,
+                request.inputs,
+                workspace,
+            )
+            _atomic_write_json(run_root / "input.json", prepared_inputs)
+        except Exception:
+            if run_root.exists():
+                shutil.rmtree(run_root, ignore_errors=True)
+            raise
+
         summary = RunSummary(
             run_id=run_id,
             project_id=project_id,
             status="queued",
             created_at=started_at,
+            run_directory=run_directory,
+            output_directory=str(artifacts),
         )
         _atomic_write_json(run_root / "meta.json", summary.model_dump(mode="json"))
         _atomic_write_text(run_root / "events.jsonl", "")
+        for source in staged_sources:
+            source.unlink(missing_ok=True)
 
         live = _LiveRun(run_id=run_id, project_id=project_id, run_root=run_root)
         async with self._lock:
@@ -142,11 +224,106 @@ class RunManager:
             )
         return summary
 
+    def stage_input_file(
+        self,
+        project_id: str,
+        input_name: str,
+        original_name: str,
+        content: bytes,
+    ) -> InputFileRef:
+        project = self.store.get(project_id)
+        workflow_input = next(
+            (
+                item
+                for item in project.sdl.workflow.inputs
+                if item.name == input_name
+            ),
+            None,
+        )
+        if workflow_input is None:
+            raise InputFileError(f"Unknown workflow input '{input_name}'")
+        if workflow_input.type.value != "FILE":
+            raise InputFileError(f"Workflow input '{input_name}' is not a FILE port")
+        if not content:
+            raise InputFileError("The selected file is empty")
+        if len(content) > self.MAX_INPUT_FILE_BYTES:
+            raise InputFileError(
+                f"Input files must be smaller than {self.MAX_INPUT_FILE_BYTES // (1024 * 1024)} MB"
+            )
+
+        safe_name = _safe_file_name(original_name)
+        stored_name = f"{uuid4().hex[:12]}-{safe_name}"
+        relative_path = f"uploads/{stored_name}"
+        upload_root = self.store.project_path(project_id) / "uploads"
+        upload_root.mkdir(parents=True, exist_ok=True)
+        target = upload_root / stored_name
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_bytes(content)
+        os.replace(temporary, target)
+        return InputFileRef(
+            input_name=input_name,
+            name=original_name,
+            path=relative_path,
+            size=len(content),
+        )
+
+    def _prepare_inputs(
+        self,
+        project: ProjectDetail,
+        inputs: dict[str, Any],
+        workspace: Path,
+    ) -> tuple[dict[str, Any], list[Path]]:
+        prepared = dict(inputs)
+        staged_sources: list[Path] = []
+        project_root = self.store.project_path(project.id).resolve()
+        upload_root = (project_root / "uploads").resolve()
+        workspace_root = workspace.resolve()
+        for workflow_input in project.sdl.workflow.inputs:
+            if workflow_input.type.value != "FILE" or workflow_input.name not in inputs:
+                continue
+            value = inputs[workflow_input.name]
+            if not isinstance(value, dict) or not isinstance(value.get("path"), str):
+                raise InputFileError(
+                    f"Workflow input '{workflow_input.name}' requires an uploaded file reference"
+                )
+            relative_path = Path(value["path"])
+            if (
+                relative_path.is_absolute()
+                or ".." in relative_path.parts
+                or not relative_path.parts
+                or relative_path.parts[0] != "uploads"
+            ):
+                raise InputFileError("Input file path must stay inside the project uploads area")
+            source = (project_root / relative_path).resolve()
+            try:
+                source.relative_to(upload_root)
+            except ValueError as exc:
+                raise InputFileError("Input file path escaped the uploads area") from exc
+            if not source.is_file():
+                raise InputFileError(
+                    f"Uploaded file for input '{workflow_input.name}' no longer exists"
+                )
+            target = (workspace_root / relative_path).resolve()
+            try:
+                target.relative_to(workspace_root)
+            except ValueError as exc:
+                raise InputFileError("Input file path escaped the run workspace") from exc
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            staged_sources.append(source)
+            prepared[workflow_input.name] = {
+                "path": relative_path.as_posix(),
+                "name": str(value.get("name") or source.name),
+                "size": target.stat().st_size,
+            }
+        return prepared, staged_sources
+
     def _runtime_environment(
         self,
         project: ProjectDetail,
         run_id: str,
         generated: Any,
+        run_root: Path,
     ) -> dict[str, str]:
         system_root = os.environ.get("SystemRoot", r"C:\Windows")
         env = {
@@ -158,9 +335,7 @@ class RunManager:
             "PYTHONUTF8": "1",
             "LOOMLANE_RUN_ID": run_id,
             "LOOMLANE_WORKFLOW_HASH": generated.compiler_key,
-            "LOOMLANE_GATE_DIR": str(
-                self.store.project_path(project.id) / "runs" / run_id / "gates"
-            ),
+            "LOOMLANE_GATE_DIR": str(run_root / "gates"),
         }
         for profile in project.sdl.api_profiles:
             try:
@@ -406,18 +581,45 @@ class RunManager:
         except (OSError, ValueError, TypeError, ValidationError) as exc:
             raise RunNotFound(str(path.parent.name)) from exc
 
+    def _with_output_directory(
+        self,
+        summary: RunSummary,
+        run_root: Path,
+    ) -> RunSummary:
+        artifacts = run_root / "workspace" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        return summary.model_copy(
+            update={
+                "run_directory": run_root.name,
+                "output_directory": str(artifacts.resolve()),
+            }
+        )
+
     def _find_run(self, run_id: str) -> tuple[Path, ProjectDetail]:
         if not re.fullmatch(r"[0-9a-f]{32}", run_id):
             raise RunNotFound(run_id)
         for project in self.store.list():
-            run_root = self.store.project_path(project.id) / "runs" / run_id
-            if (run_root / "meta.json").exists():
-                return run_root, self.store.get(project.id)
+            runs_root = self.store.project_path(project.id) / "runs"
+            if not runs_root.exists():
+                continue
+            for run_root in runs_root.iterdir():
+                meta_path = run_root / "meta.json"
+                if not run_root.is_dir() or not meta_path.exists():
+                    continue
+                try:
+                    summary = self._read_meta(meta_path)
+                except RunNotFound:
+                    continue
+                if summary.run_id == run_id:
+                    return run_root, self.store.get(project.id)
         raise RunNotFound(run_id)
 
     async def get(self, run_id: str) -> RunDetail:
         run_root, _ = self._find_run(run_id)
-        summary = self._read_meta(run_root / "meta.json")
+        summary = self._with_output_directory(
+            self._read_meta(run_root / "meta.json"),
+            run_root,
+        )
         result = self._read_result(run_root / "result.json")
         events = self._read_events_file(run_root)
         pending_gates = self._read_pending_gates(run_root)
@@ -540,7 +742,9 @@ class RunManager:
             if not meta.exists():
                 continue
             try:
-                summaries.append(self._read_meta(meta))
+                summaries.append(
+                    self._with_output_directory(self._read_meta(meta), path)
+                )
             except RunNotFound:
                 continue
         return sorted(summaries, key=lambda run: run.created_at, reverse=True)
@@ -556,11 +760,29 @@ class RunManager:
                 task = live.task
         if task:
             await asyncio.gather(task, return_exceptions=True)
-        summary = self._read_meta(self._find_run(run_id)[0] / "meta.json")
+        run_root = self._find_run(run_id)[0]
+        summary = self._with_output_directory(
+            self._read_meta(run_root / "meta.json"),
+            run_root,
+        )
         if summary.status in {"succeeded", "failed", "cancelled"}:
             return summary
+        return summary
+
+    async def open_output_folder(self, run_id: str) -> str:
         run_root, _ = self._find_run(run_id)
-        return self._read_meta(run_root / "meta.json")
+        output_directory = (run_root / "workspace" / "artifacts").resolve()
+        workspace_root = (run_root / "workspace").resolve()
+        try:
+            output_directory.relative_to(workspace_root)
+        except ValueError as exc:
+            raise RunFolderError("Run output directory is outside the workspace") from exc
+        output_directory.mkdir(parents=True, exist_ok=True)
+        try:
+            _launch_directory(output_directory)
+        except OSError as exc:
+            raise RunFolderError(f"Unable to open output directory: {exc}") from exc
+        return str(output_directory)
 
     async def is_active(self, project_id: str) -> bool:
         async with self._lock:
