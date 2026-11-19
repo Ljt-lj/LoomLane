@@ -220,6 +220,22 @@ function issueFromError(error: unknown): ValidationIssue[] {
   return Array.isArray(issues) ? (issues as ValidationIssue[]) : []
 }
 
+function validationIssueMessage(issues: ValidationIssue[], fallback: string) {
+  const first = issues.find((issue) => issue.severity === 'error') ?? issues[0]
+  if (!first) return fallback
+  const location = first.path ? `${first.path}: ` : ''
+  const remaining = issues.length > 1 ? `（另有 ${issues.length - 1} 项）` : ''
+  return `${location}${first.message}${remaining}`
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  const issues = issueFromError(error)
+  if (issues.length) return validationIssueMessage(issues, fallback)
+  return error instanceof Error && error.message.trim()
+    ? error.message
+    : fallback
+}
+
 function parseEvent(message: MessageEvent): RunEvent | null {
   try {
     const value = JSON.parse(message.data)
@@ -1196,11 +1212,11 @@ function App() {
       return updated
     } catch (error) {
       const validationIssues = issueFromError(error)
-      if (validationIssues.length) setIssues(validationIssues)
-      showNotice(
-        'error',
-        error instanceof Error ? error.message : '保存失败',
-      )
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '保存草稿失败'))
       return null
     } finally {
       setSaving(false)
@@ -1216,11 +1232,22 @@ function App() {
       if (result.valid) {
         showNotice('success', 'SDL 校验通过')
       } else {
-        showNotice('error', `发现 ${result.issues.length} 个校验问题`)
+        showNotice(
+          'error',
+          validationIssueMessage(
+            result.issues,
+            `发现 ${result.issues.length} 个校验问题`,
+          ),
+        )
       }
       return result.valid
     } catch (error) {
-      showNotice('error', error instanceof Error ? error.message : '校验失败')
+      const validationIssues = issueFromError(error)
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '校验失败'))
       return false
     }
   }
@@ -1241,8 +1268,11 @@ function App() {
       queryClient.invalidateQueries({ queryKey: ['projects'] })
     } catch (error) {
       const validationIssues = issueFromError(error)
-      if (validationIssues.length) setIssues(validationIssues)
-      showNotice('error', error instanceof Error ? error.message : '生成失败')
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '生成失败'))
     }
   }
 
@@ -1301,16 +1331,27 @@ function App() {
   async function startRun() {
     const saved = await saveProject()
     if (!saved) return
-    const valid = await api
-      .validate(saved.id, saved.sdl)
-      .then((result) => {
-        setIssues(result.issues)
-        return result.valid
-      })
-      .catch(() => false)
-    if (!valid) {
-      setDrawerTab('issues')
-      showNotice('error', 'SDL 未通过校验，无法启动运行')
+    try {
+      const validation = await api.validate(saved.id, saved.sdl)
+      setIssues(validation.issues)
+      if (!validation.valid) {
+        setDrawerTab('issues')
+        showNotice(
+          'error',
+          validationIssueMessage(
+            validation.issues,
+            'SDL 未通过校验，无法启动运行',
+          ),
+        )
+        return
+      }
+    } catch (error) {
+      const validationIssues = issueFromError(error)
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '运行前校验失败'))
       return
     }
     const fileInputs = saved.sdl.workflow.inputs.filter(

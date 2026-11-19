@@ -14,30 +14,146 @@ import type {
   ValidationResponse,
 } from './types'
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000'
+const configuredApiBase = import.meta.env.VITE_API_BASE?.trim()
+const API_BASE = configuredApiBase
+  ? configuredApiBase.replace(/\/+$/, '')
+  : ''
+const BACKEND_TARGET =
+  configuredApiBase && /^https?:\/\//i.test(configuredApiBase)
+    ? configuredApiBase.replace(/\/+$/, '')
+    : 'http://127.0.0.1:8000（Vite 代理目标）'
 
 interface RunStartRequestShape {
   inputs: Record<string, unknown>
 }
 
+function endpoint(path: string) {
+  return `${API_BASE}${path}`
+}
+
+function issueMessage(payload: Record<string, unknown>) {
+  const issues = payload.issues
+  if (!Array.isArray(issues) || issues.length === 0) return ''
+  const first = issues[0]
+  if (!first || typeof first !== 'object') return ''
+  const issue = first as Record<string, unknown>
+  const path = typeof issue.path === 'string' ? issue.path.trim() : ''
+  const message =
+    typeof issue.message === 'string' ? issue.message.trim() : '未知校验错误'
+  return `${path ? `${path}: ` : ''}${message}`
+}
+
+function payloadDetail(payload: Record<string, unknown>) {
+  const validationMessage = issueMessage(payload)
+  if (validationMessage) {
+    const count = Array.isArray(payload.issues) ? payload.issues.length : 1
+    return `${count} 个校验问题：${validationMessage}`
+  }
+
+  const detail = payload.detail
+  if (typeof detail === 'string' && detail.trim()) return detail.trim()
+  if (Array.isArray(detail) && detail.length) {
+    const first = detail[0]
+    if (first && typeof first === 'object') {
+      const item = first as Record<string, unknown>
+      const message = typeof item.msg === 'string' ? item.msg : ''
+      const location = Array.isArray(item.loc) ? item.loc.join('.') : ''
+      if (message) return `${location ? `${location}: ` : ''}${message}`
+    }
+  }
+  return ''
+}
+
 export class ApiError extends Error {
   status: number
   payload: Record<string, unknown>
+  method: string
+  path: string
 
-  constructor(status: number, payload: Record<string, unknown>) {
-    super(
-      typeof payload.detail === 'string'
-        ? payload.detail
-        : `Request failed with status ${status}`,
-    )
+  constructor(
+    status: number,
+    payload: Record<string, unknown>,
+    method = 'GET',
+    path = '',
+  ) {
+    const detail = payloadDetail(payload)
+    const request = `${method} ${path || '/'}`
+    if (detail) {
+      super(`${detail}（HTTP ${status}，${request}）`)
+    } else if (status >= 500) {
+      super(
+        `后端请求失败（HTTP ${status}，${request}）。请确认后端已在 ${BACKEND_TARGET} 启动。`,
+      )
+    } else {
+      super(`请求失败（HTTP ${status}，${request}）`)
+    }
     this.name = 'ApiError'
     this.status = status
     this.payload = payload
+    this.method = method
+    this.path = path
   }
 }
 
+export class ApiNetworkError extends Error {
+  method: string
+  path: string
+  url: string
+
+  constructor(method: string, path: string, url: string, cause: unknown) {
+    const rawMessage =
+      cause instanceof Error ? cause.message : String(cause ?? '未知网络错误')
+    super(
+      `无法连接后端服务（${method} ${path}）。请确认后端已在 ${BACKEND_TARGET} 启动，并检查网络或 CORS 配置。浏览器错误：${rawMessage}`,
+    )
+    this.name = 'ApiNetworkError'
+    this.method = method
+    this.path = path
+    this.url = url
+  }
+}
+
+async function apiFetch(
+  path: string,
+  init?: RequestInit,
+  requestPath = path,
+) {
+  const method = (init?.method ?? 'GET').toUpperCase()
+  const url = endpoint(path)
+  try {
+    return await fetch(url, init)
+  } catch (error) {
+    throw new ApiNetworkError(method, requestPath, url, error)
+  }
+}
+
+async function errorPayload(response: Response) {
+  let text = ''
+  try {
+    text = await response.text()
+  } catch {
+    // Fall back to the HTTP status text when the response body is unavailable.
+  }
+  if (text) {
+    try {
+      const value = JSON.parse(text)
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return value as Record<string, unknown>
+      }
+    } catch {
+      const plainText = text
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+      if (plainText) return { detail: plainText.slice(0, 500) }
+    }
+  }
+  return { detail: response.statusText } as Record<string, unknown>
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const method = (init?.method ?? 'GET').toUpperCase()
+  const response = await apiFetch(path, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
@@ -45,13 +161,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   })
   if (!response.ok) {
-    let payload: Record<string, unknown> = {}
-    try {
-      payload = await response.json()
-    } catch {
-      payload = { detail: response.statusText }
-    }
-    throw new ApiError(response.status, payload)
+    throw new ApiError(response.status, await errorPayload(response), method, path)
   }
   if (response.status === 204) {
     return undefined as T
@@ -157,9 +267,10 @@ export const api = {
     ),
 
   getSdl: async (projectId: string): Promise<string> => {
-    const response = await fetch(`${API_BASE}/api/projects/${projectId}/sdl`)
+    const path = `/api/projects/${projectId}/sdl`
+    const response = await apiFetch(path)
     if (!response.ok) {
-      throw new ApiError(response.status, { detail: response.statusText })
+      throw new ApiError(response.status, await errorPayload(response), 'GET', path)
     }
     return response.text()
   },
@@ -203,8 +314,9 @@ export const api = {
       input_name: inputName,
       file_name: file.name,
     })
-    const response = await fetch(
-      `${API_BASE}/api/projects/${projectId}/input-files?${query}`,
+    const path = `/api/projects/${projectId}/input-files?${query}`
+    const response = await apiFetch(
+      path,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
@@ -212,13 +324,7 @@ export const api = {
       },
     )
     if (!response.ok) {
-      let payload: Record<string, unknown> = {}
-      try {
-        payload = await response.json()
-      } catch {
-        payload = { detail: response.statusText }
-      }
-      throw new ApiError(response.status, payload)
+      throw new ApiError(response.status, await errorPayload(response), 'POST', path)
     }
     return response.json() as Promise<InputFileRef>
   },
@@ -251,7 +357,7 @@ export const api = {
     request<RunSummary>(`/api/runs/${runId}/cancel`, { method: 'POST' }),
 
   eventUrl: (runId: string, after = 0) =>
-    `${API_BASE}/api/runs/${runId}/events?after=${after}`,
+    endpoint(`/api/runs/${runId}/events?after=${after}`),
 }
 
 export type { RunStartRequest }

@@ -104,6 +104,32 @@ def test_project_api_round_trip(tmp_path: Path) -> None:
         assert generated.json()["compiler_key"]
 
 
+def test_web_client_cors_preflight_allows_validation_and_generation(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    app = create_app(store=store, credentials=MemoryCredentials())
+
+    with TestClient(app) as client:
+        project = client.get("/api/projects").json()[0]
+        headers = {
+            "Origin": "http://127.0.0.1:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        }
+
+        for action in ("validate", "generate"):
+            response = client.options(
+                f"/api/projects/{project['id']}/{action}",
+                headers=headers,
+            )
+            assert response.status_code == 200
+            assert (
+                response.headers["access-control-allow-origin"]
+                == "http://127.0.0.1:5173"
+            )
+
+
 def test_revision_conflict_returns_409(tmp_path: Path) -> None:
     store = ProjectStore(tmp_path / "projects")
     app = create_app(store=store, credentials=MemoryCredentials())
