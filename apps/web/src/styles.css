@@ -794,6 +794,43 @@ pre {
   white-space: nowrap;
 }
 
+.run-error {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  margin: 0 4px 8px;
+  padding: 8px;
+  border: 1px solid #e3b8b2;
+  border-radius: 5px;
+  background: #fff8f6;
+  color: #7b352f;
+}
+
+.run-error > svg {
+  margin-top: 1px;
+  color: var(--red);
+}
+
+.run-error > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.run-error strong {
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.run-error span {
+  overflow-wrap: anywhere;
+  color: #75443f;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
 .run-history {
   display: grid;
   gap: 1px;
@@ -2312,11 +2349,28 @@ pre {
   color: var(--red);
 }
 
+.result-view {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.result-view > .run-error {
+  flex: none;
+  margin: 8px 12px 0;
+}
+
 .result-grid {
   display: grid;
   height: 100%;
   grid-template-columns: 1fr 1fr;
   min-height: 0;
+}
+
+.result-view .result-grid {
+  height: auto;
+  flex: 1;
 }
 
 .result-grid > div {

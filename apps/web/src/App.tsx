@@ -386,6 +386,18 @@ function runStatusLabel(status: string) {
   return labels[status] ?? status
 }
 
+function RunErrorPanel({ message }: { message: string }) {
+  return (
+    <div className="run-error" role="alert">
+      <CircleAlert size={14} />
+      <div>
+        <strong>运行失败</strong>
+        <span>{message}</span>
+      </div>
+    </div>
+  )
+}
+
 function defaultHumanGate() {
   return {
     prompt: 'Approve this workflow step before it continues.',
@@ -630,6 +642,11 @@ function App() {
   )
   const replayAtLive =
     replaySeq === null || replayUntilSeq >= replayMaxSeq
+  const currentRunError =
+    replayState.error ??
+    (replayAtLive && currentRun?.status === 'failed'
+      ? currentRun.error ?? '运行失败，但未记录错误详情'
+      : null)
 
   function startInspectorResize(event: ReactPointerEvent<HTMLDivElement>) {
     if (event.button !== 0) return
@@ -3843,6 +3860,7 @@ function App() {
                   <span>{currentRun.run_directory}</span>
                 </button>
               )}
+              {currentRunError && <RunErrorPanel message={currentRunError} />}
               {pendingGates.length > 0 && (
                 <div className="gate-list">
                   {pendingGates.map((gate) => {
@@ -4272,87 +4290,92 @@ function App() {
               </div>
             )}
             {drawerTab === 'result' && (
-              <div className="result-grid">
-                <div>
-                  <span className="eyebrow">RUN RESULT</span>
-                  <pre>
-                    {JSON.stringify(
-                      currentRun && 'result' in currentRun
-                        ? currentRun.result
-                        : null,
-                      null,
-                      2,
-                    )}
-                  </pre>
-                </div>
-                <div>
-                  <div className="result-heading">
-                    <span className="eyebrow">RUN ARTIFACTS</span>
-                    <button
-                      className="icon-button"
-                      type="button"
-                      title="打开生成物目录"
-                      disabled={!currentRun}
-                      onClick={() => void openRunFolder(currentRun)}
-                    >
-                      <FolderOpen size={14} />
-                    </button>
+              <div className="result-view">
+                {currentRunError && (
+                  <RunErrorPanel message={currentRunError} />
+                )}
+                <div className="result-grid">
+                  <div>
+                    <span className="eyebrow">RUN RESULT</span>
+                    <pre>
+                      {JSON.stringify(
+                        currentRun && 'result' in currentRun
+                          ? currentRun.result
+                          : null,
+                        null,
+                        2,
+                      )}
+                    </pre>
                   </div>
-                  <div className="artifact-list">
-                    {runArtifacts(currentRun).length ? (
-                      runArtifacts(currentRun).map((artifact) => (
-                        <div className="artifact-row" key={artifact.path}>
-                          <FileCode2 size={13} />
-                          <span title={artifact.path}>{artifact.path}</span>
-                          <small>{formatFileSize(artifact.size)}</small>
-                        </div>
-                      ))
-                    ) : (
-                      <span className="result-empty">尚无运行产物</span>
-                    )}
-                  </div>
-                  {replayState.artifacts.length > 0 && (
-                    <details className="generated-files">
-                      <summary>
-                        回放产物 {replayState.artifacts.length}
-                      </summary>
-                      <div className="artifact-list">
-                        {replayState.artifacts.map((artifact) => (
-                          <div
-                            className="artifact-row"
-                            key={`${artifact.seq}-${artifact.path}`}
-                          >
-                            <div>
-                              <strong>{artifact.port}</strong>
-                              <span>{artifact.type}</span>
-                            </div>
-                            <code>
-                              runs/
-                              {currentRun?.run_directory ??
-                                currentRun?.run_id ??
-                                'current'}
-                              /workspace/{artifact.path}
-                            </code>
-                            <small>
-                              {artifact.agentId ?? 'workflow'}
-                              {artifact.batchId
-                                ? ` · ${artifact.batchId}`
-                                : ''}
-                              {artifact.bytes !== null
-                                ? ` · ${artifact.bytes} B`
-                                : ''}
-                            </small>
+                  <div>
+                    <div className="result-heading">
+                      <span className="eyebrow">RUN ARTIFACTS</span>
+                      <button
+                        className="icon-button"
+                        type="button"
+                        title="打开生成物目录"
+                        disabled={!currentRun}
+                        onClick={() => void openRunFolder(currentRun)}
+                      >
+                        <FolderOpen size={14} />
+                      </button>
+                    </div>
+                    <div className="artifact-list">
+                      {runArtifacts(currentRun).length ? (
+                        runArtifacts(currentRun).map((artifact) => (
+                          <div className="artifact-row" key={artifact.path}>
+                            <FileCode2 size={13} />
+                            <span title={artifact.path}>{artifact.path}</span>
+                            <small>{formatFileSize(artifact.size)}</small>
                           </div>
-                        ))}
-                      </div>
-                    </details>
-                  )}
-                  {generatedFiles.length > 0 && (
-                    <details className="generated-files">
-                      <summary>生成文件</summary>
-                      <pre>{generatedFiles.join('\n')}</pre>
-                    </details>
-                  )}
+                        ))
+                      ) : (
+                        <span className="result-empty">尚无运行产物</span>
+                      )}
+                    </div>
+                    {replayState.artifacts.length > 0 && (
+                      <details className="generated-files">
+                        <summary>
+                          回放产物 {replayState.artifacts.length}
+                        </summary>
+                        <div className="artifact-list">
+                          {replayState.artifacts.map((artifact) => (
+                            <div
+                              className="artifact-row"
+                              key={`${artifact.seq}-${artifact.path}`}
+                            >
+                              <div>
+                                <strong>{artifact.port}</strong>
+                                <span>{artifact.type}</span>
+                              </div>
+                              <code>
+                                runs/
+                                {currentRun?.run_directory ??
+                                  currentRun?.run_id ??
+                                  'current'}
+                                /workspace/{artifact.path}
+                              </code>
+                              <small>
+                                {artifact.agentId ?? 'workflow'}
+                                {artifact.batchId
+                                  ? ` · ${artifact.batchId}`
+                                  : ''}
+                                {artifact.bytes !== null
+                                  ? ` · ${artifact.bytes} B`
+                                  : ''}
+                              </small>
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    )}
+                    {generatedFiles.length > 0 && (
+                      <details className="generated-files">
+                        <summary>生成文件</summary>
+                        <pre>{generatedFiles.join('\n')}</pre>
+                      </details>
+                    )}
+                  </div>
                 </div>
               </div>
             )}
