@@ -52,21 +52,27 @@ def _dpapi_protect(data: bytes) -> bytes:
         len(data),
         ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)),
     )
-    output_blob = _DataBlob()
-    if not crypt32.CryptProtectData(
-        ctypes.byref(input_blob),
-        "LoomLane API credential",
-        None,
-        None,
-        None,
-        0x1,
-        ctypes.byref(output_blob),
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        return ctypes.string_at(output_blob.pbData, output_blob.cbData)
-    finally:
-        kernel32.LocalFree(output_blob.pbData)
+    # A non-interactive process can lack a credential logon session. In that
+    # case user-scoped DPAPI fails, while machine-scoped DPAPI still works.
+    last_error = 0
+    for flags in (0x1, 0x1 | 0x4):
+        output_blob = _DataBlob()
+        ctypes.set_last_error(0)
+        if crypt32.CryptProtectData(
+            ctypes.byref(input_blob),
+            "LoomLane API credential",
+            None,
+            None,
+            None,
+            flags,
+            ctypes.byref(output_blob),
+        ):
+            try:
+                return ctypes.string_at(output_blob.pbData, output_blob.cbData)
+            finally:
+                kernel32.LocalFree(output_blob.pbData)
+        last_error = ctypes.get_last_error()
+    raise ctypes.WinError(last_error)
 
 
 def _dpapi_unprotect(data: bytes) -> bytes:

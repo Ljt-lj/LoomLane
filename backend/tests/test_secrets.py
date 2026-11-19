@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
 from loomlane import secrets
 from loomlane.secrets import CredentialError, CredentialStore
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="DPAPI is Windows-only")
+def test_dpapi_fallback_round_trip() -> None:
+    payload = b'{"api_key":"test-value","origin":"https://api.deepseek.com"}'
+
+    protected = secrets._dpapi_protect(payload)
+
+    assert protected != payload
+    assert secrets._dpapi_unprotect(protected) == payload
 
 
 def test_store_uses_keyring_when_available(

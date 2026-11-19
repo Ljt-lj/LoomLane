@@ -13,6 +13,8 @@ from . import __version__
 from .compiler import COMPILER_VERSION, WorkflowCompiler
 from .models import (
     ApiProfile,
+    GateDecisionRequest,
+    GateDecisionResponse,
     GenerateResponse,
     ImportSDLRequest,
     ProjectCreateRequest,
@@ -30,6 +32,8 @@ from .models import (
 )
 from .runtime import (
     ActiveRunExists,
+    GateConflict,
+    GateNotFound,
     RunConfigurationError,
     RunManager,
     RunNotFound,
@@ -146,6 +150,20 @@ def create_app(
     ) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": str(exc)},
+        )
+
+    @app.exception_handler(GateNotFound)
+    async def gate_not_found(_: Request, exc: GateNotFound) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": "Human gate not found", "gate_id": str(exc)},
+        )
+
+    @app.exception_handler(GateConflict)
+    async def gate_conflict(_: Request, exc: GateConflict) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exc)},
         )
 
@@ -436,6 +454,17 @@ def create_app(
     @app.get("/api/runs/{run_id}", response_model=RunDetail)
     async def get_run(run_id: str) -> RunDetail:
         return await run_manager.get(run_id)
+
+    @app.post(
+        "/api/runs/{run_id}/gates/{gate_id}",
+        response_model=GateDecisionResponse,
+    )
+    async def decide_gate(
+        run_id: str,
+        gate_id: str,
+        payload: GateDecisionRequest,
+    ) -> GateDecisionResponse:
+        return await run_manager.decide_gate(run_id, gate_id, payload)
 
     @app.get("/api/runs/{run_id}/events")
     async def run_events(

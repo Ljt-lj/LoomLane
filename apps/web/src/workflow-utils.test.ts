@@ -23,7 +23,7 @@ function agent(
     system_prompt: '',
     inputs,
     outputs,
-    limits: { max_tokens: null },
+    limits: { max_tokens: null, max_total_tokens: null },
     json_output: { enabled: false, template: {} },
     output_dir: null,
   }
