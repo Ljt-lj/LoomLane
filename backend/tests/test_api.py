@@ -5,7 +5,8 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from loomlane.main import create_app
-from loomlane.models import SecretStatus
+from loomlane.models import EdgeType, Port, PortType, SecretStatus, WorkflowInput
+from loomlane.runtime import RunManager
 from loomlane.secrets import CredentialError
 from loomlane.storage import ApiProfileStore, ProjectStore, default_sdl
 
@@ -118,6 +119,121 @@ def test_revision_conflict_returns_409(tmp_path: Path) -> None:
         )
 
     assert response.status_code == 409
+
+
+def test_get_project_with_v0_2_workflow_schema(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    sdl = default_sdl()
+    sdl.sdl_version = "0.2"
+    sdl.workflow.execution.loop_limit_default = 4
+    sdl.workflow.execution.max_parallel = 2
+    feedback = next(edge for edge in sdl.edges if edge.id == "review-feedback")
+    feedback.type = EdgeType.LOOP
+    feedback.guard.max_traversals = None
+
+    project = store.create("v0.2 project", sdl)
+    app = create_app(store=store, credentials=MemoryCredentials())
+
+    with TestClient(app) as client:
+        response = client.get(f"/api/projects/{project.id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sdl"]["sdl_version"] == "0.2"
+    assert payload["sdl"]["workflow"]["execution"]["max_parallel"] == 2
+    loop = next(
+        edge
+        for edge in payload["sdl"]["edges"]
+        if edge["id"] == "review-feedback"
+    )
+    assert loop["guard"]["max_traversals"] == 4
+
+
+def test_cors_allows_local_development_ports(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    app = create_app(store=store, credentials=MemoryCredentials())
+
+    with TestClient(app) as client:
+        for origin in (
+            "http://127.0.0.1:5174",
+            "http://localhost:4173",
+        ):
+            response = client.options(
+                "/api/projects",
+                headers={
+                    "Origin": origin,
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            assert response.status_code == 200
+            assert response.headers["access-control-allow-origin"] == origin
+
+        rejected = client.options(
+            "/api/projects",
+            headers={
+                "Origin": "https://example.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert rejected.status_code == 400
+
+
+def test_file_input_upload_and_open_folder_routes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    sdl = default_sdl()
+    sdl.workflow.inputs.append(
+        WorkflowInput(name="source", type=PortType.FILE, required=True)
+    )
+    sdl.agents[0].inputs.append(
+        Port(name="source", type=PortType.FILE, required=True)
+    )
+    project = store.create("file input api", sdl)
+
+    async def fake_open_output_folder(self, run_id: str) -> str:
+        assert run_id == "a" * 32
+        return str(tmp_path / "output")
+
+    monkeypatch.setattr(
+        RunManager,
+        "open_output_folder",
+        fake_open_output_folder,
+    )
+    app = create_app(store=store, credentials=MemoryCredentials())
+
+    with TestClient(app) as client:
+        uploaded = client.post(
+            f"/api/projects/{project.id}/input-files",
+            params={"input_name": "source", "file_name": "notes.txt"},
+            content=b"reference material",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert uploaded.status_code == 201
+        payload = uploaded.json()
+        assert payload["name"] == "notes.txt"
+        assert payload["size"] == len(b"reference material")
+        assert (
+            store.project_path(project.id) / payload["path"]
+        ).read_bytes() == b"reference material"
+
+        invalid = client.post(
+            f"/api/projects/{project.id}/input-files",
+            params={
+                "input_name": "requirement",
+                "file_name": "wrong.txt",
+            },
+            content=b"not a file port",
+        )
+        assert invalid.status_code == 400
+
+        opened = client.post(f"/api/runs/{'a' * 32}/open-folder")
+        assert opened.status_code == 200
+        assert opened.json() == {
+            "path": str(tmp_path / "output"),
+            "opened": True,
+        }
 
 
 def test_api_profile_library_crud_and_secret_routes(tmp_path: Path) -> None:
