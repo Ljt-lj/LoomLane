@@ -124,13 +124,16 @@ export function applyRunEvent(
   event: RunEvent,
 ): RunReplayState {
   const data = dataObject(event)
+  let nodeStatuses = current.nodeStatuses
+  let edgeTraversals = current.edgeTraversals
+  let tokenUsage = current.tokenUsage
+  let tokenUsageByAgent = current.tokenUsageByAgent
+  let artifacts = current.artifacts
+  let gates = current.gates
+  let terminalStatus = current.terminalStatus
+  let error = current.error
   const state: RunReplayState = {
     ...current,
-    nodeStatuses: { ...current.nodeStatuses },
-    edgeTraversals: { ...current.edgeTraversals },
-    tokenUsageByAgent: { ...current.tokenUsageByAgent },
-    artifacts: [...current.artifacts],
-    gates: { ...current.gates },
     events: [...current.events, event],
     lastSeq: Math.max(current.lastSeq, event.seq),
   }
@@ -139,81 +142,107 @@ export function applyRunEvent(
   if (event.type === 'run_started') {
     state.status = 'running'
   } else if (event.type === 'node_enter' && event.node_id) {
-    state.nodeStatuses[event.node_id] = 'running'
+    nodeStatuses = { ...nodeStatuses, [event.node_id]: 'running' }
   } else if (event.type === 'node_exit' && event.node_id) {
-    state.nodeStatuses[event.node_id] = nodeExitStatus(data.status)
+    nodeStatuses = {
+      ...nodeStatuses,
+      [event.node_id]: nodeExitStatus(data.status),
+    }
   } else if (event.type === 'edge_traversed' && event.edge_id) {
-    state.edgeTraversals[event.edge_id] =
-      (state.edgeTraversals[event.edge_id] ?? 0) + 1
+    edgeTraversals = {
+      ...edgeTraversals,
+      [event.edge_id]: (edgeTraversals[event.edge_id] ?? 0) + 1,
+    }
   } else if (event.type === 'token_usage') {
     const total = numberValue(data.total_tokens) ?? 0
-    state.tokenUsage += total
+    tokenUsage += total
     if (event.node_id) {
-      state.tokenUsageByAgent[event.node_id] =
-        (state.tokenUsageByAgent[event.node_id] ?? 0) + total
+      tokenUsageByAgent = {
+        ...tokenUsageByAgent,
+        [event.node_id]: (tokenUsageByAgent[event.node_id] ?? 0) + total,
+      }
     }
   } else if (event.type === 'artifact_written') {
     const path = stringValue(data.path)
     if (path) {
-      state.artifacts.push({
-        seq: event.seq,
-        agentId: event.node_id ?? null,
-        port: stringValue(data.port) ?? '',
-        path,
-        type: stringValue(data.type) ?? 'FILE',
-        step: numberValue(data.step),
-        batchId: stringValue(data.batch_id),
-        bytes: numberValue(data.bytes),
-      })
+      artifacts = [
+        ...artifacts,
+        {
+          seq: event.seq,
+          agentId: event.node_id ?? null,
+          port: stringValue(data.port) ?? '',
+          path,
+          type: stringValue(data.type) ?? 'FILE',
+          step: numberValue(data.step),
+          batchId: stringValue(data.batch_id),
+          bytes: numberValue(data.bytes),
+        },
+      ]
     }
   } else if (event.type === 'human_gate_waiting') {
     const gateId = stringValue(data.gate_id)
     if (gateId) {
-      state.gates[gateId] = {
-        gateId,
-        edgeId: event.edge_id ?? null,
-        prompt: stringValue(data.prompt) ?? 'Approve this workflow step.',
-        timeoutSeconds: numberValue(data.timeout_seconds),
-        requestedAt: event.ts,
-        status: 'waiting',
-        decision: null,
-        comment: null,
-        timedOut: false,
+      gates = {
+        ...gates,
+        [gateId]: {
+          gateId,
+          edgeId: event.edge_id ?? null,
+          prompt: stringValue(data.prompt) ?? 'Approve this workflow step.',
+          timeoutSeconds: numberValue(data.timeout_seconds),
+          requestedAt: event.ts,
+          status: 'waiting',
+          decision: null,
+          comment: null,
+          timedOut: false,
+        },
       }
     }
   } else if (event.type === 'human_gate_resolved') {
     const gateId = stringValue(data.gate_id)
     if (gateId) {
-      const previous = state.gates[gateId]
-      state.gates[gateId] = {
-        gateId,
-        edgeId: event.edge_id ?? previous?.edgeId ?? null,
-        prompt: previous?.prompt ?? 'Approve this workflow step.',
-        timeoutSeconds: previous?.timeoutSeconds ?? null,
-        requestedAt: previous?.requestedAt ?? null,
-        status: 'resolved',
-        decision: stringValue(data.decision),
-        comment: stringValue(data.comment),
-        timedOut: Boolean(data.timed_out),
+      const previous = gates[gateId]
+      gates = {
+        ...gates,
+        [gateId]: {
+          gateId,
+          edgeId: event.edge_id ?? previous?.edgeId ?? null,
+          prompt: previous?.prompt ?? 'Approve this workflow step.',
+          timeoutSeconds: previous?.timeoutSeconds ?? null,
+          requestedAt: previous?.requestedAt ?? null,
+          status: 'resolved',
+          decision: stringValue(data.decision),
+          comment: stringValue(data.comment),
+          timedOut: Boolean(data.timed_out),
+        },
       }
     }
   } else if (event.type === 'error') {
-    if (event.node_id) state.nodeStatuses[event.node_id] = 'failed'
-    state.error = stringValue(data.message) ?? 'Workflow run failed'
+    if (event.node_id) {
+      nodeStatuses = { ...nodeStatuses, [event.node_id]: 'failed' }
+    }
+    error = stringValue(data.message) ?? 'Workflow run failed'
   } else if (event.type === 'run_finished') {
     const finishedStatus = runStatus(data.status)
-    state.terminalStatus =
+    terminalStatus =
       finishedStatus && TERMINAL_STATUSES.has(finishedStatus)
         ? finishedStatus
         : 'failed'
-    state.status = state.terminalStatus
-    state.error =
+    state.status = terminalStatus
+    error =
       stringValue(data.error) ??
-      (state.terminalStatus === 'failed'
-        ? state.error ?? 'Workflow run failed'
+      (terminalStatus === 'failed'
+        ? error ?? 'Workflow run failed'
         : null)
   }
 
+  state.nodeStatuses = nodeStatuses
+  state.edgeTraversals = edgeTraversals
+  state.tokenUsage = tokenUsage
+  state.tokenUsageByAgent = tokenUsageByAgent
+  state.artifacts = artifacts
+  state.gates = gates
+  state.terminalStatus = terminalStatus
+  state.error = error
   if (!state.terminalStatus) state.status = statusFromGates(state)
   return state
 }
