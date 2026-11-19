@@ -123,6 +123,36 @@ def test_revision_conflict_returns_409(tmp_path: Path) -> None:
     assert response.status_code == 409
 
 
+def test_project_save_accepts_draft_but_validate_reports_incomplete_workflow(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    app = create_app(store=store, credentials=MemoryCredentials())
+
+    with TestClient(app) as client:
+        summary = client.get("/api/projects").json()[0]
+        detail = client.get(f"/api/projects/{summary['id']}").json()
+        detail["sdl"]["start"] = []
+
+        saved = client.put(
+            f"/api/projects/{summary['id']}",
+            json={
+                "sdl": detail["sdl"],
+                "canvas": detail["canvas"],
+                "base_revision": detail["revision"],
+            },
+        )
+        validation = client.post(
+            f"/api/projects/{summary['id']}/validate",
+            json={"sdl": saved.json()["sdl"]},
+        )
+
+    assert saved.status_code == 200
+    assert saved.json()["sdl"]["start"] == []
+    assert validation.status_code == 200
+    assert validation.json()["valid"] is False
+
+
 def test_project_save_returns_structured_error_for_persistent_file_lock(
     tmp_path: Path,
     monkeypatch,

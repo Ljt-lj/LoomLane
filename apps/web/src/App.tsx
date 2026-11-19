@@ -27,6 +27,7 @@ import {
   CircleAlert,
   CirclePlay,
   Code2,
+  Copy,
   FileCode2,
   FileUp,
   Folder,
@@ -114,6 +115,7 @@ import {
   type InspectorTab,
 } from './uiStore'
 import {
+  cloneAgent,
   conditionPaths,
   defaultCondition,
   firstCompatibleMapping,
@@ -1190,7 +1192,7 @@ function App() {
       setDirty(false)
       setIssues([])
       await queryClient.invalidateQueries({ queryKey: ['projects'] })
-      showNotice('success', `已保存 revision ${updated.revision}`)
+      showNotice('success', `已保存草稿 revision ${updated.revision}`)
       return updated
     } catch (error) {
       const validationIssues = issueFromError(error)
@@ -2054,6 +2056,37 @@ function App() {
     }
   }
 
+  function duplicateAgent() {
+    if (!draft || !selectedAgent) return
+    const sourceNode = draft.canvas.nodes.find(
+      (node) => node.id === selectedAgent.id,
+    )
+    const duplicate = cloneAgent(
+      selectedAgent,
+      draft.sdl.agents.map((agent) => agent.id),
+    )
+    const node: CanvasNode = {
+      id: duplicate.id,
+      x: (sourceNode?.x ?? 100) + 32,
+      y: (sourceNode?.y ?? 120) + 32,
+      width: sourceNode?.width ?? 238,
+      height: sourceNode?.height ?? 132,
+    }
+    updateDraft((current) => ({
+      ...current,
+      sdl: {
+        ...current.sdl,
+        agents: [...current.sdl.agents, duplicate],
+      },
+      canvas: {
+        ...current.canvas,
+        nodes: [...current.canvas.nodes, node],
+      },
+    }))
+    setSelection({ kind: 'node', id: duplicate.id })
+    setInspectorTab('selection')
+  }
+
   function addAgent() {
     if (!draft) return
     const id = uniqueId(
@@ -2251,6 +2284,14 @@ function App() {
             </div>
             <div className="inspector-heading-actions">
               <span className="id-chip">{agent.id}</span>
+              <button
+                className="small-button"
+                title="复制所选 Agent"
+                onClick={duplicateAgent}
+              >
+                <Copy size={13} />
+                复制
+              </button>
               <button
                 className="small-button danger"
                 title="删除所选 Agent"
@@ -2929,7 +2970,7 @@ function App() {
             </button>
           </div>
           {workflowMeta.inputs.map((input, index) => (
-            <div className="port-editor-row" key={input.name}>
+            <div className="port-editor-row" key={`workflow-input-${index}`}>
               <input
                 value={input.name}
                 onChange={(event) =>
@@ -3020,7 +3061,10 @@ function App() {
               (item) => item.id === output.agent,
             )
             return (
-              <div className="output-editor-row" key={`${output.name}-${index}`}>
+              <div
+                className="output-editor-row"
+                key={`workflow-output-${index}`}
+              >
                 <input
                   value={output.name}
                   onChange={(event) =>
@@ -3711,13 +3755,14 @@ function App() {
             className="toolbar-button"
             disabled={!dirty || saving}
             onClick={saveProject}
+            title="保存当前编辑内容，不要求流程可运行"
           >
             {saving ? (
               <LoaderCircle size={15} className="spin" />
             ) : (
               <Save size={15} />
             )}
-            保存
+            保存草稿
           </button>
           {isRunActive ? (
             <button className="run-button cancel" onClick={cancelRun}>

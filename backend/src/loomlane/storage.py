@@ -1032,12 +1032,6 @@ class ProjectStore:
                 raise RevisionConflict(
                     f"Expected revision {base_revision}, current is {current.revision}"
                 )
-            validation = validate_sdl(sdl)
-            if not validation.valid:
-                raise InvalidWorkflow(
-                    [issue.model_dump(mode="json") for issue in validation.issues]
-                )
-            normalized = SDL.model_validate(validation.normalized_sdl)
             detail = ProjectDetail(
                 id=current.id,
                 name=current.name,
@@ -1045,8 +1039,8 @@ class ProjectStore:
                 created_at=current.created_at,
                 updated_at=utc_now(),
                 last_build_hash=current.last_build_hash,
-                sdl=normalized,
-                canvas=normalize_canvas(normalized, canvas),
+                sdl=sdl,
+                canvas=normalize_canvas(sdl, canvas),
             )
             self._write_project(detail)
             return detail

@@ -14,6 +14,18 @@ export function uniqueId(base: string, values: Iterable<string>) {
   return `${base}-${index}`
 }
 
+export function cloneAgent(
+  agent: Agent,
+  existingIds: Iterable<string>,
+): Agent {
+  return {
+    ...structuredClone(agent),
+    id: uniqueId(`${agent.id}-copy`, existingIds),
+    name: `${agent.name} 副本`,
+    output_dir: null,
+  }
+}
+
 export type ApiProfileRemovalResult =
   | {
       kind: 'removed'
