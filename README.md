@@ -57,7 +57,7 @@ pnpm --dir apps/web install
 终端一启动后端：
 
 ```powershell
-.\.venv\Scripts\python -m uvicorn loomlane.main:app --app-dir backend/src --reload --port 8000
+.\.venv\Scripts\python -m uvicorn loomlane.main:app --app-dir backend/src --reload-dir backend/src --port 8000
 ```
 
 终端二启动前端：
@@ -109,7 +109,7 @@ workspace/projects/{project_id}/
 
 ```powershell
 $env:LOOMLANE_DATA_DIR = "D:\LoomLaneData"
-.\.venv\Scripts\python -m uvicorn loomlane.main:app --app-dir backend/src --reload --port 8000
+.\.venv\Scripts\python -m uvicorn loomlane.main:app --app-dir backend/src --reload-dir backend/src --port 8000
 ```
 
 项目写入使用 revision 冲突检测。保存请求中的 `base_revision` 与当前版本不一致时，API 返回 `409 Conflict`。

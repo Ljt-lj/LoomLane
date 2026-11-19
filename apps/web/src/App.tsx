@@ -81,6 +81,10 @@ import {
   replayRunEvents,
   type GateReplayRecord,
 } from './run-replay'
+import {
+  applyLibrarySecretStatuses,
+  mergeSettledSecretStatuses,
+} from './secret-status-utils'
 import type {
   Agent,
   ApiProfile,
@@ -889,23 +893,45 @@ function App() {
 
   useEffect(() => {
     if (!projectId || !draft) return
+    const profiles = draft.sdl.api_profiles
+    const profileIds = profiles.map((profile) => profile.id)
+    if (dirty) {
+      setSecretStatuses((current) =>
+        applyLibrarySecretStatuses(
+          mergeSettledSecretStatuses(current, profileIds, []),
+          profiles,
+          librarySecretStatuses,
+        ),
+      )
+      return
+    }
+
     let cancelled = false
-    Promise.all(
-      draft.sdl.api_profiles.map(async (profile) => [
+    Promise.allSettled(
+      profiles.map(async (profile) => [
         profile.id,
         await api.secretStatus(projectId, profile.id),
       ] as const),
     )
-      .then((entries) => {
-        if (!cancelled) setSecretStatuses(Object.fromEntries(entries))
-      })
-      .catch(() => {
-        if (!cancelled) setSecretStatuses({})
+      .then((results) => {
+        if (cancelled) return
+        setSecretStatuses((current) =>
+          applyLibrarySecretStatuses(
+            mergeSettledSecretStatuses(current, profileIds, results),
+            profiles,
+            librarySecretStatuses,
+          ),
+        )
       })
     return () => {
       cancelled = true
     }
-  }, [draft?.sdl.api_profiles, projectId])
+  }, [
+    draft?.sdl.api_profiles,
+    dirty,
+    librarySecretStatuses,
+    projectId,
+  ])
 
   useEffect(() => {
     const profiles = apiProfilesQuery.data
@@ -919,17 +945,18 @@ function App() {
     })
 
     let cancelled = false
-    Promise.all(
+    Promise.allSettled(
       profiles.map(async (profile) => [
         profile.id,
         await api.apiProfileSecretStatus(profile.id),
       ] as const),
     )
-      .then((entries) => {
-        if (!cancelled) setLibrarySecretStatuses(Object.fromEntries(entries))
-      })
-      .catch(() => {
-        if (!cancelled) setLibrarySecretStatuses({})
+      .then((results) => {
+        if (cancelled) return
+        const profileIds = profiles.map((profile) => profile.id)
+        setLibrarySecretStatuses((current) =>
+          mergeSettledSecretStatuses(current, profileIds, results),
+        )
       })
     return () => {
       cancelled = true
@@ -1699,17 +1726,28 @@ function App() {
         ...sdl,
         api_profiles: [...sdl.api_profiles, linkedProfile],
       }))
-      if (librarySecretStatuses[profile.id]?.configured) {
+      const libraryStatus = librarySecretStatuses[profile.id]
+      if (libraryStatus) {
         setSecretStatuses((current) => ({
           ...current,
           [projectProfileId]: {
-            ...librarySecretStatuses[profile.id],
+            ...libraryStatus,
             profile_id: projectProfileId,
             scope: 'library',
           },
         }))
       }
-      showNotice('success', '已加入当前项目，保存项目后生效')
+      const local =
+        profile.base_url.includes('127.0.0.1') ||
+        profile.base_url.includes('localhost')
+      if (local || libraryStatus?.configured) {
+        showNotice('success', '已加入当前项目，保存项目后生效')
+      } else {
+        showNotice(
+          'info',
+          '已加入当前项目；该常用库 Profile 尚未配置 API Key',
+        )
+      }
     } finally {
       setLibraryProfileLinking(null)
     }
