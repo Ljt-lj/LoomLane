@@ -13,7 +13,7 @@ from .storage import InvalidWorkflow
 from .validator import validate_sdl
 
 
-COMPILER_VERSION = "0.2.7"
+COMPILER_VERSION = "0.2.8"
 
 
 def canonical_json(sdl: SDL) -> str:
