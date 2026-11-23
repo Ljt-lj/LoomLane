@@ -70,8 +70,18 @@ export interface ApiProfile {
     vision: boolean
     long_context: boolean
     structured_output: boolean
+    image_generation: boolean
   }
+  image_generation?: ImageGenerationConfig | null
   note?: string | null
+}
+
+export interface ImageGenerationConfig {
+  protocol: 'openai_images' | 'siliconflow' | 'automatic1111'
+  size: string
+  quality?: string | null
+  output_format?: 'png' | 'jpeg' | 'webp' | null
+  response_format?: 'url' | 'b64_json' | null
 }
 
 export interface AgentJsonOutput {
@@ -83,6 +93,7 @@ export interface Agent {
   id: string
   name: string
   api_profile: string
+  mode: 'chat' | 'image'
   system_prompt: string
   inputs: Port[]
   outputs: Port[]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath, PureWindowsPath
@@ -91,11 +92,29 @@ class RequestConfig(StrictModel):
     temperature: float = Field(default=0.2, ge=0, le=2)
 
 
+class ImageGenerationConfig(StrictModel):
+    protocol: Literal[
+        "openai_images",
+        "siliconflow",
+        "automatic1111",
+    ] = "automatic1111"
+    size: str = Field(default="1024x1024", min_length=1, max_length=32)
+    quality: str | None = Field(default=None, min_length=1, max_length=32)
+    output_format: Literal["png", "jpeg", "webp"] | None = None
+    response_format: Literal["url", "b64_json"] | None = None
+
+    @field_validator("size")
+    @classmethod
+    def normalize_size(cls, value: str) -> str:
+        return re.sub(r"\s*[x\u00d7]\s*", "x", value.strip(), flags=re.IGNORECASE)
+
+
 class CapabilityFlags(StrictModel):
     function_calling: bool = False
     vision: bool = False
     long_context: bool = False
     structured_output: bool = False
+    image_generation: bool = False
 
 
 class ApiProfile(StrictModel):
@@ -107,6 +126,7 @@ class ApiProfile(StrictModel):
     model: str
     request: RequestConfig = Field(default_factory=RequestConfig)
     capabilities: CapabilityFlags = Field(default_factory=CapabilityFlags)
+    image_generation: ImageGenerationConfig | None = None
     note: str | None = None
 
     @field_validator("base_url")
@@ -138,6 +158,7 @@ class Agent(StrictModel):
     id: str
     name: str
     api_profile: str
+    mode: Literal["chat", "image"] = "chat"
     system_prompt: str
     inputs: list[Port] = Field(default_factory=list)
     outputs: list[Port] = Field(default_factory=list)

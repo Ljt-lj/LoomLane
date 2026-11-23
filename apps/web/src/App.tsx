@@ -124,6 +124,7 @@ import {
 } from './workflow-utils'
 
 const nodeTypes = { agent: AgentNode }
+const DEFAULT_IMAGE_PROTOCOL = 'automatic1111' as const
 const PORT_TYPES: PortType[] = ['TEXT', 'DATA', 'FILE', 'MIXED']
 const EDGE_TYPES: EdgeType[] = [
   'PIPE',
@@ -175,6 +176,213 @@ interface RunArtifact {
 
 function classNames(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(' ')
+}
+
+function ImageGenerationFields({
+  profile,
+  onChange,
+}: {
+  profile: ApiProfile
+  onChange: (updater: (profile: ApiProfile) => ApiProfile) => void
+}) {
+  const enabled = profile.capabilities.image_generation
+  const protocol = profile.image_generation?.protocol ?? DEFAULT_IMAGE_PROTOCOL
+  return (
+    <>
+      <div className="capability-row">
+        <label>
+          <input
+            type="checkbox"
+            checked={profile.capabilities.structured_output}
+            onChange={(event) =>
+              onChange((current) => ({
+                ...current,
+                capabilities: {
+                  ...current.capabilities,
+                  structured_output: event.target.checked,
+                },
+              }))
+            }
+          />
+          Structured JSON
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(event) =>
+              onChange((current) => ({
+                ...current,
+                capabilities: {
+                  ...current.capabilities,
+                  image_generation: event.target.checked,
+                },
+                image_generation: event.target.checked
+                  ? current.image_generation ?? {
+                      protocol: DEFAULT_IMAGE_PROTOCOL,
+                      size: '1024x1024',
+                      quality: null,
+                      output_format: null,
+                      response_format: null,
+                    }
+                  : null,
+              }))
+            }
+          />
+          Image generation
+        </label>
+      </div>
+      {enabled && (
+        <div className="image-generation-fields">
+          <div className="two-column-fields">
+            <label>
+              Protocol
+              <select
+                value={protocol}
+                onChange={(event) =>
+                  onChange((current) => ({
+                    ...current,
+                    image_generation: {
+                      protocol: event.target.value as
+                        | 'openai_images'
+                        | 'siliconflow'
+                        | 'automatic1111',
+                      size: current.image_generation?.size ?? '1024x1024',
+                      quality: current.image_generation?.quality ?? null,
+                      output_format:
+                        current.image_generation?.output_format ?? null,
+                      response_format:
+                        current.image_generation?.response_format ?? null,
+                    },
+                  }))
+                }
+              >
+                <option value="openai_images">OpenAI Images</option>
+                <option value="siliconflow">SiliconFlow</option>
+                <option value="automatic1111">AUTOMATIC1111 / Forge</option>
+              </select>
+            </label>
+            <label>
+              Size
+              <input
+                value={profile.image_generation?.size ?? '1024x1024'}
+                placeholder="1024x1024"
+                onChange={(event) =>
+                  onChange((current) => ({
+                    ...current,
+                    image_generation: {
+                      protocol:
+                        current.image_generation?.protocol ??
+                        DEFAULT_IMAGE_PROTOCOL,
+                      size: event.target.value,
+                      quality: current.image_generation?.quality ?? null,
+                      output_format:
+                        current.image_generation?.output_format ?? null,
+                      response_format:
+                        current.image_generation?.response_format ?? null,
+                    },
+                  }))
+                }
+              />
+            </label>
+          </div>
+          {protocol === 'openai_images' && (
+            <>
+              <div className="two-column-fields">
+                <label>
+                  Quality
+                  <input
+                    value={profile.image_generation?.quality ?? ''}
+                    placeholder="Provider default"
+                    onChange={(event) =>
+                      onChange((current) => ({
+                        ...current,
+                        image_generation: {
+                          protocol:
+                            current.image_generation?.protocol ??
+                            DEFAULT_IMAGE_PROTOCOL,
+                          size:
+                            current.image_generation?.size ?? '1024x1024',
+                          quality: event.target.value || null,
+                          output_format:
+                            current.image_generation?.output_format ?? null,
+                          response_format:
+                            current.image_generation?.response_format ?? null,
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  Output format
+                  <select
+                    value={profile.image_generation?.output_format ?? ''}
+                    onChange={(event) =>
+                      onChange((current) => ({
+                        ...current,
+                        image_generation: {
+                          protocol:
+                            current.image_generation?.protocol ??
+                            DEFAULT_IMAGE_PROTOCOL,
+                          size:
+                            current.image_generation?.size ?? '1024x1024',
+                          quality: current.image_generation?.quality ?? null,
+                          output_format:
+                            (event.target.value as
+                              | 'png'
+                              | 'jpeg'
+                              | 'webp') || null,
+                          response_format:
+                            current.image_generation?.response_format ?? null,
+                        },
+                      }))
+                    }
+                  >
+                    <option value="">Provider default</option>
+                    <option value="png">PNG</option>
+                    <option value="jpeg">JPEG</option>
+                    <option value="webp">WebP</option>
+                  </select>
+                </label>
+              </div>
+              <div className="two-column-fields">
+                <label>
+                  API response
+                  <select
+                    value={profile.image_generation?.response_format ?? ''}
+                    onChange={(event) =>
+                      onChange((current) => ({
+                        ...current,
+                        image_generation: {
+                          protocol:
+                            current.image_generation?.protocol ??
+                            DEFAULT_IMAGE_PROTOCOL,
+                          size:
+                            current.image_generation?.size ?? '1024x1024',
+                          quality: current.image_generation?.quality ?? null,
+                          output_format:
+                            current.image_generation?.output_format ?? null,
+                          response_format:
+                            (event.target.value as
+                              | 'url'
+                              | 'b64_json') || null,
+                        },
+                      }))
+                    }
+                  >
+                    <option value="">Provider default</option>
+                    <option value="b64_json">Base64</option>
+                    <option value="url">URL</option>
+                  </select>
+                </label>
+                <span />
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </>
+  )
 }
 
 function initialRunInputs(
@@ -1621,6 +1829,7 @@ function App() {
         vision: false,
         long_context: true,
         structured_output: true,
+        image_generation: false,
       },
     }
     setLibraryProfileSaving(profileId)
@@ -2146,6 +2355,7 @@ function App() {
       id,
       name: '新 Agent',
       api_profile: draft.sdl.api_profiles[0]?.id ?? 'openai-main',
+      mode: 'chat',
       system_prompt: '你是一个负责处理输入并返回结构化输出的 Agent。',
       inputs: [{ name: 'input', type: 'TEXT', required: true }],
       outputs: [{ name: 'output', type: 'TEXT' }],
@@ -2316,6 +2526,12 @@ function App() {
   function renderSelectionInspector() {
     if (selectedAgent) {
       const agent = selectedAgent
+      const selectedProfile = draft?.sdl.api_profiles.find(
+        (profile) => profile.id === agent.api_profile,
+      )
+      const imageContractInvalid =
+        agent.mode === 'image' &&
+        (agent.outputs.length !== 1 || agent.outputs[0]?.type !== 'FILE')
       return (
         <div className="inspector-body">
           <div className="inspector-heading">
@@ -2356,6 +2572,53 @@ function App() {
             />
           </label>
           <label>
+            Agent 模式
+            <select
+              value={agent.mode}
+              onChange={(event) => {
+                const mode = event.target.value as Agent['mode']
+                updateAgent(agent.id, (current) => {
+                  const compatibleProfile =
+                    draft?.sdl.api_profiles.find(
+                      (profile) => profile.capabilities.image_generation,
+                    )?.id ?? current.api_profile
+                  return {
+                    ...current,
+                    mode,
+                    api_profile:
+                      mode === 'image' &&
+                      !draft?.sdl.api_profiles.find(
+                        (profile) =>
+                          profile.id === current.api_profile &&
+                          profile.capabilities.image_generation,
+                      )
+                        ? compatibleProfile
+                        : current.api_profile,
+                    json_output:
+                      mode === 'image'
+                        ? { ...current.json_output, enabled: false }
+                        : current.json_output,
+                    outputs:
+                      mode === 'image'
+                        ? [
+                            {
+                              name: current.outputs[0]?.name || 'picture',
+                              type: 'FILE',
+                            },
+                          ]
+                        : current.outputs.length === 1 &&
+                            current.outputs[0]?.type === 'FILE'
+                          ? [{ ...current.outputs[0], type: 'TEXT' }]
+                          : current.outputs,
+                  }
+                })
+              }}
+            >
+              <option value="chat">Chat</option>
+              <option value="image">Image</option>
+            </select>
+          </label>
+          <label>
             API Profile
             <select
               value={agent.api_profile}
@@ -2367,12 +2630,32 @@ function App() {
               }
             >
               {draft?.sdl.api_profiles.map((profile) => (
-                <option key={profile.id} value={profile.id}>
+                <option
+                  key={profile.id}
+                  value={profile.id}
+                  disabled={
+                    agent.mode === 'image' &&
+                    !profile.capabilities.image_generation
+                  }
+                >
                   {profile.name || profile.id}
                 </option>
               ))}
             </select>
           </label>
+          {agent.mode === 'image' &&
+            (!selectedProfile?.capabilities.image_generation ||
+              imageContractInvalid) && (
+              <div className="inline-warning">
+                {!selectedProfile?.capabilities.image_generation &&
+                  '请选择启用了 Image generation 的 API Profile。'}
+                {!selectedProfile?.capabilities.image_generation &&
+                  imageContractInvalid &&
+                  ' '}
+                {imageContractInvalid &&
+                  '图片模式需要且仅需要一个 FILE 输出端口。'}
+              </div>
+            )}
           <label>
             System Prompt
             <textarea
@@ -2386,26 +2669,28 @@ function App() {
               }
             />
           </label>
-          <label>
-            单次 Max tokens
-            <input
-              type="number"
-              min={1}
-              placeholder="不限制"
-              value={agent.limits.max_tokens ?? ''}
-              onChange={(event) =>
-                updateAgent(agent.id, (current) => ({
-                  ...current,
-                  limits: {
-                    ...current.limits,
-                    max_tokens: event.target.value
-                      ? Number(event.target.value)
-                      : null,
-                  },
-                }))
-              }
-            />
-          </label>
+          {agent.mode === 'chat' && (
+            <label>
+              单次 Max tokens
+              <input
+                type="number"
+                min={1}
+                placeholder="不限制"
+                value={agent.limits.max_tokens ?? ''}
+                onChange={(event) =>
+                  updateAgent(agent.id, (current) => ({
+                    ...current,
+                    limits: {
+                      ...current.limits,
+                      max_tokens: event.target.value
+                        ? Number(event.target.value)
+                        : null,
+                    },
+                  }))
+                }
+              />
+            </label>
+          )}
           <label>
             累计 Max tokens
             <input
@@ -2439,16 +2724,18 @@ function App() {
               }
             />
           </label>
-          <JsonOutputEditor
-            value={agent.json_output ?? { enabled: false, template: {} }}
-            outputNames={agent.outputs.map((port) => port.name)}
-            onChange={(jsonOutput) =>
-              updateAgent(agent.id, (current) => ({
-                ...current,
-                json_output: jsonOutput,
-              }))
-            }
-          />
+          {agent.mode === 'chat' && (
+            <JsonOutputEditor
+              value={agent.json_output ?? { enabled: false, template: {} }}
+              outputNames={agent.outputs.map((port) => port.name)}
+              onChange={(jsonOutput) =>
+                updateAgent(agent.id, (current) => ({
+                  ...current,
+                  json_output: jsonOutput,
+                }))
+              }
+            />
+          )}
           {renderPorts(agent, 'inputs')}
           {renderPorts(agent, 'outputs')}
         </div>
@@ -3410,24 +3697,12 @@ function App() {
                     )}
                   </div>
                 )}
-                <div className="capability-row">
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={profile.capabilities.structured_output}
-                      onChange={(event) =>
-                        updateLibraryProfileDraft(serverProfile.id, (current) => ({
-                          ...current,
-                          capabilities: {
-                            ...current.capabilities,
-                            structured_output: event.target.checked,
-                          },
-                        }))
-                      }
-                    />
-                    Structured JSON
-                  </label>
-                </div>
+                <ImageGenerationFields
+                  profile={profile}
+                  onChange={(updater) =>
+                    updateLibraryProfileDraft(serverProfile.id, updater)
+                  }
+                />
                 <div className="profile-card-actions">
                   <button
                     className="small-button"
@@ -3499,6 +3774,7 @@ function App() {
                           vision: false,
                           long_context: false,
                           structured_output: true,
+                          image_generation: false,
                         },
                       },
                     ],
@@ -3700,24 +3976,10 @@ function App() {
                     )}
                   </div>
                 )}
-                <div className="capability-row">
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={profile.capabilities.structured_output}
-                      onChange={(event) =>
-                        updateProfile(profile.id, (current) => ({
-                          ...current,
-                          capabilities: {
-                            ...current.capabilities,
-                            structured_output: event.target.checked,
-                          },
-                        }))
-                      }
-                    />
-                    Structured JSON
-                  </label>
-                </div>
+                <ImageGenerationFields
+                  profile={profile}
+                  onChange={(updater) => updateProfile(profile.id, updater)}
+                />
               </section>
             )
           })}

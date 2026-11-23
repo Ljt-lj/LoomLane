@@ -21,6 +21,7 @@ function agent(
     id,
     name: id,
     api_profile: apiProfile,
+    mode: 'chat',
     system_prompt: '',
     inputs,
     outputs,
@@ -47,6 +48,7 @@ function apiProfile(id: string): ApiProfile {
       vision: false,
       long_context: false,
       structured_output: true,
+      image_generation: false,
     },
   }
 }

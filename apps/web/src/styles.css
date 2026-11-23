@@ -2000,6 +2000,7 @@ pre {
 .capability-row {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 7px;
   color: var(--muted);
   font-size: 10px;
@@ -2009,6 +2010,15 @@ pre {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+.image-generation-fields {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #d8e1dc;
+  border-radius: 6px;
+  background: #f7faf8;
 }
 
 .bottom-drawer {

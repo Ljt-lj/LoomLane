@@ -412,3 +412,110 @@ def test_api_profile_delete_survives_vault_cleanup_failure(
         assert client.get("/api/api-profiles").json() == []
 
     assert profile_store.list() == []
+
+
+def test_image_generation_profile_config_round_trips_through_api(
+    tmp_path: Path,
+) -> None:
+    profile_store = ApiProfileStore(tmp_path / "api-profiles.json")
+    app = create_app(
+        store=ProjectStore(tmp_path / "projects"),
+        api_profiles=profile_store,
+        credentials=MemoryCredentials(),
+    )
+    profile = {
+        "id": "openai-images",
+        "name": "OpenAI Images",
+        "provider": "openai_compatible",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-image-1",
+        "capabilities": {
+            "function_calling": False,
+            "vision": False,
+            "long_context": False,
+            "structured_output": False,
+            "image_generation": True,
+        },
+        "image_generation": {
+            "protocol": "openai_images",
+            "size": "1024x1024",
+            "quality": "high",
+            "output_format": "png",
+            "response_format": "b64_json",
+        },
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/api/api-profiles", json=profile)
+        assert created.status_code == 201
+        assert created.json()["capabilities"]["image_generation"] is True
+        assert created.json()["image_generation"] == profile["image_generation"]
+
+        fetched = client.get("/api/api-profiles")
+        assert fetched.status_code == 200
+        assert (
+            fetched.json()[0]["image_generation"]["protocol"]
+            == "openai_images"
+        )
+        assert fetched.json()[0]["image_generation"]["size"] == "1024x1024"
+
+        updated = client.put(
+            "/api/api-profiles/openai-images",
+            json={
+                **profile,
+                "image_generation": {
+                    **profile["image_generation"],
+                    "size": "1536\u00d71024",
+                    "quality": "medium",
+                },
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["image_generation"]["size"] == "1536x1024"
+        assert updated.json()["image_generation"]["quality"] == "medium"
+
+    persisted = profile_store.get("openai-images")
+    assert persisted.capabilities.image_generation is True
+    assert persisted.image_generation is not None
+    assert persisted.image_generation.protocol == "openai_images"
+    assert persisted.image_generation.size == "1536x1024"
+
+
+def test_automatic1111_profile_round_trips_through_api(tmp_path: Path) -> None:
+    profile_store = ApiProfileStore(tmp_path / "api-profiles.json")
+    app = create_app(
+        store=ProjectStore(tmp_path / "projects"),
+        api_profiles=profile_store,
+        credentials=MemoryCredentials(),
+    )
+    profile = {
+        "id": "local-sd",
+        "name": "Local Stable Diffusion",
+        "provider": "openai_compatible",
+        "base_url": "http://127.0.0.1:7860",
+        "model": "local",
+        "capabilities": {"image_generation": True},
+        "image_generation": {
+            "protocol": "automatic1111",
+            "size": "1024x1024",
+        },
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/api/api-profiles", json=profile)
+        assert created.status_code == 201
+        assert (
+            created.json()["image_generation"]["protocol"]
+            == "automatic1111"
+        )
+
+        fetched = client.get("/api/api-profiles")
+        assert fetched.status_code == 200
+        assert (
+            fetched.json()[0]["image_generation"]["protocol"]
+            == "automatic1111"
+        )
+
+    persisted = profile_store.get("local-sd")
+    assert persisted.image_generation is not None
+    assert persisted.image_generation.protocol == "automatic1111"
