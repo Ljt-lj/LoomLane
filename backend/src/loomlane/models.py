@@ -338,6 +338,34 @@ class RunStartRequest(StrictModel):
     inputs: dict[str, Any] = Field(default_factory=dict)
 
 
+class RunResumeRequest(StrictModel):
+    source_run_id: str
+    checkpoint_id: str
+
+
+class RunResumeCheckpoint(StrictModel):
+    checkpoint_id: str
+    step: int
+    completed_agent_ids: list[str] = Field(default_factory=list)
+    completed_agent_names: list[str] = Field(default_factory=list)
+    pending_agent_ids: list[str] = Field(default_factory=list)
+    pending_agent_names: list[str] = Field(default_factory=list)
+    available: bool
+    disabled_reason: str | None = None
+    inherited_usage: dict[str, int] = Field(default_factory=dict)
+    snapshot_available: bool
+    workspace_snapshot_available: bool
+    global_disabled_reason: str | None = None
+
+
+class RunResumeOptions(StrictModel):
+    source_run_id: str
+    project_id: str
+    checkpoints: list[RunResumeCheckpoint] = Field(default_factory=list)
+    snapshot_available: bool
+    global_disabled_reason: str | None = None
+
+
 class GateDecisionRequest(StrictModel):
     decision: Literal["approve", "reject"]
     comment: str | None = Field(default=None, max_length=2_000)
@@ -377,6 +405,8 @@ class RunSummary(StrictModel):
     error: str | None = None
     run_directory: str | None = None
     output_directory: str | None = None
+    resumed_from_run_id: str | None = None
+    resume_checkpoint_id: str | None = None
 
 
 class RunDetail(RunSummary):

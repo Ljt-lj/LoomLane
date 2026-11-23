@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import base64
 import ipaddress
-import itertools
 import json
 import os
 import re
@@ -384,8 +383,8 @@ def _save_generated_image(
         / f"{uuid.uuid4().hex}{extension}"
     )
     target = _safe_path(workspace, relative.as_posix())
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(data)
+    Path(_filesystem_path(target.parent)).mkdir(parents=True, exist_ok=True)
+    Path(_filesystem_path(target)).write_bytes(data)
     return {
         "path": relative.as_posix(),
         "media_type": media_type,
@@ -429,6 +428,16 @@ def _safe_path(root: Path, relative: str) -> Path:
     if target != resolved_root and resolved_root not in target.parents:
         raise WorkflowError(f"Path '{relative}' escaped the run workspace")
     return target
+
+
+def _filesystem_path(path: Path) -> str:
+    value = str(path)
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return value
+    resolved = str(path.resolve())
+    if resolved.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + resolved[2:]
+    return "\\\\?\\" + resolved
 
 
 def _validate_value(value: Any, port: dict[str, Any], workspace: Path) -> Any:
@@ -734,7 +743,7 @@ def _write_artifacts(
 ) -> list[dict[str, Any]]:
     output_dir = agent.get("output_dir") or "artifacts"
     directory = _safe_path(workspace, output_dir)
-    directory.mkdir(parents=True, exist_ok=True)
+    Path(_filesystem_path(directory)).mkdir(parents=True, exist_ok=True)
     artifacts: list[dict[str, Any]] = []
     for port in agent["outputs"]:
         safe_batch = re.sub(r"[^A-Za-z0-9_.-]", "_", batch_id)
@@ -749,19 +758,23 @@ def _write_artifacts(
         value = outputs[port["name"]]
         if port_type == "FILE":
             source = _safe_path(workspace, value["path"])
-            if not source.is_file():
+            source_io = Path(_filesystem_path(source))
+            if not source_io.is_file():
                 raise WorkflowError(
                     f"File output '{port['name']}' does not exist: {value['path']}"
                 )
             target = directory / f"{name}{source.suffix}"
-            shutil.copy2(source, target)
+            shutil.copy2(
+                _filesystem_path(source),
+                _filesystem_path(target),
+            )
         elif port_type == "DATA":
-            target.write_text(
+            Path(_filesystem_path(target)).write_text(
                 json.dumps(value, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
         else:
-            target.write_text(str(value), encoding="utf-8")
+            Path(_filesystem_path(target)).write_text(str(value), encoding="utf-8")
         artifacts.append(
             {
                 "agent_id": agent["id"],
@@ -770,14 +783,19 @@ def _write_artifacts(
                 "type": port_type,
                 "step": step,
                 "batch_id": batch_id,
-                "bytes": target.stat().st_size,
+                "bytes": Path(_filesystem_path(target)).stat().st_size,
             }
         )
     return artifacts
 
 
 class WorkflowRuntime:
-    def __init__(self, run_inputs: dict[str, Any], workspace: Path) -> None:
+    def __init__(
+        self,
+        run_inputs: dict[str, Any],
+        workspace: Path,
+        checkpoint_state: dict[str, Any] | None = None,
+    ) -> None:
         self.run_inputs = run_inputs
         self.workspace = workspace.resolve()
         self.events = EventWriter()
@@ -822,7 +840,7 @@ class WorkflowRuntime:
         }
         self._gate_executor: ThreadPoolExecutor | None = None
         self._stop_event = threading.Event()
-        self._batch_counter = itertools.count(1)
+        self._batch_counter = 1
         self.step = 0
         self.failed_node_id: str | None = None
         self._active_agents: set[str] = set()
@@ -835,9 +853,231 @@ class WorkflowRuntime:
         ).resolve()
         self.gate_dir.mkdir(parents=True, exist_ok=True)
         self.gate_counters: dict[str, int] = {}
+        self._checkpoint_dir = Path(
+            os.getenv(
+                "LOOMLANE_CHECKPOINT_DIR",
+                str(workspace.parent / "checkpoints"),
+            )
+        ).resolve()
+        self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self._checkpoint_counter = max(
+            (
+                int(path.stem.removeprefix("checkpoint-"))
+                for path in self._checkpoint_dir.glob("checkpoint-*.json")
+                if path.stem.removeprefix("checkpoint-").isdigit()
+            ),
+            default=0,
+        )
+        self._resume_info: dict[str, Any] | None = None
+        if checkpoint_state is not None:
+            self._restore_checkpoint(checkpoint_state)
 
     def _new_batch_id(self, prefix: str) -> str:
-        return f"{prefix}-{next(self._batch_counter)}"
+        batch_id = f"{prefix}-{self._batch_counter}"
+        self._batch_counter += 1
+        return batch_id
+
+    def _restore_checkpoint(self, state: dict[str, Any]) -> None:
+        raw_inputs = state.get("inputs")
+        if isinstance(raw_inputs, dict):
+            for agent_id, values in raw_inputs.items():
+                if agent_id in self.inputs and isinstance(values, dict):
+                    self.inputs[agent_id] = dict(values)
+
+        raw_batches = state.get("input_batches")
+        if isinstance(raw_batches, dict):
+            for agent_id, batches in raw_batches.items():
+                if agent_id not in self.input_batches or not isinstance(batches, dict):
+                    continue
+                self.input_batches[agent_id] = {
+                    str(batch_id): dict(values)
+                    for batch_id, values in batches.items()
+                    if isinstance(values, dict)
+                }
+
+        raw_outputs = state.get("outputs")
+        if isinstance(raw_outputs, dict):
+            self.outputs = {
+                str(agent_id): dict(values)
+                for agent_id, values in raw_outputs.items()
+                if agent_id in self.agents and isinstance(values, dict)
+            }
+
+        raw_traversals = state.get("traversals")
+        if isinstance(raw_traversals, dict):
+            for edge_id, count in raw_traversals.items():
+                if edge_id in self.traversals:
+                    self.traversals[edge_id] = int(count or 0)
+
+        raw_usage = state.get("usage")
+        if isinstance(raw_usage, dict):
+            self._merge_usage(self.usage, raw_usage)
+        raw_agent_usage = state.get("agent_usage")
+        if isinstance(raw_agent_usage, dict):
+            for agent_id, usage in raw_agent_usage.items():
+                if agent_id in self.agent_usage and isinstance(usage, dict):
+                    self._merge_usage(self.agent_usage[agent_id], usage)
+
+        raw_artifacts = state.get("artifacts")
+        if isinstance(raw_artifacts, list):
+            self.artifacts = [
+                dict(item) for item in raw_artifacts if isinstance(item, dict)
+            ]
+
+        raw_pending = state.get("pending")
+        if isinstance(raw_pending, list):
+            for item in raw_pending:
+                if not isinstance(item, dict):
+                    continue
+                agent_id = item.get("agent_id")
+                batch_id = item.get("batch_id")
+                inputs = item.get("inputs")
+                if (
+                    agent_id in self.agents
+                    and isinstance(batch_id, str)
+                    and isinstance(inputs, dict)
+                ):
+                    self.pending.append(
+                        AgentExecution(
+                            agent_id=agent_id,
+                            batch_id=batch_id,
+                            inputs=dict(inputs),
+                        )
+                    )
+
+        raw_scheduled = state.get("scheduled_batches")
+        if isinstance(raw_scheduled, list):
+            for item in raw_scheduled:
+                if not isinstance(item, dict):
+                    continue
+                agent_id = item.get("agent_id")
+                batch_id = item.get("batch_id")
+                if agent_id in self.agents and isinstance(batch_id, str):
+                    self.scheduled_batches.add((agent_id, batch_id))
+
+        raw_aggregates = state.get("aggregate_arrivals")
+        if isinstance(raw_aggregates, list):
+            for item in raw_aggregates:
+                if not isinstance(item, dict):
+                    continue
+                agent_id = item.get("agent_id")
+                batch_id = item.get("batch_id")
+                edge_ids = item.get("edge_ids")
+                if (
+                    agent_id in self.agents
+                    and isinstance(batch_id, str)
+                    and isinstance(edge_ids, list)
+                ):
+                    self.aggregate_arrivals[(agent_id, batch_id)] = {
+                        str(edge_id) for edge_id in edge_ids
+                    }
+
+        self.step = int(state.get("step", 0) or 0)
+        self._batch_counter = max(1, int(state.get("batch_counter", 1) or 1))
+        raw_gate_counters = state.get("gate_counters")
+        if isinstance(raw_gate_counters, dict):
+            self.gate_counters = {
+                str(edge_id): int(count or 0)
+                for edge_id, count in raw_gate_counters.items()
+            }
+        self._resume_info = {
+            "source_run_id": os.getenv("LOOMLANE_RESUME_SOURCE_RUN_ID")
+            or state.get("source_run_id", ""),
+            "checkpoint_id": os.getenv("LOOMLANE_RESUME_CHECKPOINT_ID")
+            or state.get("checkpoint_id"),
+            "completed_agent_ids": list(self.outputs),
+            "inherited_usage": dict(self.usage),
+            "agent_usage": {
+                agent_id: dict(usage)
+                for agent_id, usage in self.agent_usage.items()
+                if usage.get("total_tokens", 0)
+            },
+            "traversals": dict(self.traversals),
+            "artifacts": [dict(item) for item in self.artifacts],
+        }
+
+    def _save_checkpoint(self) -> None:
+        self._checkpoint_counter += 1
+        checkpoint_id = f"checkpoint-{self._checkpoint_counter:04d}"
+        payload = {
+            "checkpoint_version": 1,
+            "checkpoint_id": checkpoint_id,
+            "source_run_id": os.getenv("LOOMLANE_RUN_ID", "run"),
+            "step": self.step,
+            "agent_names": {
+                agent_id: agent["name"]
+                for agent_id, agent in self.agents.items()
+            },
+            "completed_agent_ids": [
+                agent_id for agent_id in self.agents if agent_id in self.outputs
+            ],
+            "pending_agent_ids": sorted(
+                {execution.agent_id for execution in self.pending}
+            ),
+            "inputs": self.inputs,
+            "input_batches": self.input_batches,
+            "outputs": self.outputs,
+            "traversals": self.traversals,
+            "usage": self.usage,
+            "agent_usage": self.agent_usage,
+            "artifacts": self.artifacts,
+            "pending": [
+                {
+                    "agent_id": execution.agent_id,
+                    "batch_id": execution.batch_id,
+                    "inputs": execution.inputs,
+                }
+                for execution in self.pending
+            ],
+            "scheduled_batches": [
+                {"agent_id": agent_id, "batch_id": batch_id}
+                for agent_id, batch_id in sorted(self.scheduled_batches)
+            ],
+            "aggregate_arrivals": [
+                {
+                    "agent_id": agent_id,
+                    "batch_id": batch_id,
+                    "edge_ids": sorted(edge_ids),
+                }
+                for (agent_id, batch_id), edge_ids in sorted(
+                    self.aggregate_arrivals.items()
+                )
+            ],
+            "batch_counter": self._batch_counter,
+            "gate_counters": self.gate_counters,
+        }
+        path = self._checkpoint_dir / f"{checkpoint_id}.json"
+        temporary = path.with_suffix(".tmp")
+        workspace_snapshot = (
+            self._checkpoint_dir / f"{checkpoint_id}.workspace"
+        )
+        workspace_snapshot_temporary = (
+            self._checkpoint_dir / f"{checkpoint_id}.workspace.tmp"
+        )
+        try:
+            if workspace_snapshot_temporary.exists():
+                shutil.rmtree(workspace_snapshot_temporary)
+            shutil.copytree(
+                _filesystem_path(self.workspace),
+                _filesystem_path(workspace_snapshot_temporary),
+            )
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            workspace_snapshot_temporary.replace(workspace_snapshot)
+            try:
+                temporary.replace(path)
+            except Exception:
+                shutil.rmtree(workspace_snapshot, ignore_errors=True)
+                raise
+        finally:
+            if workspace_snapshot_temporary.exists():
+                shutil.rmtree(
+                    workspace_snapshot_temporary,
+                    ignore_errors=True,
+                )
+            temporary.unlink(missing_ok=True)
 
     def _set_input(
         self,
@@ -1022,8 +1262,8 @@ class WorkflowRuntime:
         batch_id: str,
         fanout_batch_id: str | None = None,
     ) -> None:
+        self.traversals[edge["id"]] += 1
         if edge["type"] in {"FEEDBACK", "LOOP"}:
-            self.traversals[edge["id"]] += 1
             limit = edge.get("guard", {}).get("max_traversals")
             if limit is None:
                 limit = SDL["workflow"]["execution"].get(
@@ -1297,7 +1537,11 @@ class WorkflowRuntime:
 
     def run(self) -> dict[str, Any]:
         self.events.emit("run_started", data={"workflow": SDL["workflow"]["id"]})
-        self._initialize_inputs()
+        if self._resume_info is not None:
+            self.events.emit("run_resumed", data=self._resume_info)
+        else:
+            self._initialize_inputs()
+            self._save_checkpoint()
         executor = ThreadPoolExecutor(max_workers=self.max_parallel)
         self._gate_executor = ThreadPoolExecutor(max_workers=self.max_parallel)
         agent_futures: dict[Future[Any], AgentExecution] = {}
@@ -1386,6 +1630,8 @@ class WorkflowRuntime:
                         self._gate_executor,
                         gate_futures,
                     )
+                if not agent_futures and not gate_futures and self.pending:
+                    self._save_checkpoint()
 
             workflow_outputs = self._workflow_outputs()
             result = {
@@ -1398,6 +1644,16 @@ class WorkflowRuntime:
                 "edge_traversals": self.traversals,
                 "artifacts": self.artifacts,
                 "error": None,
+                "resumed_from_run_id": (
+                    self._resume_info["source_run_id"]
+                    if self._resume_info
+                    else None
+                ),
+                "resume_checkpoint_id": (
+                    self._resume_info["checkpoint_id"]
+                    if self._resume_info
+                    else None
+                ),
             }
             self.events.emit("run_finished", data={"status": "succeeded"})
             return result
@@ -1424,6 +1680,7 @@ def main() -> None:
         "--result",
         default=os.getenv("LOOMLANE_RESULT_PATH", "result.json"),
     )
+    parser.add_argument("--resume")
     args = parser.parse_args()
     input_path = Path(args.input)
     result_path = Path(args.result)
@@ -1432,7 +1689,18 @@ def main() -> None:
     runtime: WorkflowRuntime | None = None
     try:
         run_inputs = json.loads(input_path.read_text(encoding="utf-8"))
-        runtime = WorkflowRuntime(run_inputs, workspace)
+        checkpoint_state: dict[str, Any] | None = None
+        if args.resume:
+            checkpoint_payload = json.loads(
+                Path(args.resume).read_text(encoding="utf-8")
+            )
+            if (
+                not isinstance(checkpoint_payload, dict)
+                or checkpoint_payload.get("checkpoint_version") != 1
+            ):
+                raise WorkflowError("Unsupported workflow checkpoint")
+            checkpoint_state = checkpoint_payload
+        runtime = WorkflowRuntime(run_inputs, workspace, checkpoint_state)
         result = runtime.run()
         result.update(
             {
@@ -1465,6 +1733,16 @@ def main() -> None:
             "edge_traversals": runtime.traversals if runtime else {},
             "artifacts": runtime.artifacts if runtime else [],
             "error": str(exc),
+            "resumed_from_run_id": (
+                runtime._resume_info["source_run_id"]
+                if runtime and runtime._resume_info
+                else None
+            ),
+            "resume_checkpoint_id": (
+                runtime._resume_info["checkpoint_id"]
+                if runtime and runtime._resume_info
+                else None
+            ),
         }
         _write_result(result_path, result)
         events.emit("run_finished", data={"status": "failed", "error": str(exc)})

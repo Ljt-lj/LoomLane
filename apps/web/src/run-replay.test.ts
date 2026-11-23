@@ -82,6 +82,69 @@ describe('run replay', () => {
     ])
   })
 
+  it('restores inherited state when a run resumes from a checkpoint', () => {
+    const state = replayRunEvents([
+      event(1, 'run_started'),
+      event(2, 'run_resumed', {
+        source_run_id: 'source-run',
+        checkpoint_id: 'checkpoint-0003',
+        completed_agent_ids: ['brief', 'researcher'],
+        inherited_usage: {
+          prompt_tokens: 120,
+          completion_tokens: 80,
+          total_tokens: 200,
+        },
+        agent_usage: {
+          brief: { total_tokens: 70 },
+          researcher: { total_tokens: 130 },
+        },
+        traversals: {
+          'brief-to-research': 1,
+          'research-loop': 2,
+        },
+        artifacts: [
+          {
+            agent_id: 'brief',
+            port: 'brief',
+            path: 'artifacts/brief.txt',
+            type: 'TEXT',
+            step: 1,
+            batch_id: 'batch-start',
+            bytes: 64,
+          },
+        ],
+      }),
+      event(3, 'token_usage', { total_tokens: 25 }, 'reviewer'),
+    ])
+
+    expect(state.nodeStatuses.brief).toBe('succeeded')
+    expect(state.nodeStatuses.researcher).toBe('succeeded')
+    expect(state.tokenUsage).toBe(225)
+    expect(state.tokenUsageByAgent).toEqual({
+      brief: 70,
+      researcher: 130,
+      reviewer: 25,
+    })
+    expect(state.edgeTraversals).toEqual({
+      'brief-to-research': 1,
+      'research-loop': 2,
+    })
+    expect(state.artifacts).toEqual([
+      {
+        seq: 2,
+        agentId: 'brief',
+        port: 'brief',
+        path: 'artifacts/brief.txt',
+        type: 'TEXT',
+        step: 1,
+        batchId: 'batch-start',
+        bytes: 64,
+      },
+    ])
+    expect(state.resumedFromRunId).toBe('source-run')
+    expect(state.resumeCheckpointId).toBe('checkpoint-0003')
+  })
+
   it('tracks human gates and terminal failures', () => {
     const state = replayRunEvents([
       event(1, 'run_started'),

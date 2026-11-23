@@ -36,6 +36,8 @@ export interface RunReplayState {
   terminalStatus: RunStatus | null
   error: string | null
   lastSeq: number
+  resumedFromRunId: string | null
+  resumeCheckpointId: string | null
 }
 
 const TERMINAL_STATUSES = new Set<RunStatus>([
@@ -108,6 +110,8 @@ export function createEmptyRunReplayState(): RunReplayState {
     terminalStatus: null,
     error: null,
     lastSeq: 0,
+    resumedFromRunId: null,
+    resumeCheckpointId: null,
   }
 }
 
@@ -132,6 +136,8 @@ export function applyRunEvent(
   let gates = current.gates
   let terminalStatus = current.terminalStatus
   let error = current.error
+  let resumedFromRunId = current.resumedFromRunId
+  let resumeCheckpointId = current.resumeCheckpointId
   const state: RunReplayState = {
     ...current,
     events: [...current.events, event],
@@ -140,6 +146,90 @@ export function applyRunEvent(
   state.status = current.terminalStatus ?? 'running'
 
   if (event.type === 'run_started') {
+    state.status = 'running'
+  } else if (event.type === 'run_resumed') {
+    const completedAgentIds = Array.isArray(data.completed_agent_ids)
+      ? data.completed_agent_ids.filter(
+          (agentId): agentId is string =>
+            typeof agentId === 'string' && Boolean(agentId),
+        )
+      : []
+    if (completedAgentIds.length) {
+      nodeStatuses = {
+        ...nodeStatuses,
+        ...Object.fromEntries(
+          completedAgentIds.map((agentId) => [agentId, 'succeeded' as const]),
+        ),
+      }
+    }
+
+    const inheritedTraversals = data.traversals
+    if (
+      inheritedTraversals &&
+      typeof inheritedTraversals === 'object' &&
+      !Array.isArray(inheritedTraversals)
+    ) {
+      edgeTraversals = Object.fromEntries(
+        Object.entries(inheritedTraversals)
+          .map(([edgeId, count]) => [edgeId, numberValue(count)])
+          .filter((entry): entry is [string, number] => entry[1] !== null),
+      )
+    }
+
+    const inheritedUsage = data.inherited_usage
+    if (
+      inheritedUsage &&
+      typeof inheritedUsage === 'object' &&
+      !Array.isArray(inheritedUsage)
+    ) {
+      tokenUsage =
+        numberValue((inheritedUsage as Record<string, unknown>).total_tokens) ??
+        0
+    }
+    const inheritedAgentUsage = data.agent_usage
+    if (
+      inheritedAgentUsage &&
+      typeof inheritedAgentUsage === 'object' &&
+      !Array.isArray(inheritedAgentUsage)
+    ) {
+      tokenUsageByAgent = Object.fromEntries(
+        Object.entries(inheritedAgentUsage)
+          .map(([agentId, usage]) => {
+            if (!usage || typeof usage !== 'object' || Array.isArray(usage)) {
+              return [agentId, null] as const
+            }
+            return [
+              agentId,
+              numberValue((usage as Record<string, unknown>).total_tokens),
+            ] as const
+          })
+          .filter((entry): entry is readonly [string, number] => entry[1] !== null),
+      )
+    }
+
+    const inheritedArtifacts = data.artifacts
+    if (Array.isArray(inheritedArtifacts)) {
+      artifacts = inheritedArtifacts.flatMap((item, index) => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+        const artifact = item as Record<string, unknown>
+        const path = stringValue(artifact.path)
+        if (!path) return []
+        return [
+          {
+            seq: event.seq + index / 1000,
+            agentId: stringValue(artifact.agent_id),
+            port: stringValue(artifact.port) ?? '',
+            path,
+            type: stringValue(artifact.type) ?? 'FILE',
+            step: numberValue(artifact.step),
+            batchId: stringValue(artifact.batch_id),
+            bytes: numberValue(artifact.bytes),
+          },
+        ]
+      })
+    }
+    resumedFromRunId = stringValue(data.source_run_id)
+    resumeCheckpointId = stringValue(data.checkpoint_id)
     state.status = 'running'
   } else if (event.type === 'node_enter' && event.node_id) {
     nodeStatuses = { ...nodeStatuses, [event.node_id]: 'running' }
@@ -243,6 +333,8 @@ export function applyRunEvent(
   state.gates = gates
   state.terminalStatus = terminalStatus
   state.error = error
+  state.resumedFromRunId = resumedFromRunId
+  state.resumeCheckpointId = resumeCheckpointId
   if (!state.terminalStatus) state.status = statusFromGates(state)
   return state
 }

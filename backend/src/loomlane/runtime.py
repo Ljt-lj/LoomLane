@@ -25,9 +25,14 @@ from .models import (
     PendingHumanGate,
     ProjectDetail,
     RunDetail,
+    RunResumeCheckpoint,
+    RunResumeOptions,
+    RunResumeRequest,
     RunStartRequest,
     RunSummary,
+    SDL,
 )
+from .resume import checkpoint_entries
 from .secrets import CredentialError, CredentialStore
 from .storage import ProjectStore, _atomic_write_json, _atomic_write_text, utc_now
 
@@ -41,6 +46,10 @@ class RunNotFound(RunError):
 
 
 class ActiveRunExists(RunError):
+    pass
+
+
+class RunResumeConflict(RunError):
     pass
 
 
@@ -209,6 +218,11 @@ class RunManager:
                 workspace,
             )
             _atomic_write_json(run_root / "input.json", prepared_inputs)
+            _atomic_write_json(
+                run_root / "workflow.snapshot.json",
+                project.sdl.canonical_dict(),
+            )
+            (run_root / "checkpoints").mkdir(parents=True, exist_ok=False)
         except Exception:
             if run_root.exists():
                 shutil.rmtree(run_root, ignore_errors=True)
@@ -234,7 +248,183 @@ class RunManager:
             self._active_by_project[project_id] = live
             self._live[run_id] = live
             live.task = asyncio.create_task(
-                self._execute(live, Path(generated.generated_path), env)
+                self._execute(
+                    live,
+                    Path(generated.generated_path),
+                    env,
+                    resume_checkpoint=None,
+                )
+            )
+        return summary
+
+    async def resume_options(self, source_run_id: str) -> RunResumeOptions:
+        source_root, project = self._find_run(source_run_id)
+        async with self._lock:
+            if project.id in self._active_by_project:
+                raise ActiveRunExists("This project already has an active run")
+        return await self._build_resume_options(source_root, project)
+
+    async def _build_resume_options(
+        self,
+        source_root: Path,
+        project: ProjectDetail,
+    ) -> RunResumeOptions:
+        source = self._read_meta(source_root / "meta.json")
+        if source.status not in {"succeeded", "failed", "cancelled"}:
+            raise RunResumeConflict(
+                "Only a terminal run can be used as a resume source"
+            )
+        summaries = await self.list_for_project(project.id)
+        latest = summaries[0] if summaries else None
+        if latest is None or latest.run_id != source.run_id:
+            raise RunResumeConflict(
+                "Only the project's most recent run can be resumed"
+            )
+
+        source_snapshot: SDL | None = None
+        snapshot_path = source_root / "workflow.snapshot.json"
+        if snapshot_path.exists():
+            try:
+                source_snapshot = SDL.model_validate(
+                    json.loads(snapshot_path.read_text(encoding="utf-8"))
+                )
+            except (OSError, ValueError, TypeError, ValidationError):
+                source_snapshot = None
+
+        entries, global_reason = checkpoint_entries(
+            source_root,
+            source_snapshot,
+            project.sdl,
+        )
+        checkpoints = [
+            RunResumeCheckpoint.model_validate(item) for item in entries
+        ]
+        if not checkpoints and global_reason is None:
+            global_reason = "该运行没有可用的检查点"
+        return RunResumeOptions(
+            source_run_id=source.run_id,
+            project_id=project.id,
+            checkpoints=checkpoints,
+            snapshot_available=source_snapshot is not None,
+            global_disabled_reason=global_reason,
+        )
+
+    async def resume(
+        self,
+        project_id: str,
+        request: RunResumeRequest,
+    ) -> RunSummary:
+        project = self.store.get(project_id)
+        source_root, source_project = self._find_run(request.source_run_id)
+        if source_project.id != project_id:
+            raise RunResumeConflict("Source run belongs to a different project")
+        async with self._lock:
+            if project_id in self._active_by_project:
+                raise ActiveRunExists("This project already has an active run")
+
+        options = await self._build_resume_options(source_root, project)
+        checkpoint = next(
+            (
+                item
+                for item in options.checkpoints
+                if item.checkpoint_id == request.checkpoint_id
+            ),
+            None,
+        )
+        if checkpoint is None:
+            raise RunResumeConflict("Resume checkpoint was not found")
+        if not checkpoint.available:
+            raise RunResumeConflict(
+                checkpoint.disabled_reason or "Resume checkpoint is not available"
+            )
+        if not re.fullmatch(r"checkpoint-\d{4,}", request.checkpoint_id):
+            raise RunResumeConflict("Invalid resume checkpoint id")
+
+        source_checkpoint = (
+            source_root / "checkpoints" / f"{request.checkpoint_id}.json"
+        )
+        source_workspace = (
+            source_root
+            / "checkpoints"
+            / f"{request.checkpoint_id}.workspace"
+        )
+        source_input = source_root / "input.json"
+        if (
+            not source_checkpoint.is_file()
+            or not source_workspace.is_dir()
+            or not source_input.is_file()
+        ):
+            raise RunResumeConflict("Source run data is incomplete")
+
+        generated = self.compiler.compile(
+            project.sdl,
+            self.store.project_path(project_id),
+        )
+        self.store.set_last_build(project_id, generated.compiler_key)
+
+        run_id = uuid4().hex
+        started_at = utc_now()
+        project_name = _safe_path_component(project.name, "project")
+        timestamp = started_at.strftime("%Y%m%d-%H%M%S")
+        run_directory = f"{project_name}__{timestamp}__{run_id[:8]}"
+        run_root = self.store.project_path(project_id) / "runs" / run_directory
+        workspace = run_root / "workspace"
+        artifacts = workspace / "artifacts"
+        checkpoint_dir = run_root / "checkpoints"
+        env = self._runtime_environment(project, run_id, generated, run_root)
+        env.update(
+            {
+                "LOOMLANE_RESUME_SOURCE_RUN_ID": request.source_run_id,
+                "LOOMLANE_RESUME_CHECKPOINT_ID": request.checkpoint_id,
+            }
+        )
+        try:
+            run_root.mkdir(parents=True, exist_ok=False)
+            shutil.copytree(source_workspace, workspace)
+            artifacts.mkdir(parents=True, exist_ok=True)
+            (run_root / "gates").mkdir(parents=True, exist_ok=False)
+            checkpoint_dir.mkdir(parents=True, exist_ok=False)
+            shutil.copy2(source_input, run_root / "input.json")
+            shutil.copy2(
+                source_checkpoint,
+                checkpoint_dir / source_checkpoint.name,
+            )
+            _atomic_write_json(
+                run_root / "workflow.snapshot.json",
+                project.sdl.canonical_dict(),
+            )
+        except Exception:
+            if run_root.exists():
+                shutil.rmtree(run_root, ignore_errors=True)
+            raise
+
+        summary = RunSummary(
+            run_id=run_id,
+            project_id=project_id,
+            status="queued",
+            created_at=started_at,
+            run_directory=run_directory,
+            output_directory=str(artifacts),
+            resumed_from_run_id=request.source_run_id,
+            resume_checkpoint_id=request.checkpoint_id,
+        )
+        _atomic_write_json(run_root / "meta.json", summary.model_dump(mode="json"))
+        _atomic_write_text(run_root / "events.jsonl", "")
+
+        live = _LiveRun(run_id=run_id, project_id=project_id, run_root=run_root)
+        async with self._lock:
+            if project_id in self._active_by_project:
+                shutil.rmtree(run_root, ignore_errors=True)
+                raise ActiveRunExists("This project already has an active run")
+            self._active_by_project[project_id] = live
+            self._live[run_id] = live
+            live.task = asyncio.create_task(
+                self._execute(
+                    live,
+                    Path(generated.generated_path),
+                    env,
+                    resume_checkpoint=checkpoint_dir / source_checkpoint.name,
+                )
             )
         return summary
 
@@ -350,6 +540,7 @@ class RunManager:
             "LOOMLANE_RUN_ID": run_id,
             "LOOMLANE_WORKFLOW_HASH": generated.compiler_key,
             "LOOMLANE_GATE_DIR": str(run_root / "gates"),
+            "LOOMLANE_CHECKPOINT_DIR": str(run_root / "checkpoints"),
         }
         for profile in project.sdl.api_profiles:
             try:
@@ -378,6 +569,7 @@ class RunManager:
         live: _LiveRun,
         generated_root: Path,
         env: dict[str, str],
+        resume_checkpoint: Path | None,
     ) -> None:
         await self._set_meta(live, status="running", started_at=utc_now())
         stdout_task: asyncio.Task[None] | None = None
@@ -401,6 +593,8 @@ class RunManager:
                 "--result",
                 str(live.run_root / "result.json"),
             ]
+            if resume_checkpoint is not None:
+                command.extend(["--resume", str(resume_checkpoint)])
             creation_flags = (
                 subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             )
