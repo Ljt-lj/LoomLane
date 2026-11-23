@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import subprocess
@@ -110,6 +111,10 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
 class ScriptedOpenAIHandler(BaseHTTPRequestHandler):
     responder: Any = None
     calls: list[dict[str, Any]] = []
+    image_calls: list[dict[str, Any]] = []
+    image_paths: list[str] = []
+    image_response: dict[str, Any] | None = None
+    image_status: int = 200
     active = 0
     max_active = 0
     lock = threading.Lock()
@@ -119,6 +124,32 @@ class ScriptedOpenAIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path.endswith(
+            ("/images/generations", "/sdapi/v1/txt2img")
+        ):
+            with type(self).lock:
+                type(self).image_calls.append(body)
+                type(self).image_paths.append(self.path)
+                type(self).active += 1
+                type(self).max_active = max(
+                    type(self).max_active,
+                    type(self).active,
+                )
+            try:
+                payload = type(self).image_response or {
+                    "data": [{"b64_json": ""}]
+                }
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(type(self).image_status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+            finally:
+                with type(self).lock:
+                    type(self).active -= 1
+            return
+
         with type(self).lock:
             type(self).calls.append(body)
             type(self).active += 1
@@ -172,6 +203,10 @@ def fake_openai() -> str:
 @pytest.fixture
 def scripted_openai():
     ScriptedOpenAIHandler.calls = []
+    ScriptedOpenAIHandler.image_calls = []
+    ScriptedOpenAIHandler.image_paths = []
+    ScriptedOpenAIHandler.image_response = None
+    ScriptedOpenAIHandler.image_status = 200
     ScriptedOpenAIHandler.active = 0
     ScriptedOpenAIHandler.max_active = 0
     ScriptedOpenAIHandler.responder = None
@@ -230,6 +265,7 @@ def _graph_sdl(
     workflow_inputs: list[dict[str, Any]] | None = None,
     workflow_outputs: list[dict[str, Any]] | None = None,
     execution: dict[str, Any] | None = None,
+    api_profiles: list[dict[str, Any]] | None = None,
 ) -> SDL:
     return SDL.model_validate(
         {
@@ -249,7 +285,8 @@ def _graph_sdl(
                 },
             },
             "start": start,
-            "api_profiles": [
+            "api_profiles": api_profiles
+            or [
                 {
                     "id": "local",
                     "name": "Local",
@@ -271,6 +308,54 @@ def _graph_sdl(
             ],
             "edges": edges,
         }
+    )
+
+
+def _image_sdl(
+    base_url: str,
+    *,
+    protocol: str | None = "openai_images",
+    response_format: str = "b64_json",
+    size: str = "512x512",
+    model: str = "image-test-model",
+) -> SDL:
+    return _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "painter",
+                "name": "Painter",
+                "api_profile": "local",
+                "mode": "image",
+                "system_prompt": "Draw a polished editorial illustration.",
+                "inputs": [{"name": "brief", "type": "TEXT", "required": True}],
+                "outputs": [{"name": "picture", "type": "FILE"}],
+            }
+        ],
+        edges=[],
+        start=["painter"],
+        workflow_inputs=[
+            {"name": "brief", "type": "TEXT", "required": True}
+        ],
+        workflow_outputs=[
+            {"name": "picture", "agent": "painter", "port": "picture"}
+        ],
+        api_profiles=[
+            {
+                "id": "local",
+                "name": "Image service",
+                "base_url": base_url,
+                "model": model,
+                "capabilities": {"image_generation": True},
+                "image_generation": {
+                    **({"protocol": protocol} if protocol is not None else {}),
+                    "size": size,
+                    "quality": "high",
+                    "output_format": "png",
+                    "response_format": response_format,
+                },
+            }
+        ],
     )
 
 
@@ -546,6 +631,368 @@ async def test_agent_json_output_enables_response_format(
     assert '"sections": "章节标题字符串数组"' in drafter_calls[0]["messages"][0][
         "content"
     ]
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_image_agent_saves_base64_image_and_file_artifact(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, _ = scripted_openai
+    image_bytes = b"\x89PNG\r\n\x1a\nimage-test"
+    ScriptedOpenAIHandler.image_response = {
+        "data": [{"b64_json": base64.b64encode(image_bytes).decode("ascii")}],
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 0,
+            "total_tokens": 12,
+        },
+    }
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("image generation", _image_sdl(base_url))
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"brief": "a quiet editorial cover"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    assert len(ScriptedOpenAIHandler.calls) == 0
+    assert len(ScriptedOpenAIHandler.image_calls) == 1
+    request = ScriptedOpenAIHandler.image_calls[0]
+    assert request["model"] == "image-test-model"
+    assert request["size"] == "512x512"
+    assert request["quality"] == "high"
+    assert request["output_format"] == "png"
+    assert request["response_format"] == "b64_json"
+    assert "a quiet editorial cover" in request["prompt"]
+    assert "temperature" not in request
+    assert "max_tokens" not in request
+
+    reference = detail.result["workflow_outputs"]["picture"]
+    assert reference["media_type"] == "image/png"
+    assert reference["path"].startswith("generated/images/painter/")
+    assert reference["path"].endswith(".png")
+    assert summary.run_directory is not None
+    run_workspace = (
+        store.project_path(project.id)
+        / "runs"
+        / summary.run_directory
+        / "workspace"
+    )
+    assert (run_workspace / reference["path"]).read_bytes() == image_bytes
+    artifact = next(
+        event["data"]
+        for event in detail.events
+        if event["type"] == "artifact_written"
+    )
+    assert artifact["port"] == "picture"
+    assert artifact["type"] == "FILE"
+    assert (run_workspace / artifact["path"]).read_bytes() == image_bytes
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_chat_agent_normalizes_file_path_string_to_reference(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, configure = scripted_openai
+    image_bytes = b"\x89PNG\r\n\x1a\npassthrough-test"
+    ScriptedOpenAIHandler.image_response = {
+        "data": [{"b64_json": base64.b64encode(image_bytes).decode("ascii")}]
+    }
+
+    def respond(body: dict[str, Any]) -> dict[str, Any]:
+        inputs = _agent_inputs(body)
+        return {
+            "picture": inputs["picture"]["path"],
+            "result": "图片已转交",
+        }
+
+    configure(respond)
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "painter",
+                "name": "Painter",
+                "api_profile": "local",
+                "mode": "image",
+                "system_prompt": "Draw a polished illustration.",
+                "inputs": [{"name": "brief", "type": "TEXT"}],
+                "outputs": [{"name": "picture", "type": "FILE"}],
+            },
+            {
+                "id": "reporter",
+                "name": "Reporter",
+                "api_profile": "local",
+                "system_prompt": "Return the supplied picture path and a short report.",
+                "inputs": [{"name": "picture", "type": "FILE"}],
+                "outputs": [
+                    {"name": "picture", "type": "FILE"},
+                    {"name": "result", "type": "TEXT"},
+                ],
+            },
+        ],
+        edges=[
+            {
+                "id": "painter-to-reporter",
+                "from": "painter",
+                "to": "reporter",
+                "type": "PIPE",
+                "mappings": [{"from": "picture", "to": "picture"}],
+            }
+        ],
+        start=["painter"],
+        workflow_inputs=[{"name": "brief", "type": "TEXT"}],
+        workflow_outputs=[
+            {"name": "picture", "agent": "reporter", "port": "picture"},
+            {"name": "result", "agent": "reporter", "port": "result"},
+        ],
+        api_profiles=[
+            {
+                "id": "local",
+                "name": "Image service",
+                "base_url": base_url,
+                "model": "image-test-model",
+                "capabilities": {"image_generation": True},
+                "image_generation": {
+                    "protocol": "openai_images",
+                    "size": "512x512",
+                    "response_format": "b64_json",
+                },
+            }
+        ],
+    )
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("file passthrough", sdl)
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"brief": "a test image"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    painter_reference = detail.result["agent_outputs"]["painter"]["picture"]
+    reporter_reference = detail.result["agent_outputs"]["reporter"]["picture"]
+    assert reporter_reference == {"path": painter_reference["path"]}
+    assert detail.result["workflow_outputs"]["picture"] == reporter_reference
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_siliconflow_image_agent_uses_protocol_specific_request_and_response(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, _ = scripted_openai
+    image_bytes = b"\x89PNG\r\n\x1a\nsiliconflow-test"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    ScriptedOpenAIHandler.image_response = {
+        "images": [{"url": f"data:image/png;base64,{encoded}"}]
+    }
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create(
+        "siliconflow image generation",
+        _image_sdl(
+            base_url,
+            protocol="siliconflow",
+            size="1024\u00d71024",
+            model="Kwai-Kolors/Kolors",
+        ),
+    )
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"brief": "a calm product illustration"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    assert len(ScriptedOpenAIHandler.calls) == 0
+    assert len(ScriptedOpenAIHandler.image_calls) == 1
+    request = ScriptedOpenAIHandler.image_calls[0]
+    assert request["model"] == "Kwai-Kolors/Kolors"
+    assert request["image_size"] == "1024x1024"
+    assert request["batch_size"] == 1
+    assert "a calm product illustration" in request["prompt"]
+    for field in ("size", "quality", "output_format", "response_format"):
+        assert field not in request
+
+    reference = detail.result["workflow_outputs"]["picture"]
+    assert reference["media_type"] == "image/png"
+    assert reference["path"].startswith("generated/images/painter/")
+    run_workspace = (
+        store.project_path(project.id)
+        / "runs"
+        / summary.run_directory
+        / "workspace"
+    )
+    assert (run_workspace / reference["path"]).read_bytes() == image_bytes
+    artifact = next(
+        event["data"]
+        for event in detail.events
+        if event["type"] == "artifact_written"
+    )
+    assert artifact["port"] == "picture"
+    assert artifact["type"] == "FILE"
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_siliconflow_kolors_rejects_unsupported_image_size(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, _ = scripted_openai
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create(
+        "unsupported siliconflow image size",
+        _image_sdl(
+            base_url,
+            protocol="siliconflow",
+            size="512\u00d7512",
+            model="Kwai-Kolors/Kolors",
+        ),
+    )
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"brief": "an unsupported image size"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "failed"
+    assert "does not support image size '512x512'" in detail.error
+    assert len(ScriptedOpenAIHandler.image_calls) == 0
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_image_agent_defaults_to_automatic1111_local_txt2img_api(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, _ = scripted_openai
+    local_base_url = base_url.removesuffix("/v1")
+    image_bytes = b"\x89PNG\r\n\x1a\nautomatic1111-test"
+    ScriptedOpenAIHandler.image_response = {
+        "images": [base64.b64encode(image_bytes).decode("ascii")]
+    }
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create(
+        "automatic1111 image generation",
+        _image_sdl(local_base_url, protocol=None),
+    )
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"brief": "a local editorial illustration"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    assert len(ScriptedOpenAIHandler.calls) == 0
+    assert ScriptedOpenAIHandler.image_paths == ["/sdapi/v1/txt2img"]
+    assert len(ScriptedOpenAIHandler.image_calls) == 1
+    request = ScriptedOpenAIHandler.image_calls[0]
+    assert request["width"] == 512
+    assert request["height"] == 512
+    assert request["steps"] == 28
+    assert request["cfg_scale"] == 7
+    assert request["sampler_name"] == "DPM++ 2M Karras"
+    assert request["batch_size"] == 1
+    assert "a local editorial illustration" in request["prompt"]
+    for field in (
+        "model",
+        "size",
+        "quality",
+        "output_format",
+        "response_format",
+    ):
+        assert field not in request
+
+    reference = detail.result["workflow_outputs"]["picture"]
+    assert reference["media_type"] == "image/png"
+    assert reference["path"].startswith("generated/images/painter/")
+    run_workspace = (
+        store.project_path(project.id)
+        / "runs"
+        / summary.run_directory
+        / "workspace"
+    )
+    assert (run_workspace / reference["path"]).read_bytes() == image_bytes
+    artifact = next(
+        event["data"]
+        for event in detail.events
+        if event["type"] == "artifact_written"
+    )
+    assert artifact["port"] == "picture"
+    assert artifact["type"] == "FILE"
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_image_agent_rejects_non_image_bytes(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, _ = scripted_openai
+    ScriptedOpenAIHandler.image_response = {
+        "data": [
+            {
+                "b64_json": base64.b64encode(b"not an image").decode("ascii")
+            }
+        ]
+    }
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("invalid image", _image_sdl(base_url))
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"brief": "invalid image"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "failed"
+    assert "not a supported PNG, JPEG, or WebP image" in detail.error
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_image_agent_rejects_non_public_image_url(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, _ = scripted_openai
+    ScriptedOpenAIHandler.image_response = {
+        "data": [{"url": "http://127.0.0.1/image.png"}]
+    }
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create(
+        "private image url",
+        _image_sdl(base_url, response_format="url"),
+    )
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"brief": "private url"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "failed"
+    assert "non-public address" in detail.error
     await manager.shutdown()
 
 
