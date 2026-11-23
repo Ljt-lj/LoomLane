@@ -7,6 +7,7 @@ import type {
   ProjectDetail,
   ProjectSummary,
   RunDetail,
+  RunResumeOptions,
   RunStartRequest,
   RunSummary,
   SDL,
@@ -25,6 +26,11 @@ const BACKEND_TARGET =
 
 interface RunStartRequestShape {
   inputs: Record<string, unknown>
+}
+
+interface RunResumeRequestShape {
+  source_run_id: string
+  checkpoint_id: string
 }
 
 function endpoint(path: string) {
@@ -333,6 +339,15 @@ export const api = {
     request<RunSummary[]>(`/api/projects/${projectId}/runs`),
 
   getRun: (runId: string) => request<RunDetail>(`/api/runs/${runId}`),
+
+  resumeOptions: (runId: string) =>
+    request<RunResumeOptions>(`/api/runs/${runId}/resume-options`),
+
+  resumeRun: (projectId: string, payload: RunResumeRequestShape) =>
+    request<RunSummary>(`/api/projects/${projectId}/runs/resume`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   openRunFolder: (runId: string) =>
     request<OpenFolderResponse>(`/api/runs/${runId}/open-folder`, {

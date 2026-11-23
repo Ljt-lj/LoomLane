@@ -229,6 +229,35 @@ export interface RunSummary {
   error: string | null
   run_directory: string | null
   output_directory: string | null
+  resumed_from_run_id: string | null
+  resume_checkpoint_id: string | null
+}
+
+export interface RunResumeCheckpoint {
+  checkpoint_id: string
+  step: number
+  completed_agent_ids: string[]
+  completed_agent_names: string[]
+  pending_agent_ids: string[]
+  pending_agent_names: string[]
+  available: boolean
+  disabled_reason: string | null
+  inherited_usage: {
+    prompt_tokens?: number
+    completion_tokens?: number
+    total_tokens?: number
+  }
+  snapshot_available: boolean
+  workspace_snapshot_available: boolean
+  global_disabled_reason: string | null
+}
+
+export interface RunResumeOptions {
+  source_run_id: string
+  project_id: string
+  checkpoints: RunResumeCheckpoint[]
+  snapshot_available: boolean
+  global_disabled_reason: string | null
 }
 
 export interface PendingHumanGate {

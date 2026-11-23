@@ -25,6 +25,8 @@ from .models import (
     ProjectSummary,
     ProjectUpdateRequest,
     RunDetail,
+    RunResumeOptions,
+    RunResumeRequest,
     RunStartRequest,
     RunSummary,
     SecretImportRequest,
@@ -42,6 +44,7 @@ from .runtime import (
     RunConfigurationError,
     RunManager,
     RunNotFound,
+    RunResumeConflict,
 )
 from .secrets import CredentialError, CredentialStore
 from .storage import (
@@ -147,6 +150,13 @@ def create_app(
 
     @app.exception_handler(ActiveRunExists)
     async def active_run_exists(_: Request, exc: ActiveRunExists) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": str(exc)},
+        )
+
+    @app.exception_handler(RunResumeConflict)
+    async def run_resume_conflict(_: Request, exc: RunResumeConflict) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exc)},
@@ -488,6 +498,18 @@ def create_app(
         return await run_manager.start(project_id, payload)
 
     @app.post(
+        "/api/projects/{project_id}/runs/resume",
+        response_model=RunSummary,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def resume_run(
+        project_id: str,
+        payload: RunResumeRequest,
+    ) -> RunSummary:
+        project_or_404(project_id)
+        return await run_manager.resume(project_id, payload)
+
+    @app.post(
         "/api/projects/{project_id}/input-files",
         response_model=InputFileRef,
         status_code=status.HTTP_201_CREATED,
@@ -517,6 +539,13 @@ def create_app(
     @app.get("/api/runs/{run_id}", response_model=RunDetail)
     async def get_run(run_id: str) -> RunDetail:
         return await run_manager.get(run_id)
+
+    @app.get(
+        "/api/runs/{run_id}/resume-options",
+        response_model=RunResumeOptions,
+    )
+    async def get_resume_options(run_id: str) -> RunResumeOptions:
+        return await run_manager.resume_options(run_id)
 
     @app.post(
         "/api/runs/{run_id}/open-folder",

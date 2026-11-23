@@ -30,6 +30,18 @@ from loomlane.runtime import GateConflict, RunManager
 from loomlane.storage import ProjectStore
 
 
+def _read_bytes(path: Path) -> bytes:
+    value = str(path)
+    if os.name == "nt" and not value.startswith("\\\\?\\"):
+        resolved = str(path.resolve())
+        value = (
+            "\\\\?\\UNC\\" + resolved[2:]
+            if resolved.startswith("\\\\")
+            else "\\\\?\\" + resolved
+        )
+    return Path(value).read_bytes()
+
+
 class MemoryCredentials:
     def get(self, project_id: str, profile_id: str, base_url: str) -> str | None:
         return None
@@ -683,7 +695,7 @@ async def test_image_agent_saves_base64_image_and_file_artifact(
         / summary.run_directory
         / "workspace"
     )
-    assert (run_workspace / reference["path"]).read_bytes() == image_bytes
+    assert _read_bytes(run_workspace / reference["path"]) == image_bytes
     artifact = next(
         event["data"]
         for event in detail.events
@@ -691,7 +703,7 @@ async def test_image_agent_saves_base64_image_and_file_artifact(
     )
     assert artifact["port"] == "picture"
     assert artifact["type"] == "FILE"
-    assert (run_workspace / artifact["path"]).read_bytes() == image_bytes
+    assert _read_bytes(run_workspace / artifact["path"]) == image_bytes
     await manager.shutdown()
 
 
@@ -835,7 +847,7 @@ async def test_siliconflow_image_agent_uses_protocol_specific_request_and_respon
         / summary.run_directory
         / "workspace"
     )
-    assert (run_workspace / reference["path"]).read_bytes() == image_bytes
+    assert _read_bytes(run_workspace / reference["path"]) == image_bytes
     artifact = next(
         event["data"]
         for event in detail.events
@@ -930,7 +942,7 @@ async def test_image_agent_defaults_to_automatic1111_local_txt2img_api(
         / summary.run_directory
         / "workspace"
     )
-    assert (run_workspace / reference["path"]).read_bytes() == image_bytes
+    assert _read_bytes(run_workspace / reference["path"]) == image_bytes
     artifact = next(
         event["data"]
         for event in detail.events

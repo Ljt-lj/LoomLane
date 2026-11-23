@@ -46,6 +46,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
   Settings2,
   SkipBack,
@@ -97,6 +98,7 @@ import type {
   ProjectDetail,
   RunDetail,
   RunEvent,
+  RunResumeOptions,
   RunSummary,
   SDL,
   SecretStatus,
@@ -137,6 +139,7 @@ const EDGE_TYPES: EdgeType[] = [
 ]
 const EVENT_TYPES = [
   'run_started',
+  'run_resumed',
   'node_enter',
   'node_exit',
   'edge_traversed',
@@ -798,6 +801,14 @@ function App() {
   const [currentRun, setCurrentRun] = useState<RunSummary | RunDetail | null>(
     null,
   )
+  const [resumeOptions, setResumeOptions] =
+    useState<RunResumeOptions | null>(null)
+  const [resumePanelOpen, setResumePanelOpen] = useState(false)
+  const [resumeCheckpointId, setResumeCheckpointId] = useState<string | null>(
+    null,
+  )
+  const [resumeLoading, setResumeLoading] = useState(false)
+  const [resuming, setResuming] = useState(false)
   const [runEvents, setRunEvents] = useState<RunEvent[]>([])
   const [replaySeq, setReplaySeq] = useState<number | null>(null)
   const [replayPlaying, setReplayPlaying] = useState(false)
@@ -1039,6 +1050,25 @@ function App() {
         : false
     },
   })
+  const latestRun = runsQuery.data?.[0] ?? null
+  const hasActiveRun =
+    runsQuery.data?.some((run) =>
+      ['queued', 'running', 'waiting'].includes(run.status),
+    ) ||
+    Boolean(
+      currentRun &&
+        ['queued', 'running', 'waiting'].includes(currentRun.status),
+    )
+  const resumeCandidate =
+    latestRun &&
+    TERMINAL_RUN_STATUSES.has(latestRun.status) &&
+    !hasActiveRun
+      ? latestRun
+      : null
+  const selectedResumeCheckpoint =
+    resumeOptions?.checkpoints.find(
+      (checkpoint) => checkpoint.checkpoint_id === resumeCheckpointId,
+    ) ?? null
 
   const showNotice = useCallback(
     (tone: Notice['tone'], message: string) => {
@@ -1608,6 +1638,9 @@ function App() {
     }
 
     eventSourceRef.current?.close()
+    setResumePanelOpen(false)
+    setResumeOptions(null)
+    setResumeCheckpointId(null)
     setRunEvents([])
     setReplaySeq(null)
     setReplayPlaying(false)
@@ -1637,6 +1670,77 @@ function App() {
     }
   }
 
+  async function openResumeOptions(run: RunSummary) {
+    setResumePanelOpen(true)
+    setResumeLoading(true)
+    setResumeOptions(null)
+    setResumeCheckpointId(null)
+    try {
+      const saved = await saveProject()
+      if (!saved) {
+        setResumePanelOpen(false)
+        return
+      }
+      const options = await api.resumeOptions(run.run_id)
+      setResumeOptions(options)
+      setResumeCheckpointId(
+        options.checkpoints.find((checkpoint) => checkpoint.available)
+          ?.checkpoint_id ?? null,
+      )
+    } catch (error) {
+      setResumePanelOpen(false)
+      showNotice(
+        'error',
+        errorMessage(error, '断点重跑选项读取失败'),
+      )
+    } finally {
+      setResumeLoading(false)
+    }
+  }
+
+  async function resumeFromCheckpoint() {
+    if (
+      !resumeOptions ||
+      !resumeCheckpointId ||
+      !selectedResumeCheckpoint?.available ||
+      resuming
+    ) {
+      return
+    }
+    setResuming(true)
+    try {
+      const saved = await saveProject()
+      if (!saved) return
+      const summary = await api.resumeRun(saved.id, {
+        source_run_id: resumeOptions.source_run_id,
+        checkpoint_id: resumeCheckpointId,
+      })
+      eventSourceRef.current?.close()
+      setRunEvents([])
+      setReplaySeq(null)
+      setReplayPlaying(false)
+      setGateComments({})
+      setDrawerTab('events')
+      setCurrentRun(summary)
+      setResumePanelOpen(false)
+      setResumeOptions(null)
+      setResumeCheckpointId(null)
+      connectRunEvents(summary.run_id)
+      queryClient.invalidateQueries({ queryKey: ['runs', saved.id] })
+      showNotice(
+        'success',
+        `已从 ${resumeCheckpointId} 恢复运行`,
+      )
+    } catch (error) {
+      showNotice(
+        'error',
+        errorMessage(error, '断点重跑启动失败'),
+      )
+    } finally {
+      setResuming(false)
+    }
+  }
+
   async function openRunFolder(run: RunSummary | RunDetail | null) {
     if (!run) return
     try {
@@ -1652,6 +1756,9 @@ function App() {
 
   async function loadRun(run: RunSummary) {
     eventSourceRef.current?.close()
+    setResumePanelOpen(false)
+    setResumeOptions(null)
+    setResumeCheckpointId(null)
     try {
       const detail = await api.getRun(run.run_id)
       setCurrentRun(detail)
@@ -1717,6 +1824,9 @@ function App() {
     if (nextProjectId === projectId) return
     if (dirty && !window.confirm('当前项目有未保存修改，仍要切换吗？')) return
     eventSourceRef.current?.close()
+    setResumePanelOpen(false)
+    setResumeOptions(null)
+    setResumeCheckpointId(null)
     setProjectId(nextProjectId)
     setDraft(null)
     setDirty(false)
@@ -4297,6 +4407,145 @@ function App() {
                   <FolderOpen size={13} />
                   <span>{currentRun.run_directory}</span>
                 </button>
+              )}
+              {currentRun?.resumed_from_run_id && (
+                <div
+                  className="run-resume-origin"
+                  title={currentRun.resumed_from_run_id}
+                >
+                  <RotateCcw size={12} />
+                  <span>
+                    {currentRun.resumed_from_run_id.slice(0, 8)} /{' '}
+                    {currentRun.resume_checkpoint_id}
+                  </span>
+                </div>
+              )}
+              {resumeCandidate && (
+                <div className="resume-control">
+                  <button
+                    className="resume-trigger"
+                    type="button"
+                    aria-expanded={resumePanelOpen}
+                    onClick={() => {
+                      if (resumePanelOpen) {
+                        setResumePanelOpen(false)
+                      } else {
+                        void openResumeOptions(resumeCandidate)
+                      }
+                    }}
+                  >
+                    <RotateCcw size={13} />
+                    <span>断点重跑</span>
+                    <small>{resumeCandidate.run_id.slice(0, 8)}</small>
+                  </button>
+                  {resumePanelOpen && (
+                    <div className="resume-options">
+                      {resumeLoading ? (
+                        <div className="resume-loading">
+                          <LoaderCircle size={14} className="spin" />
+                          正在计算安全检查点
+                        </div>
+                      ) : resumeOptions ? (
+                        <>
+                          {resumeOptions.global_disabled_reason && (
+                            <p className="resume-reason">
+                              {resumeOptions.global_disabled_reason}
+                            </p>
+                          )}
+                          {resumeOptions.checkpoints.length ? (
+                            <div className="resume-checkpoints">
+                              {resumeOptions.checkpoints.map((checkpoint) => (
+                                <label
+                                  key={checkpoint.checkpoint_id}
+                                  className={classNames(
+                                    'resume-checkpoint',
+                                    !checkpoint.available && 'unavailable',
+                                    resumeCheckpointId ===
+                                      checkpoint.checkpoint_id && 'selected',
+                                  )}
+                                >
+                                  <input
+                                    type="radio"
+                                    name="resume-checkpoint"
+                                    value={checkpoint.checkpoint_id}
+                                    checked={
+                                      resumeCheckpointId ===
+                                      checkpoint.checkpoint_id
+                                    }
+                                    disabled={
+                                      !checkpoint.available || resuming
+                                    }
+                                    onChange={() =>
+                                      setResumeCheckpointId(
+                                        checkpoint.checkpoint_id,
+                                      )
+                                    }
+                                  />
+                                  <span className="resume-checkpoint-copy">
+                                    <strong>
+                                      第 {checkpoint.step} 步 ·{' '}
+                                      {checkpoint.checkpoint_id}
+                                    </strong>
+                                    <small>
+                                      已完成{' '}
+                                      {checkpoint.completed_agent_names.length
+                                        ? checkpoint.completed_agent_names.join(
+                                            '、',
+                                          )
+                                        : '无'}
+                                    </small>
+                                    {checkpoint.pending_agent_names.length >
+                                      0 && (
+                                      <small>
+                                        待执行{' '}
+                                        {checkpoint.pending_agent_names.join(
+                                          '、',
+                                        )}
+                                      </small>
+                                    )}
+                                    <span>
+                                      继承{' '}
+                                      {(
+                                        checkpoint.inherited_usage
+                                          .total_tokens ?? 0
+                                      ).toLocaleString()}{' '}
+                                      tokens
+                                    </span>
+                                    {checkpoint.disabled_reason && (
+                                      <em>{checkpoint.disabled_reason}</em>
+                                    )}
+                                  </span>
+                                </label>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="resume-empty">
+                              没有可安全恢复的检查点
+                            </div>
+                          )}
+                          <button
+                            className="resume-confirm"
+                            type="button"
+                            disabled={
+                              !selectedResumeCheckpoint?.available ||
+                              resuming
+                            }
+                            onClick={() => void resumeFromCheckpoint()}
+                          >
+                            {resuming ? (
+                              <LoaderCircle size={13} className="spin" />
+                            ) : (
+                              <RotateCcw size={13} />
+                            )}
+                            {resuming ? '正在启动' : '从此处重跑'}
+                          </button>
+                        </>
+                      ) : (
+                        <div className="resume-empty">检查点读取失败</div>
+                      )}
+                    </div>
+                  )}
+                </div>
               )}
               {currentRunError && <RunErrorPanel message={currentRunError} />}
               {pendingGates.length > 0 && (
