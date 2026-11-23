@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import errno
+import json
 import os
 import shutil
 import tempfile
 import threading
+import time
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -37,6 +41,17 @@ class RevisionConflict(StorageError):
     pass
 
 
+class StorageWriteError(StorageError):
+    def __init__(self, path: Path, cause: OSError) -> None:
+        super().__init__(
+            f"Could not save '{path.name}'. The file may be locked by another "
+            "process. Please retry."
+        )
+        self.path = path
+        self.errno = cause.errno
+        self.winerror = getattr(cause, "winerror", None)
+
+
 class ApiProfileNotFound(StorageError):
     pass
 
@@ -55,7 +70,26 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
+_TRANSIENT_WRITE_ERRNOS = frozenset(
+    {
+        errno.EACCES,
+        errno.EAGAIN,
+        errno.EBUSY,
+    }
+)
+_TRANSIENT_WINDOWS_ERRORS = frozenset({5, 32, 33})
+_WRITE_RETRY_ATTEMPTS = 6
+_WRITE_RETRY_INITIAL_DELAY = 0.02
+
+
+def _is_transient_write_error(exc: OSError) -> bool:
+    return (
+        exc.errno in _TRANSIENT_WRITE_ERRNOS
+        or getattr(exc, "winerror", None) in _TRANSIENT_WINDOWS_ERRORS
+    )
+
+
+def _atomic_write_text_once(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
@@ -70,8 +104,25 @@ def _atomic_write_text(path: Path, content: str) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary_name, path)
     finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
+        with suppress(OSError):
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    delay = _WRITE_RETRY_INITIAL_DELAY
+    for attempt in range(_WRITE_RETRY_ATTEMPTS):
+        try:
+            _atomic_write_text_once(path, content)
+            return
+        except OSError as exc:
+            if (
+                attempt + 1 >= _WRITE_RETRY_ATTEMPTS
+                or not _is_transient_write_error(exc)
+            ):
+                raise
+            time.sleep(delay)
+            delay *= 2
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -981,12 +1032,6 @@ class ProjectStore:
                 raise RevisionConflict(
                     f"Expected revision {base_revision}, current is {current.revision}"
                 )
-            validation = validate_sdl(sdl)
-            if not validation.valid:
-                raise InvalidWorkflow(
-                    [issue.model_dump(mode="json") for issue in validation.issues]
-                )
-            normalized = SDL.model_validate(validation.normalized_sdl)
             detail = ProjectDetail(
                 id=current.id,
                 name=current.name,
@@ -994,8 +1039,8 @@ class ProjectStore:
                 created_at=current.created_at,
                 updated_at=utc_now(),
                 last_build_hash=current.last_build_hash,
-                sdl=normalized,
-                canvas=normalize_canvas(normalized, canvas),
+                sdl=sdl,
+                canvas=normalize_canvas(sdl, canvas),
             )
             self._write_project(detail)
             return detail
@@ -1046,10 +1091,28 @@ class ProjectStore:
             "updated_at": detail.updated_at.isoformat(),
             "last_build_hash": detail.last_build_hash,
         }
-        _atomic_write_json(project_path / "project.json", summary)
-        _atomic_write_text(project_path / "workflow.sdl.yaml", sdl_to_yaml(detail.sdl))
-        _atomic_write_json(
-            project_path / "canvas.json",
-            detail.canvas.model_dump(mode="json"),
+        files = (
+            (
+                project_path / "workflow.sdl.yaml",
+                sdl_to_yaml(detail.sdl),
+            ),
+            (
+                project_path / "canvas.json",
+                json.dumps(
+                    detail.canvas.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+            ),
+            (
+                project_path / "project.json",
+                json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+            ),
         )
+        for path, content in files:
+            try:
+                _atomic_write_text(path, content)
+            except OSError as exc:
+                raise StorageWriteError(path, exc) from exc
 

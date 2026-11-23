@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { Agent, ApiProfile, SDL } from './types'
 import {
   appendConditionPredicate,
+  cloneAgent,
   conditionPaths,
   defaultCondition,
   firstCompatibleMapping,
@@ -20,6 +21,7 @@ function agent(
     id,
     name: id,
     api_profile: apiProfile,
+    mode: 'chat',
     system_prompt: '',
     inputs,
     outputs,
@@ -46,6 +48,7 @@ function apiProfile(id: string): ApiProfile {
       vision: false,
       long_context: false,
       structured_output: true,
+      image_generation: false,
     },
   }
 }
@@ -55,6 +58,49 @@ describe('workflow utilities', () => {
     expect(uniqueId('agent', [])).toBe('agent')
     expect(uniqueId('agent', ['agent'])).toBe('agent-2')
     expect(uniqueId('agent', ['agent', 'agent-2', 'agent-3'])).toBe('agent-4')
+  })
+
+  it('clones an agent without sharing nested configuration', () => {
+    const original = agent(
+      'drafter',
+      [{ name: 'brief', type: 'TEXT', schema_hint: { type: 'string' } }],
+      [{ name: 'draft', type: 'DATA' }],
+      'writer-profile',
+    )
+    original.name = '内容起草'
+    original.system_prompt = 'write carefully'
+    original.limits = { max_tokens: 2048, max_total_tokens: 12000 }
+    original.json_output = {
+      enabled: true,
+      template: { outline: { sections: [] } },
+    }
+    original.output_dir = 'artifacts/drafter'
+
+    const copy = cloneAgent(original, ['drafter', 'drafter-copy'])
+
+    expect(copy).toMatchObject({
+      id: 'drafter-copy-2',
+      name: '内容起草 副本',
+      api_profile: 'writer-profile',
+      system_prompt: 'write carefully',
+      limits: { max_tokens: 2048, max_total_tokens: 12000 },
+      json_output: {
+        enabled: true,
+        template: { outline: { sections: [] } },
+      },
+      output_dir: null,
+    })
+    expect(copy.inputs).not.toBe(original.inputs)
+    expect(copy.inputs[0].schema_hint).not.toBe(
+      original.inputs[0].schema_hint,
+    )
+    expect(copy.json_output.template).not.toBe(original.json_output.template)
+
+    copy.inputs[0].name = 'source_brief'
+    copy.json_output.template.outline = { sections: ['intro'] }
+
+    expect(original.inputs[0].name).toBe('brief')
+    expect(original.json_output.template.outline).toEqual({ sections: [] })
   })
 
   it('allows exact and mixed port matches only', () => {

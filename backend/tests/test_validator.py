@@ -13,7 +13,10 @@ from loomlane.models import (
     Condition,
     EdgeGuard,
     EdgeType,
+    ImageGenerationConfig,
+    Port,
     SDL,
+    WorkflowOutput,
 )
 from loomlane.storage import default_sdl
 from loomlane.validator import validate_sdl
@@ -30,6 +33,18 @@ def test_default_workflow_is_valid() -> None:
     assert {edge["type"] for edge in result.normalized_sdl["edges"]} == {
         edge_type.value for edge_type in EdgeType
     }
+
+
+def test_missing_workflow_output_returns_validation_issue(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    sdl.workflow.outputs.clear()
+
+    result = validate_sdl(sdl)
+
+    assert not result.valid
+    assert "missing_workflow_output" in {issue.code for issue in result.issues}
 
 
 def test_non_feedback_cycle_is_rejected(
@@ -233,3 +248,100 @@ def test_port_type_mismatch_is_rejected(
 
     assert not result.valid
     assert "port_type_mismatch" in {issue.code for issue in result.issues}
+
+
+def test_json_output_template_rejects_structured_text_port(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    sdl.agents[1].json_output.template["review"] = {
+        "style": "画风修改建议",
+        "background": "背景修改建议",
+    }
+
+    result = validate_sdl(sdl)
+
+    assert not result.valid
+    issue = next(
+        issue
+        for issue in result.issues
+        if issue.code == "json_output_port_type_mismatch"
+    )
+    assert issue.node_id == "reviewer"
+    assert issue.path == "agents.reviewer.json_output.template.review"
+
+
+def test_json_output_template_accepts_string_text_port(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    sdl.agents[1].json_output.template["review"] = (
+        "综合角色、背景、风格和质量维度的完整修改建议文本"
+    )
+
+    result = validate_sdl(sdl)
+
+    assert result.valid
+    assert result.issues == []
+
+
+def test_json_output_template_rejects_non_reference_file_port(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    sdl.agents[1].outputs.append(Port(name="picture", type="FILE"))
+    sdl.agents[1].json_output.template["picture"] = "生成的图片路径"
+
+    result = validate_sdl(sdl)
+
+    assert not result.valid
+    issue = next(
+        issue
+        for issue in result.issues
+        if issue.code == "json_output_port_type_mismatch"
+    )
+    assert issue.node_id == "reviewer"
+    assert issue.path == "agents.reviewer.json_output.template.picture"
+
+
+def test_image_agent_requires_capability_file_output_and_chat_json_disabled(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    agent = sdl.agents[0]
+    agent.mode = "image"
+    agent.outputs = []
+    agent.json_output.enabled = True
+
+    result = validate_sdl(sdl)
+
+    assert not result.valid
+    assert {issue.code for issue in result.issues} >= {
+        "image_profile_required",
+        "image_output_contract",
+        "image_json_output",
+    }
+
+
+def test_image_agent_accepts_compatible_profile_and_file_output(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    profile = sdl.api_profiles[0]
+    profile.capabilities.image_generation = True
+    profile.image_generation = ImageGenerationConfig(size="1024x1024")
+    assert profile.image_generation.protocol == "automatic1111"
+    agent = sdl.agents[0]
+    agent.mode = "image"
+    agent.outputs = [Port(name="picture", type="FILE")]
+    agent.json_output.enabled = False
+    sdl.edges.clear()
+    sdl.agents = [agent]
+    sdl.workflow.outputs = [
+        WorkflowOutput(name="picture", agent=agent.id, port="picture")
+    ]
+
+    result = validate_sdl(sdl)
+
+    assert result.valid
+    assert result.issues == []

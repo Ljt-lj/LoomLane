@@ -27,6 +27,7 @@ import {
   CircleAlert,
   CirclePlay,
   Code2,
+  Copy,
   FileCode2,
   FileUp,
   Folder,
@@ -81,6 +82,10 @@ import {
   replayRunEvents,
   type GateReplayRecord,
 } from './run-replay'
+import {
+  applyLibrarySecretStatuses,
+  mergeSettledSecretStatuses,
+} from './secret-status-utils'
 import type {
   Agent,
   ApiProfile,
@@ -110,6 +115,7 @@ import {
   type InspectorTab,
 } from './uiStore'
 import {
+  cloneAgent,
   conditionPaths,
   defaultCondition,
   firstCompatibleMapping,
@@ -118,6 +124,7 @@ import {
 } from './workflow-utils'
 
 const nodeTypes = { agent: AgentNode }
+const DEFAULT_IMAGE_PROTOCOL = 'automatic1111' as const
 const PORT_TYPES: PortType[] = ['TEXT', 'DATA', 'FILE', 'MIXED']
 const EDGE_TYPES: EdgeType[] = [
   'PIPE',
@@ -171,6 +178,213 @@ function classNames(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(' ')
 }
 
+function ImageGenerationFields({
+  profile,
+  onChange,
+}: {
+  profile: ApiProfile
+  onChange: (updater: (profile: ApiProfile) => ApiProfile) => void
+}) {
+  const enabled = profile.capabilities.image_generation
+  const protocol = profile.image_generation?.protocol ?? DEFAULT_IMAGE_PROTOCOL
+  return (
+    <>
+      <div className="capability-row">
+        <label>
+          <input
+            type="checkbox"
+            checked={profile.capabilities.structured_output}
+            onChange={(event) =>
+              onChange((current) => ({
+                ...current,
+                capabilities: {
+                  ...current.capabilities,
+                  structured_output: event.target.checked,
+                },
+              }))
+            }
+          />
+          Structured JSON
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(event) =>
+              onChange((current) => ({
+                ...current,
+                capabilities: {
+                  ...current.capabilities,
+                  image_generation: event.target.checked,
+                },
+                image_generation: event.target.checked
+                  ? current.image_generation ?? {
+                      protocol: DEFAULT_IMAGE_PROTOCOL,
+                      size: '1024x1024',
+                      quality: null,
+                      output_format: null,
+                      response_format: null,
+                    }
+                  : null,
+              }))
+            }
+          />
+          Image generation
+        </label>
+      </div>
+      {enabled && (
+        <div className="image-generation-fields">
+          <div className="two-column-fields">
+            <label>
+              Protocol
+              <select
+                value={protocol}
+                onChange={(event) =>
+                  onChange((current) => ({
+                    ...current,
+                    image_generation: {
+                      protocol: event.target.value as
+                        | 'openai_images'
+                        | 'siliconflow'
+                        | 'automatic1111',
+                      size: current.image_generation?.size ?? '1024x1024',
+                      quality: current.image_generation?.quality ?? null,
+                      output_format:
+                        current.image_generation?.output_format ?? null,
+                      response_format:
+                        current.image_generation?.response_format ?? null,
+                    },
+                  }))
+                }
+              >
+                <option value="openai_images">OpenAI Images</option>
+                <option value="siliconflow">SiliconFlow</option>
+                <option value="automatic1111">AUTOMATIC1111 / Forge</option>
+              </select>
+            </label>
+            <label>
+              Size
+              <input
+                value={profile.image_generation?.size ?? '1024x1024'}
+                placeholder="1024x1024"
+                onChange={(event) =>
+                  onChange((current) => ({
+                    ...current,
+                    image_generation: {
+                      protocol:
+                        current.image_generation?.protocol ??
+                        DEFAULT_IMAGE_PROTOCOL,
+                      size: event.target.value,
+                      quality: current.image_generation?.quality ?? null,
+                      output_format:
+                        current.image_generation?.output_format ?? null,
+                      response_format:
+                        current.image_generation?.response_format ?? null,
+                    },
+                  }))
+                }
+              />
+            </label>
+          </div>
+          {protocol === 'openai_images' && (
+            <>
+              <div className="two-column-fields">
+                <label>
+                  Quality
+                  <input
+                    value={profile.image_generation?.quality ?? ''}
+                    placeholder="Provider default"
+                    onChange={(event) =>
+                      onChange((current) => ({
+                        ...current,
+                        image_generation: {
+                          protocol:
+                            current.image_generation?.protocol ??
+                            DEFAULT_IMAGE_PROTOCOL,
+                          size:
+                            current.image_generation?.size ?? '1024x1024',
+                          quality: event.target.value || null,
+                          output_format:
+                            current.image_generation?.output_format ?? null,
+                          response_format:
+                            current.image_generation?.response_format ?? null,
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  Output format
+                  <select
+                    value={profile.image_generation?.output_format ?? ''}
+                    onChange={(event) =>
+                      onChange((current) => ({
+                        ...current,
+                        image_generation: {
+                          protocol:
+                            current.image_generation?.protocol ??
+                            DEFAULT_IMAGE_PROTOCOL,
+                          size:
+                            current.image_generation?.size ?? '1024x1024',
+                          quality: current.image_generation?.quality ?? null,
+                          output_format:
+                            (event.target.value as
+                              | 'png'
+                              | 'jpeg'
+                              | 'webp') || null,
+                          response_format:
+                            current.image_generation?.response_format ?? null,
+                        },
+                      }))
+                    }
+                  >
+                    <option value="">Provider default</option>
+                    <option value="png">PNG</option>
+                    <option value="jpeg">JPEG</option>
+                    <option value="webp">WebP</option>
+                  </select>
+                </label>
+              </div>
+              <div className="two-column-fields">
+                <label>
+                  API response
+                  <select
+                    value={profile.image_generation?.response_format ?? ''}
+                    onChange={(event) =>
+                      onChange((current) => ({
+                        ...current,
+                        image_generation: {
+                          protocol:
+                            current.image_generation?.protocol ??
+                            DEFAULT_IMAGE_PROTOCOL,
+                          size:
+                            current.image_generation?.size ?? '1024x1024',
+                          quality: current.image_generation?.quality ?? null,
+                          output_format:
+                            current.image_generation?.output_format ?? null,
+                          response_format:
+                            (event.target.value as
+                              | 'url'
+                              | 'b64_json') || null,
+                        },
+                      }))
+                    }
+                  >
+                    <option value="">Provider default</option>
+                    <option value="b64_json">Base64</option>
+                    <option value="url">URL</option>
+                  </select>
+                </label>
+                <span />
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </>
+  )
+}
+
 function initialRunInputs(
   inputs: SDL['workflow']['inputs'],
 ): Record<string, RunInputValue> {
@@ -212,6 +426,22 @@ function issueFromError(error: unknown): ValidationIssue[] {
   if (!(error instanceof ApiError)) return []
   const issues = error.payload.issues
   return Array.isArray(issues) ? (issues as ValidationIssue[]) : []
+}
+
+function validationIssueMessage(issues: ValidationIssue[], fallback: string) {
+  const first = issues.find((issue) => issue.severity === 'error') ?? issues[0]
+  if (!first) return fallback
+  const location = first.path ? `${first.path}: ` : ''
+  const remaining = issues.length > 1 ? `（另有 ${issues.length - 1} 项）` : ''
+  return `${location}${first.message}${remaining}`
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  const issues = issueFromError(error)
+  if (issues.length) return validationIssueMessage(issues, fallback)
+  return error instanceof Error && error.message.trim()
+    ? error.message
+    : fallback
 }
 
 function parseEvent(message: MessageEvent): RunEvent | null {
@@ -889,23 +1119,45 @@ function App() {
 
   useEffect(() => {
     if (!projectId || !draft) return
+    const profiles = draft.sdl.api_profiles
+    const profileIds = profiles.map((profile) => profile.id)
+    if (dirty) {
+      setSecretStatuses((current) =>
+        applyLibrarySecretStatuses(
+          mergeSettledSecretStatuses(current, profileIds, []),
+          profiles,
+          librarySecretStatuses,
+        ),
+      )
+      return
+    }
+
     let cancelled = false
-    Promise.all(
-      draft.sdl.api_profiles.map(async (profile) => [
+    Promise.allSettled(
+      profiles.map(async (profile) => [
         profile.id,
         await api.secretStatus(projectId, profile.id),
       ] as const),
     )
-      .then((entries) => {
-        if (!cancelled) setSecretStatuses(Object.fromEntries(entries))
-      })
-      .catch(() => {
-        if (!cancelled) setSecretStatuses({})
+      .then((results) => {
+        if (cancelled) return
+        setSecretStatuses((current) =>
+          applyLibrarySecretStatuses(
+            mergeSettledSecretStatuses(current, profileIds, results),
+            profiles,
+            librarySecretStatuses,
+          ),
+        )
       })
     return () => {
       cancelled = true
     }
-  }, [draft?.sdl.api_profiles, projectId])
+  }, [
+    draft?.sdl.api_profiles,
+    dirty,
+    librarySecretStatuses,
+    projectId,
+  ])
 
   useEffect(() => {
     const profiles = apiProfilesQuery.data
@@ -919,17 +1171,18 @@ function App() {
     })
 
     let cancelled = false
-    Promise.all(
+    Promise.allSettled(
       profiles.map(async (profile) => [
         profile.id,
         await api.apiProfileSecretStatus(profile.id),
       ] as const),
     )
-      .then((entries) => {
-        if (!cancelled) setLibrarySecretStatuses(Object.fromEntries(entries))
-      })
-      .catch(() => {
-        if (!cancelled) setLibrarySecretStatuses({})
+      .then((results) => {
+        if (cancelled) return
+        const profileIds = profiles.map((profile) => profile.id)
+        setLibrarySecretStatuses((current) =>
+          mergeSettledSecretStatuses(current, profileIds, results),
+        )
       })
     return () => {
       cancelled = true
@@ -1163,15 +1416,15 @@ function App() {
       setDirty(false)
       setIssues([])
       await queryClient.invalidateQueries({ queryKey: ['projects'] })
-      showNotice('success', `已保存 revision ${updated.revision}`)
+      showNotice('success', `已保存草稿 revision ${updated.revision}`)
       return updated
     } catch (error) {
       const validationIssues = issueFromError(error)
-      if (validationIssues.length) setIssues(validationIssues)
-      showNotice(
-        'error',
-        error instanceof Error ? error.message : '保存失败',
-      )
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '保存草稿失败'))
       return null
     } finally {
       setSaving(false)
@@ -1187,11 +1440,22 @@ function App() {
       if (result.valid) {
         showNotice('success', 'SDL 校验通过')
       } else {
-        showNotice('error', `发现 ${result.issues.length} 个校验问题`)
+        showNotice(
+          'error',
+          validationIssueMessage(
+            result.issues,
+            `发现 ${result.issues.length} 个校验问题`,
+          ),
+        )
       }
       return result.valid
     } catch (error) {
-      showNotice('error', error instanceof Error ? error.message : '校验失败')
+      const validationIssues = issueFromError(error)
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '校验失败'))
       return false
     }
   }
@@ -1212,8 +1476,11 @@ function App() {
       queryClient.invalidateQueries({ queryKey: ['projects'] })
     } catch (error) {
       const validationIssues = issueFromError(error)
-      if (validationIssues.length) setIssues(validationIssues)
-      showNotice('error', error instanceof Error ? error.message : '生成失败')
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '生成失败'))
     }
   }
 
@@ -1272,16 +1539,27 @@ function App() {
   async function startRun() {
     const saved = await saveProject()
     if (!saved) return
-    const valid = await api
-      .validate(saved.id, saved.sdl)
-      .then((result) => {
-        setIssues(result.issues)
-        return result.valid
-      })
-      .catch(() => false)
-    if (!valid) {
-      setDrawerTab('issues')
-      showNotice('error', 'SDL 未通过校验，无法启动运行')
+    try {
+      const validation = await api.validate(saved.id, saved.sdl)
+      setIssues(validation.issues)
+      if (!validation.valid) {
+        setDrawerTab('issues')
+        showNotice(
+          'error',
+          validationIssueMessage(
+            validation.issues,
+            'SDL 未通过校验，无法启动运行',
+          ),
+        )
+        return
+      }
+    } catch (error) {
+      const validationIssues = issueFromError(error)
+      if (validationIssues.length) {
+        setIssues(validationIssues)
+        setDrawerTab('issues')
+      }
+      showNotice('error', errorMessage(error, '运行前校验失败'))
       return
     }
     const fileInputs = saved.sdl.workflow.inputs.filter(
@@ -1551,6 +1829,7 @@ function App() {
         vision: false,
         long_context: true,
         structured_output: true,
+        image_generation: false,
       },
     }
     setLibraryProfileSaving(profileId)
@@ -1699,17 +1978,28 @@ function App() {
         ...sdl,
         api_profiles: [...sdl.api_profiles, linkedProfile],
       }))
-      if (librarySecretStatuses[profile.id]?.configured) {
+      const libraryStatus = librarySecretStatuses[profile.id]
+      if (libraryStatus) {
         setSecretStatuses((current) => ({
           ...current,
           [projectProfileId]: {
-            ...librarySecretStatuses[profile.id],
+            ...libraryStatus,
             profile_id: projectProfileId,
             scope: 'library',
           },
         }))
       }
-      showNotice('success', '已加入当前项目，保存项目后生效')
+      const local =
+        profile.base_url.includes('127.0.0.1') ||
+        profile.base_url.includes('localhost')
+      if (local || libraryStatus?.configured) {
+        showNotice('success', '已加入当前项目，保存项目后生效')
+      } else {
+        showNotice(
+          'info',
+          '已加入当前项目；该常用库 Profile 尚未配置 API Key',
+        )
+      }
     } finally {
       setLibraryProfileLinking(null)
     }
@@ -2016,6 +2306,37 @@ function App() {
     }
   }
 
+  function duplicateAgent() {
+    if (!draft || !selectedAgent) return
+    const sourceNode = draft.canvas.nodes.find(
+      (node) => node.id === selectedAgent.id,
+    )
+    const duplicate = cloneAgent(
+      selectedAgent,
+      draft.sdl.agents.map((agent) => agent.id),
+    )
+    const node: CanvasNode = {
+      id: duplicate.id,
+      x: (sourceNode?.x ?? 100) + 32,
+      y: (sourceNode?.y ?? 120) + 32,
+      width: sourceNode?.width ?? 238,
+      height: sourceNode?.height ?? 132,
+    }
+    updateDraft((current) => ({
+      ...current,
+      sdl: {
+        ...current.sdl,
+        agents: [...current.sdl.agents, duplicate],
+      },
+      canvas: {
+        ...current.canvas,
+        nodes: [...current.canvas.nodes, node],
+      },
+    }))
+    setSelection({ kind: 'node', id: duplicate.id })
+    setInspectorTab('selection')
+  }
+
   function addAgent() {
     if (!draft) return
     const id = uniqueId(
@@ -2034,6 +2355,7 @@ function App() {
       id,
       name: '新 Agent',
       api_profile: draft.sdl.api_profiles[0]?.id ?? 'openai-main',
+      mode: 'chat',
       system_prompt: '你是一个负责处理输入并返回结构化输出的 Agent。',
       inputs: [{ name: 'input', type: 'TEXT', required: true }],
       outputs: [{ name: 'output', type: 'TEXT' }],
@@ -2204,6 +2526,12 @@ function App() {
   function renderSelectionInspector() {
     if (selectedAgent) {
       const agent = selectedAgent
+      const selectedProfile = draft?.sdl.api_profiles.find(
+        (profile) => profile.id === agent.api_profile,
+      )
+      const imageContractInvalid =
+        agent.mode === 'image' &&
+        (agent.outputs.length !== 1 || agent.outputs[0]?.type !== 'FILE')
       return (
         <div className="inspector-body">
           <div className="inspector-heading">
@@ -2213,6 +2541,14 @@ function App() {
             </div>
             <div className="inspector-heading-actions">
               <span className="id-chip">{agent.id}</span>
+              <button
+                className="small-button"
+                title="复制所选 Agent"
+                onClick={duplicateAgent}
+              >
+                <Copy size={13} />
+                复制
+              </button>
               <button
                 className="small-button danger"
                 title="删除所选 Agent"
@@ -2236,6 +2572,53 @@ function App() {
             />
           </label>
           <label>
+            Agent 模式
+            <select
+              value={agent.mode}
+              onChange={(event) => {
+                const mode = event.target.value as Agent['mode']
+                updateAgent(agent.id, (current) => {
+                  const compatibleProfile =
+                    draft?.sdl.api_profiles.find(
+                      (profile) => profile.capabilities.image_generation,
+                    )?.id ?? current.api_profile
+                  return {
+                    ...current,
+                    mode,
+                    api_profile:
+                      mode === 'image' &&
+                      !draft?.sdl.api_profiles.find(
+                        (profile) =>
+                          profile.id === current.api_profile &&
+                          profile.capabilities.image_generation,
+                      )
+                        ? compatibleProfile
+                        : current.api_profile,
+                    json_output:
+                      mode === 'image'
+                        ? { ...current.json_output, enabled: false }
+                        : current.json_output,
+                    outputs:
+                      mode === 'image'
+                        ? [
+                            {
+                              name: current.outputs[0]?.name || 'picture',
+                              type: 'FILE',
+                            },
+                          ]
+                        : current.outputs.length === 1 &&
+                            current.outputs[0]?.type === 'FILE'
+                          ? [{ ...current.outputs[0], type: 'TEXT' }]
+                          : current.outputs,
+                  }
+                })
+              }}
+            >
+              <option value="chat">Chat</option>
+              <option value="image">Image</option>
+            </select>
+          </label>
+          <label>
             API Profile
             <select
               value={agent.api_profile}
@@ -2247,12 +2630,32 @@ function App() {
               }
             >
               {draft?.sdl.api_profiles.map((profile) => (
-                <option key={profile.id} value={profile.id}>
+                <option
+                  key={profile.id}
+                  value={profile.id}
+                  disabled={
+                    agent.mode === 'image' &&
+                    !profile.capabilities.image_generation
+                  }
+                >
                   {profile.name || profile.id}
                 </option>
               ))}
             </select>
           </label>
+          {agent.mode === 'image' &&
+            (!selectedProfile?.capabilities.image_generation ||
+              imageContractInvalid) && (
+              <div className="inline-warning">
+                {!selectedProfile?.capabilities.image_generation &&
+                  '请选择启用了 Image generation 的 API Profile。'}
+                {!selectedProfile?.capabilities.image_generation &&
+                  imageContractInvalid &&
+                  ' '}
+                {imageContractInvalid &&
+                  '图片模式需要且仅需要一个 FILE 输出端口。'}
+              </div>
+            )}
           <label>
             System Prompt
             <textarea
@@ -2266,26 +2669,28 @@ function App() {
               }
             />
           </label>
-          <label>
-            单次 Max tokens
-            <input
-              type="number"
-              min={1}
-              placeholder="不限制"
-              value={agent.limits.max_tokens ?? ''}
-              onChange={(event) =>
-                updateAgent(agent.id, (current) => ({
-                  ...current,
-                  limits: {
-                    ...current.limits,
-                    max_tokens: event.target.value
-                      ? Number(event.target.value)
-                      : null,
-                  },
-                }))
-              }
-            />
-          </label>
+          {agent.mode === 'chat' && (
+            <label>
+              单次 Max tokens
+              <input
+                type="number"
+                min={1}
+                placeholder="不限制"
+                value={agent.limits.max_tokens ?? ''}
+                onChange={(event) =>
+                  updateAgent(agent.id, (current) => ({
+                    ...current,
+                    limits: {
+                      ...current.limits,
+                      max_tokens: event.target.value
+                        ? Number(event.target.value)
+                        : null,
+                    },
+                  }))
+                }
+              />
+            </label>
+          )}
           <label>
             累计 Max tokens
             <input
@@ -2319,16 +2724,18 @@ function App() {
               }
             />
           </label>
-          <JsonOutputEditor
-            value={agent.json_output ?? { enabled: false, template: {} }}
-            outputNames={agent.outputs.map((port) => port.name)}
-            onChange={(jsonOutput) =>
-              updateAgent(agent.id, (current) => ({
-                ...current,
-                json_output: jsonOutput,
-              }))
-            }
-          />
+          {agent.mode === 'chat' && (
+            <JsonOutputEditor
+              value={agent.json_output ?? { enabled: false, template: {} }}
+              outputNames={agent.outputs.map((port) => port.name)}
+              onChange={(jsonOutput) =>
+                updateAgent(agent.id, (current) => ({
+                  ...current,
+                  json_output: jsonOutput,
+                }))
+              }
+            />
+          )}
           {renderPorts(agent, 'inputs')}
           {renderPorts(agent, 'outputs')}
         </div>
@@ -2891,7 +3298,7 @@ function App() {
             </button>
           </div>
           {workflowMeta.inputs.map((input, index) => (
-            <div className="port-editor-row" key={input.name}>
+            <div className="port-editor-row" key={`workflow-input-${index}`}>
               <input
                 value={input.name}
                 onChange={(event) =>
@@ -2982,7 +3389,10 @@ function App() {
               (item) => item.id === output.agent,
             )
             return (
-              <div className="output-editor-row" key={`${output.name}-${index}`}>
+              <div
+                className="output-editor-row"
+                key={`workflow-output-${index}`}
+              >
                 <input
                   value={output.name}
                   onChange={(event) =>
@@ -3287,24 +3697,12 @@ function App() {
                     )}
                   </div>
                 )}
-                <div className="capability-row">
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={profile.capabilities.structured_output}
-                      onChange={(event) =>
-                        updateLibraryProfileDraft(serverProfile.id, (current) => ({
-                          ...current,
-                          capabilities: {
-                            ...current.capabilities,
-                            structured_output: event.target.checked,
-                          },
-                        }))
-                      }
-                    />
-                    Structured JSON
-                  </label>
-                </div>
+                <ImageGenerationFields
+                  profile={profile}
+                  onChange={(updater) =>
+                    updateLibraryProfileDraft(serverProfile.id, updater)
+                  }
+                />
                 <div className="profile-card-actions">
                   <button
                     className="small-button"
@@ -3376,6 +3774,7 @@ function App() {
                           vision: false,
                           long_context: false,
                           structured_output: true,
+                          image_generation: false,
                         },
                       },
                     ],
@@ -3577,24 +3976,10 @@ function App() {
                     )}
                   </div>
                 )}
-                <div className="capability-row">
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={profile.capabilities.structured_output}
-                      onChange={(event) =>
-                        updateProfile(profile.id, (current) => ({
-                          ...current,
-                          capabilities: {
-                            ...current.capabilities,
-                            structured_output: event.target.checked,
-                          },
-                        }))
-                      }
-                    />
-                    Structured JSON
-                  </label>
-                </div>
+                <ImageGenerationFields
+                  profile={profile}
+                  onChange={(updater) => updateProfile(profile.id, updater)}
+                />
               </section>
             )
           })}
@@ -3673,13 +4058,14 @@ function App() {
             className="toolbar-button"
             disabled={!dirty || saving}
             onClick={saveProject}
+            title="保存当前编辑内容，不要求流程可运行"
           >
             {saving ? (
               <LoaderCircle size={15} className="spin" />
             ) : (
               <Save size={15} />
             )}
-            保存
+            保存草稿
           </button>
           {isRunActive ? (
             <button className="run-button cancel" onClick={cancelRun}>

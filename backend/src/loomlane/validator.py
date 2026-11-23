@@ -240,7 +240,8 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
                     node_id=agent.id,
                 )
             )
-        if agent.api_profile not in profiles:
+        profile = profiles.get(agent.api_profile)
+        if profile is None:
             issues.append(
                 _issue(
                     "unknown_api_profile",
@@ -250,6 +251,70 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
                     node_id=agent.id,
                 )
             )
+        elif agent.mode == "image":
+            if not profile.capabilities.image_generation:
+                issues.append(
+                    _issue(
+                        "image_profile_required",
+                        f"Image Agent '{agent.id}' requires an API Profile with "
+                        "image_generation capability",
+                        f"agents.{agent.id}.mode",
+                        node_id=agent.id,
+                    )
+                )
+            if len(agent.outputs) != 1 or agent.outputs[0].type.value != "FILE":
+                issues.append(
+                    _issue(
+                        "image_output_contract",
+                        f"Image Agent '{agent.id}' must define exactly one FILE "
+                        "output port",
+                        f"agents.{agent.id}.outputs",
+                        node_id=agent.id,
+                    )
+                )
+            if agent.json_output.enabled:
+                issues.append(
+                    _issue(
+                        "image_json_output",
+                        f"Image Agent '{agent.id}' cannot enable structured JSON "
+                        "output",
+                        f"agents.{agent.id}.json_output",
+                        node_id=agent.id,
+                    )
+                )
+        if agent.mode == "chat" and agent.json_output.enabled:
+            template = agent.json_output.template
+            for port in agent.outputs:
+                if port.name not in template:
+                    continue
+                template_value = template[port.name]
+                if port.type.value == "TEXT" and isinstance(
+                    template_value, (dict, list)
+                ):
+                    issues.append(
+                        _issue(
+                            "json_output_port_type_mismatch",
+                            f"Output port '{port.name}' on Agent '{agent.id}' is "
+                            "TEXT, but its JSON template is structured. Use a "
+                            "string description or change the port type to DATA.",
+                            f"agents.{agent.id}.json_output.template.{port.name}",
+                            node_id=agent.id,
+                        )
+                    )
+                if port.type.value == "FILE" and not (
+                    isinstance(template_value, dict)
+                    and isinstance(template_value.get("path"), str)
+                ):
+                    issues.append(
+                        _issue(
+                            "json_output_port_type_mismatch",
+                            f"Output port '{port.name}' on Agent '{agent.id}' is "
+                            "FILE, but its JSON template is not an object with a "
+                            "string 'path' field.",
+                            f"agents.{agent.id}.json_output.template.{port.name}",
+                            node_id=agent.id,
+                        )
+                    )
 
     for start_id in sdl.start:
         if start_id not in agents:
@@ -542,7 +607,6 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
                 "missing_workflow_output",
                 "Workflow must declare at least one output",
                 "workflow.outputs",
-                severity="error",
             )
         )
 

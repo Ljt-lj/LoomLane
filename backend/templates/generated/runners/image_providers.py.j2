@@ -1,0 +1,182 @@
+@dataclass(frozen=True)
+class ImageRequest:
+    url: str
+    body: dict[str, Any]
+
+
+def _image_config(profile: dict[str, Any]) -> dict[str, Any]:
+    config = profile.get("image_generation")
+    return config if isinstance(config, dict) else {}
+
+
+def _image_dimensions(value: Any) -> tuple[int, int]:
+    try:
+        normalized = str(value).strip().lower().replace("\u00d7", "x")
+        raw_width, raw_height = normalized.split("x", 1)
+        width = int(raw_width.strip())
+        height = int(raw_height.strip())
+    except (TypeError, ValueError) as exc:
+        raise WorkflowError(
+            "Image size must use WIDTHxHEIGHT, for example 1024x1024"
+        ) from exc
+    if width < 64 or height < 64 or width > 4096 or height > 4096:
+        raise WorkflowError(
+            "Image size dimensions must be between 64 and 4096 pixels"
+        )
+    return width, height
+
+
+_SILICONFLOW_KOLORS_SIZES = {
+    "1024x1024",
+    "960x1280",
+    "768x1024",
+    "720x1440",
+    "720x1280",
+}
+
+
+def _siliconflow_image_size(profile: dict[str, Any]) -> str:
+    configured = _image_config(profile).get("size", "1024x1024")
+    width, height = _image_dimensions(configured)
+    normalized = f"{width}x{height}"
+    if (
+        str(profile.get("model", "")).strip().lower()
+        == "kwai-kolors/kolors"
+        and normalized not in _SILICONFLOW_KOLORS_SIZES
+    ):
+        supported = ", ".join(sorted(_SILICONFLOW_KOLORS_SIZES))
+        raise WorkflowError(
+            f"SiliconFlow model Kwai-Kolors/Kolors does not support image "
+            f"size '{configured}'. Supported sizes: {supported}"
+        )
+    return normalized
+
+
+class OpenAIImagesAdapter:
+    protocol = "openai_images"
+
+    def build_request(
+        self,
+        agent: dict[str, Any],
+        profile: dict[str, Any],
+        inputs: dict[str, Any],
+    ) -> ImageRequest:
+        body: dict[str, Any] = {
+            "model": profile["model"],
+            "prompt": _image_prompt(agent, inputs),
+        }
+        config = _image_config(profile)
+        for key in ("size", "quality", "output_format", "response_format"):
+            value = config.get(key)
+            if value is not None:
+                body[key] = value
+        return ImageRequest(
+            url=profile["base_url"].rstrip("/") + "/images/generations",
+            body=body,
+        )
+
+    def extract_image(
+        self,
+        payload: dict[str, Any],
+        timeout: float,
+    ) -> bytes:
+        return _image_bytes_from_entries(payload.get("data"), "data", timeout)
+
+
+class SiliconFlowImagesAdapter:
+    protocol = "siliconflow"
+
+    def build_request(
+        self,
+        agent: dict[str, Any],
+        profile: dict[str, Any],
+        inputs: dict[str, Any],
+    ) -> ImageRequest:
+        body: dict[str, Any] = {
+            "model": profile["model"],
+            "prompt": _image_prompt(agent, inputs),
+            "image_size": _siliconflow_image_size(profile),
+            "batch_size": 1,
+        }
+        return ImageRequest(
+            url=profile["base_url"].rstrip("/") + "/images/generations",
+            body=body,
+        )
+
+    def extract_image(
+        self,
+        payload: dict[str, Any],
+        timeout: float,
+    ) -> bytes:
+        images = payload.get("images")
+        if isinstance(images, list):
+            return _image_bytes_from_entries(images, "images", timeout)
+        return _image_bytes_from_entries(payload.get("data"), "data", timeout)
+
+
+class Automatic1111ImagesAdapter:
+    protocol = "automatic1111"
+
+    def build_request(
+        self,
+        agent: dict[str, Any],
+        profile: dict[str, Any],
+        inputs: dict[str, Any],
+    ) -> ImageRequest:
+        width, height = _image_dimensions(
+            _image_config(profile).get("size", "1024x1024")
+        )
+        body: dict[str, Any] = {
+            "prompt": _image_prompt(agent, inputs),
+            "negative_prompt": "",
+            "width": width,
+            "height": height,
+            "steps": 28,
+            "cfg_scale": 7,
+            "sampler_name": "DPM++ 2M Karras",
+            "seed": -1,
+            "batch_size": 1,
+            "n_iter": 1,
+        }
+        return ImageRequest(
+            url=profile["base_url"].rstrip("/") + "/sdapi/v1/txt2img",
+            body=body,
+        )
+
+    def extract_image(
+        self,
+        payload: dict[str, Any],
+        timeout: float,
+    ) -> bytes:
+        images = payload.get("images")
+        if not isinstance(images, list) or not images:
+            raise WorkflowError(
+                "AUTOMATIC1111 response did not contain images[0]"
+            )
+        image = images[0]
+        if isinstance(image, str):
+            if image.startswith("data:"):
+                return _download_image(image, timeout)
+            return _decode_image_base64(image)
+        return _image_bytes_from_item(image, timeout)
+
+
+_IMAGE_ADAPTERS = {
+    adapter.protocol: adapter
+    for adapter in (
+        OpenAIImagesAdapter(),
+        SiliconFlowImagesAdapter(),
+        Automatic1111ImagesAdapter(),
+    )
+}
+
+
+def _image_adapter(profile: dict[str, Any]) -> Any:
+    protocol = _image_config(profile).get("protocol", "automatic1111")
+    adapter = _IMAGE_ADAPTERS.get(protocol)
+    if adapter is None:
+        supported = ", ".join(sorted(_IMAGE_ADAPTERS))
+        raise WorkflowError(
+            f"Unsupported image protocol '{protocol}'; supported: {supported}"
+        )
+    return adapter

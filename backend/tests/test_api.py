@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import errno
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from loomlane import storage as storage_module
 from loomlane.main import create_app
 from loomlane.models import EdgeType, Port, PortType, SecretStatus, WorkflowInput
 from loomlane.runtime import RunManager
@@ -102,6 +104,32 @@ def test_project_api_round_trip(tmp_path: Path) -> None:
         assert generated.json()["compiler_key"]
 
 
+def test_web_client_cors_preflight_allows_validation_and_generation(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    app = create_app(store=store, credentials=MemoryCredentials())
+
+    with TestClient(app) as client:
+        project = client.get("/api/projects").json()[0]
+        headers = {
+            "Origin": "http://127.0.0.1:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        }
+
+        for action in ("validate", "generate"):
+            response = client.options(
+                f"/api/projects/{project['id']}/{action}",
+                headers=headers,
+            )
+            assert response.status_code == 200
+            assert (
+                response.headers["access-control-allow-origin"]
+                == "http://127.0.0.1:5173"
+            )
+
+
 def test_revision_conflict_returns_409(tmp_path: Path) -> None:
     store = ProjectStore(tmp_path / "projects")
     app = create_app(store=store, credentials=MemoryCredentials())
@@ -119,6 +147,72 @@ def test_revision_conflict_returns_409(tmp_path: Path) -> None:
         )
 
     assert response.status_code == 409
+
+
+def test_project_save_accepts_draft_but_validate_reports_incomplete_workflow(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    app = create_app(store=store, credentials=MemoryCredentials())
+
+    with TestClient(app) as client:
+        summary = client.get("/api/projects").json()[0]
+        detail = client.get(f"/api/projects/{summary['id']}").json()
+        detail["sdl"]["start"] = []
+
+        saved = client.put(
+            f"/api/projects/{summary['id']}",
+            json={
+                "sdl": detail["sdl"],
+                "canvas": detail["canvas"],
+                "base_revision": detail["revision"],
+            },
+        )
+        validation = client.post(
+            f"/api/projects/{summary['id']}/validate",
+            json={"sdl": saved.json()["sdl"]},
+        )
+
+    assert saved.status_code == 200
+    assert saved.json()["sdl"]["start"] == []
+    assert validation.status_code == 200
+    assert validation.json()["valid"] is False
+
+
+def test_project_save_returns_structured_error_for_persistent_file_lock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = ProjectStore(tmp_path / "projects")
+    app = create_app(store=store, credentials=MemoryCredentials())
+
+    with TestClient(app) as client:
+        summary = client.get("/api/projects").json()[0]
+        detail = client.get(f"/api/projects/{summary['id']}").json()
+
+        def locked_replace(_: str | Path, destination: str | Path) -> None:
+            raise PermissionError(
+                errno.EACCES,
+                "file is locked",
+                destination,
+            )
+
+        monkeypatch.setattr(storage_module.os, "replace", locked_replace)
+        monkeypatch.setattr(storage_module.time, "sleep", lambda _: None)
+        response = client.put(
+            f"/api/projects/{summary['id']}",
+            json={
+                "sdl": detail["sdl"],
+                "canvas": detail["canvas"],
+                "base_revision": detail["revision"],
+            },
+        )
+
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["code"] == "project_storage_write_failed"
+        assert "retry" in payload["detail"].lower()
+        assert client.get(f"/api/projects/{summary['id']}").json()["revision"] == 1
 
 
 def test_get_project_with_v0_2_workflow_schema(tmp_path: Path) -> None:
@@ -318,3 +412,110 @@ def test_api_profile_delete_survives_vault_cleanup_failure(
         assert client.get("/api/api-profiles").json() == []
 
     assert profile_store.list() == []
+
+
+def test_image_generation_profile_config_round_trips_through_api(
+    tmp_path: Path,
+) -> None:
+    profile_store = ApiProfileStore(tmp_path / "api-profiles.json")
+    app = create_app(
+        store=ProjectStore(tmp_path / "projects"),
+        api_profiles=profile_store,
+        credentials=MemoryCredentials(),
+    )
+    profile = {
+        "id": "openai-images",
+        "name": "OpenAI Images",
+        "provider": "openai_compatible",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-image-1",
+        "capabilities": {
+            "function_calling": False,
+            "vision": False,
+            "long_context": False,
+            "structured_output": False,
+            "image_generation": True,
+        },
+        "image_generation": {
+            "protocol": "openai_images",
+            "size": "1024x1024",
+            "quality": "high",
+            "output_format": "png",
+            "response_format": "b64_json",
+        },
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/api/api-profiles", json=profile)
+        assert created.status_code == 201
+        assert created.json()["capabilities"]["image_generation"] is True
+        assert created.json()["image_generation"] == profile["image_generation"]
+
+        fetched = client.get("/api/api-profiles")
+        assert fetched.status_code == 200
+        assert (
+            fetched.json()[0]["image_generation"]["protocol"]
+            == "openai_images"
+        )
+        assert fetched.json()[0]["image_generation"]["size"] == "1024x1024"
+
+        updated = client.put(
+            "/api/api-profiles/openai-images",
+            json={
+                **profile,
+                "image_generation": {
+                    **profile["image_generation"],
+                    "size": "1536\u00d71024",
+                    "quality": "medium",
+                },
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["image_generation"]["size"] == "1536x1024"
+        assert updated.json()["image_generation"]["quality"] == "medium"
+
+    persisted = profile_store.get("openai-images")
+    assert persisted.capabilities.image_generation is True
+    assert persisted.image_generation is not None
+    assert persisted.image_generation.protocol == "openai_images"
+    assert persisted.image_generation.size == "1536x1024"
+
+
+def test_automatic1111_profile_round_trips_through_api(tmp_path: Path) -> None:
+    profile_store = ApiProfileStore(tmp_path / "api-profiles.json")
+    app = create_app(
+        store=ProjectStore(tmp_path / "projects"),
+        api_profiles=profile_store,
+        credentials=MemoryCredentials(),
+    )
+    profile = {
+        "id": "local-sd",
+        "name": "Local Stable Diffusion",
+        "provider": "openai_compatible",
+        "base_url": "http://127.0.0.1:7860",
+        "model": "local",
+        "capabilities": {"image_generation": True},
+        "image_generation": {
+            "protocol": "automatic1111",
+            "size": "1024x1024",
+        },
+    }
+
+    with TestClient(app) as client:
+        created = client.post("/api/api-profiles", json=profile)
+        assert created.status_code == 201
+        assert (
+            created.json()["image_generation"]["protocol"]
+            == "automatic1111"
+        )
+
+        fetched = client.get("/api/api-profiles")
+        assert fetched.status_code == 200
+        assert (
+            fetched.json()[0]["image_generation"]["protocol"]
+            == "automatic1111"
+        )
+
+    persisted = profile_store.get("local-sd")
+    assert persisted.image_generation is not None
+    assert persisted.image_generation.protocol == "automatic1111"
