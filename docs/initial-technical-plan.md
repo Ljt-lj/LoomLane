@@ -1,9 +1,9 @@
-# LoomLane V0.2.5 技术方案与落地记录
+# LoomLane V0.2 技术方案与落地记录
 
-- 状态：V0.2.5 已落地，本文档作为当前实现基线与后续演进依据
-- 目标版本：V0.2.5
+- 状态：V0.2 已落地，本文档作为当前实现基线与后续演进依据
+- 目标版本：V0.2
 - 输入材料：`LL.json`
-- 更新时间：2026-11-23
+- 更新时间：2026-11-19
 
 ## 1. 方案摘要
 
@@ -22,7 +22,7 @@ LoomLane 是一个本地优先的多 Agent 流水线可视化编排与编译系�
 
 从现有材料看，项目要实现的是完整的 LoomLane 产品，而不是一个单独的 Codex `SKILL.md` 技能包。下文按产品工程方案设计；如果最终还需要提供 Codex Skill，应另做一层调用和交付封装，不与本方案的应用程序架构混在一起。
 
-### 1.1 V0.2.5 已实现能力
+### 1.1 V0.2 已实现能力
 
 | 模块 | 当前实现 |
 | --- | --- |
@@ -32,7 +32,6 @@ LoomLane 是一个本地优先的多 Agent 流水线可视化编排与编译系�
 | 面板 | 左、右、底部面板均可收纳；左右面板可调宽度，底部面板可调高度，偏好持久化到浏览器 |
 | API Profile | 增删改、密钥状态查询、密钥写入/删除；删除被引用 Profile 时自动迁移或阻止 |
 | 模型 JSON 输出 | 每个 Agent 可独立启用层次化 JSON 模板，并通过 `response_format={"type":"json_object"}` 请求 JSON |
-| 图片生成 | Chat/Image Agent 双模式、图片供应商适配器、OpenAI Images/SiliconFlow/AUTOMATIC1111 协议、图片校验与自动落盘 |
 | 编译 | 从规范化 SDL 确定性生成独立 Python 项目 |
 | 运行 | 子进程执行、条件分支、有界 Feedback/Loop、Fan-out、Aggregate、人工确认、并行度和取消 |
 | 限额 | 单次请求 `max_tokens`、Agent 累计 `max_total_tokens`、Workflow 累计 `max_total_tokens`、`max_steps` |
@@ -62,18 +61,16 @@ LoomLane 是一个本地优先的多 Agent 流水线可视化编排与编译系�
 8. 将运行事件流式反馈到前端、持久化为 `events.jsonl`，并按事件序号进行运行回放。
 9. 在本地项目目录中保存画布布局、SDL、生成物、运行记录和自动落盘产物。
 10. 对单次模型调用、Agent 累计、Workflow 累计和运行步数实施分层限额。
-11. 支持图片生成 Agent，将图片服务的 Base64 或 URL 结果保存为运行工作区文件，并继续走统一 artifacts 流程。
 
 ### 2.2 V0.2 非目标
 
 - 不做多租户、云端协作、权限系统。
 - 不支持任意 Python、JavaScript 或 Jinja2 表达式执行。
 - 不做 token 级模型流式输出，只回传节点、边、用量和错误等运行事件。
-- 不提供第三方供应商插件热加载；V0.2.5 已内置 OpenAI Images、SiliconFlow 和 AUTOMATIC1111 / Forge 图片适配器，并默认使用本地 AUTOMATIC1111 / Forge。
+- 不做多 provider 完整适配；V0.2 只实现 OpenAI 兼容接口。
 - 不实现 Agent 内 Python 精细规则。
 - 不提供分布式执行或跨主机调度；并行仅限单个生成项目的本地线程池。
 - 不提供产物的在线编辑、版本管理或对象存储；产物文件由本地运行工作区管理。
-- 图片能力只做生成，不做图生图、局部重绘、蒙版编辑或视频生成；这些能力需要独立输入协议。
 - 不校验 `AGGREGATE` 映射是否覆盖目标 Agent 的全部必要输入，仍需用户在保存前补齐。
 
 ## 3. 关键设计决策
@@ -93,8 +90,6 @@ LoomLane 是一个本地优先的多 Agent 流水线可视化编排与编译系�
 | 并发调度 | 有界线程池 + 显式就绪队列 | 在单机本地执行中获得可控并行，不引入分布式运行时 |
 | 人工暂停 | Gate 文件 + 进程内等待线程 | 子进程可暂停、状态可落盘，API 可在独立请求中批准或拒绝 |
 | 运行回放 | 原始事件流 + 纯函数推导视图 | 回放与实时消费共用一套状态机，支持任意事件序号重建 |
-| 图片生成 | Agent 增加 `chat`/`image` 模式，图片参数和协议放在 API Profile | 同一工作流可以混用文本与图片服务，同时避免把模型能力和请求参数散落到 Agent Prompt |
-| 图片供应商 | `image_generation.protocol` 选择适配器，公共运行层负责调用与落盘 | 将供应商差异限制在请求构造和响应提取，密钥、重试、安全校验及 artifacts 逻辑保持一致 |
 
 与初始 JSON 方案相比，V0.2 落地时已经收敛以下细节：
 
@@ -381,13 +376,6 @@ edges:
 - 其他跨类型连接默认报错，不做隐式字符串化。
 - `schema_hint` 在 V0.2 可保存任意 JSON Schema 子集；运行时可用于附加校验，不替代端口类型。
 
-图片 Agent 额外要求：
-
-- `agents[].mode` 必须是 `image`；旧配置缺省时按 `chat` 处理。
-- 引用的 API Profile 必须设置 `capabilities.image_generation: true`。
-- 必须有且只有一个 `FILE` 输出端口，图片运行时会把生成文件路径写入该端口。
-- 不允许启用 `json_output`，图片服务响应与普通 Chat JSON 输出是两套协议。
-
 ### 6.4 条件表达式
 
 V0.2 不支持原始字符串表达式。条件使用 AST：
@@ -549,25 +537,8 @@ json_output:
 - 最外层键必须与 Agent 的输出端口一一对应。缺少端口、增加未知最外层键都会导致节点失败。
 - 嵌套对象允许使用任意业务字段名，当前的 `outline.sections` 表示“`outline` 对象中的 `sections` 字段”，不是名为 `outline.sections` 的单层键。
 - 字符串叶值用于描述模型应返回的内容或类型，模型应把说明替换为实际值。
-- `TEXT` 端口的模板值必须是标量说明，不能写成对象或数组；需要保留层次化结果时，应把端口类型改为 `DATA`。
-- `FILE` 端口的保存校验仍要求模板是带字符串 `path` 字段的对象，用于指导模型生成标准引用。
-- Chat Agent 实际返回合法相对路径字符串时，运行时会先规范化为 `{"path": "..."}`，再执行工作区路径和文件引用安全检查；不会放宽越界路径限制。
 - JSON 解析成功后，运行时仍按输出端口执行 `TEXT`、`DATA`、`FILE`、`MIXED` 类型检查。
 - `schema_hint` 会在端口类型检查后继续校验，例如 `score` 的 `type/minimum/maximum`。
-
-例如 `suggestion` 是 `TEXT` 端口时，错误模板与正确模板分别为：
-
-```yaml
-# 错误：对象输出会在运行时触发 Port 'suggestion' requires TEXT
-suggestion:
-  风格: 画风修改建议
-  背景: 背景修改建议
-
-# 正确：把综合建议作为一段文本返回
-suggestion: 综合风格、背景、角色和质量维度的完整修改建议文本
-```
-
-保存或显式校验时，此类冲突会返回 `json_output_port_type_mismatch`，不需要等到运行阶段才发现。
 
 前端填写方式：
 
@@ -638,221 +609,6 @@ API Key 不属于 SDL 字段。配置步骤是：
 3. 为该 Profile 输入 Key 并点击保存密钥。
 4. 看到“已配置”后再运行。修改 origin 后状态会回到“未配置”，这是密钥安全绑定生效，而不是保存失败。
 
-### 6.9 图片生成 Profile 与 Agent 配置
-
-V0.2.5 通过图片供应商适配器接入不同图片服务。API Profile 顶层的
-`provider: openai_compatible` 表示该 Profile 属于 OpenAI 风格配置族；
-`image_generation.protocol` 进一步选择实际图片协议。未填写 `protocol` 时默认
-使用 `automatic1111`，调用本机或内网 WebUI；需要使用 OpenAI Images 或
-SiliconFlow 的配置应显式填写对应协议。
-
-OpenAI Images Profile 示例：
-
-```yaml
-api_profiles:
-  - id: openai-images
-    name: OpenAI Images
-    provider: openai_compatible
-    base_url: https://api.openai.com/v1
-    model: gpt-image-1
-    request:
-      timeout_seconds: 120
-      max_retries: 2
-      temperature: 0.2
-    capabilities:
-      function_calling: false
-      vision: false
-      long_context: false
-      structured_output: false
-      image_generation: true
-    image_generation:
-      protocol: openai_images
-      size: 1024x1024
-      quality: high
-      output_format: png
-      response_format: b64_json
-```
-
-SiliconFlow Profile 示例：
-
-```yaml
-api_profiles:
-  - id: siliconflow-kolors
-    name: SiliconFlow Kolors
-    provider: openai_compatible
-    base_url: https://api.siliconflow.cn/v1
-    model: Kwai-Kolors/Kolors
-    request:
-      timeout_seconds: 120
-      max_retries: 2
-      temperature: 0.2
-    capabilities:
-      function_calling: false
-      vision: false
-      long_context: false
-      structured_output: false
-      image_generation: true
-    image_generation:
-      protocol: siliconflow
-      size: 1024x1024
-      quality: null
-      output_format: null
-      response_format: null
-```
-
-本地 AUTOMATIC1111 / Forge Profile 示例：
-
-```yaml
-api_profiles:
-  - id: local-sd
-    name: Local Stable Diffusion
-    provider: openai_compatible
-    base_url: http://127.0.0.1:7860
-    model: local
-    request:
-      timeout_seconds: 300
-      max_retries: 0
-      temperature: 0.2
-    capabilities:
-      function_calling: false
-      vision: false
-      long_context: false
-      structured_output: false
-      image_generation: true
-    image_generation:
-      protocol: automatic1111
-      size: 1024x1024
-      quality: null
-      output_format: null
-      response_format: null
-```
-
-字段说明：
-
-| 字段 | 作用 |
-| --- | --- |
-| `capabilities.image_generation` | 标记该 Profile 可供 Image Agent 使用 |
-| `image_generation.protocol` | `openai_images`、`siliconflow` 或 `automatic1111`；缺省值为 `automatic1111` |
-| `image_generation.size` | 请求图片尺寸，默认 `1024x1024`，最终以服务端支持范围为准 |
-| `image_generation.quality` | OpenAI Images 可选质量值，留空时不向服务端发送 |
-| `image_generation.output_format` | OpenAI Images 输出格式，可选 `png`、`jpeg` 或 `webp` |
-| `image_generation.response_format` | OpenAI Images 偏好 `url` 或 `b64_json`，留空时使用服务端默认行为 |
-
-`quality`、`output_format` 和 `response_format` 仅对 OpenAI Images 生效，
-不会泄漏到 SiliconFlow 或 AUTOMATIC1111 请求中。
-
-对应 Agent：
-
-```yaml
-- id: illustrator
-  name: 封面绘制
-  api_profile: openai-images
-  mode: image
-  system_prompt: 根据需求生成一张构图清晰、文字留白充足的编辑插画。
-  inputs:
-    - name: brief
-      type: TEXT
-      required: true
-  outputs:
-    - name: picture
-      type: FILE
-  json_output:
-    enabled: false
-    template: {}
-```
-
-OpenAI Images 适配器向 `POST {base_url}/images/generations` 发送：
-
-```json
-{
-  "model": "gpt-image-1",
-  "prompt": "由全局背景 Prompt、Agent System Prompt 和当前输入拼装",
-  "size": "1024x1024",
-  "quality": "high",
-  "output_format": "png",
-  "response_format": "b64_json"
-}
-```
-
-SiliconFlow 适配器调用相同路径，但发送该供应商接受的字段：
-
-```json
-{
-  "model": "Kwai-Kolors/Kolors",
-  "prompt": "由全局背景 Prompt、Agent System Prompt 和当前输入拼装",
-  "image_size": "1024x1024",
-  "batch_size": 1
-}
-```
-
-AUTOMATIC1111 / Forge 适配器调用本地 WebUI API：
-
-```text
-POST {base_url}/sdapi/v1/txt2img
-```
-
-```json
-{
-  "prompt": "由全局背景 Prompt、Agent System Prompt 和当前输入拼装",
-  "negative_prompt": "",
-  "width": 1024,
-  "height": 1024,
-  "steps": 28,
-  "cfg_scale": 7,
-  "sampler_name": "DPM++ 2M Karras",
-  "seed": -1,
-  "batch_size": 1,
-  "n_iter": 1
-}
-```
-
-`size` 会拆分为 `width` 和 `height`。实际 checkpoint、VAE 和采样器实现由
-WebUI 当前加载的模型决定，Profile 的 `model` 字段不会切换 WebUI 模型。
-
-本地部署要求与硬件建议：
-
-1. AUTOMATIC1111 或 Forge WebUI 必须使用 `--api` 启动，例如
-   `webui.bat --api --port 7860`。
-2. `base_url` 填 WebUI 根地址，例如 `http://127.0.0.1:7860`，不要追加
-   `/v1`、`/sdapi/v1` 或 `/sdapi/v1/txt2img`。
-3. 本机回环地址和 `host.docker.internal` 被视为本地服务，因此不需要 API Key；
-   仍必须创建 Profile 并启用 `capabilities.image_generation`。
-4. 不要把启用 `--api` 且无认证的 WebUI 直接暴露到公网；远程部署应在反向代理层
-   增加认证和访问控制。
-5. 8 GB 显存适合常见的 1024 级生成；6 GB 可使用较小 checkpoint 或较低分辨率；
-   4 GB 通常需要更低分辨率、优化参数或接受较慢速度。CPU 可以运行，但生成时间
-   会显著增加。
-6. 生成耗时可能远高于文本请求，建议把 Profile 的 `timeout_seconds` 设置为
-   `120` 到 `300` 秒，并按本地服务稳定性配置重试次数。
-
-三个适配器共享同一个运行流程：
-
-1. 从环境变量读取与 Profile 绑定的 API Key。
-2. 由适配器构造供应商请求。
-3. 公共运行层处理超时、重试、429 和 5xx。
-4. 由适配器从响应中提取 Base64、HTTP URL 或 data URL 图片；
-   AUTOMATIC1111 的裸 Base64 图片也走同一套解码与校验。
-5. 公共运行层执行大小限制、文件头校验、安全下载和 artifacts 落盘。
-
-配置顺序：
-
-1. 在 API 常用库或项目 Profile 中启用 `Image generation`，选择供应商协议并填写该协议支持的参数。
-2. 保存项目和 Profile，再按普通 Profile 的方式配置 API Key。
-3. 在 Agent 检查器把模式切换为 `Image`；界面会自动选择兼容 Profile、关闭 JSON 输出并整理为单个 `FILE` 输出。
-4. 校验、生成并运行工作流，在结果与产物区域查看 `artifact_written`。
-
-DeepSeek 文本模型不能用于图片生成。即使接口形态兼容 OpenAI，也必须确认目标模型实际支持对应图片接口，否则会返回 404 或参数错误。
-
-新增图片供应商时，在生成运行时的
-`backend/templates/generated/runners/image_providers.py.j2` 中增加适配器。适配器需要：
-
-- 声明唯一的 `protocol` 标识。
-- 实现 `build_request(agent, profile, inputs) -> ImageRequest`。
-- 实现 `extract_image(payload, timeout) -> bytes`。
-- 注册到 `_IMAGE_ADAPTERS`，并同步 Pydantic、前端联合类型和测试。
-
-文件下载、安全边界、Token 记录和 artifacts 写入不需要在供应商适配器中重复实现。
-
 ## 7. SDL 校验与编译
 
 ### 7.1 校验分两层
@@ -874,8 +630,6 @@ DeepSeek 文本模型不能用于图片生成。即使接口形态兼容 OpenAI�
 - `AGGREGATE` 配置只能出现在 `AGGREGATE` 边上，`HUMAN_GATE` 配置只能出现在 `HUMAN_GATE` 边上。
 - 同一目标 Agent 的所有 `AGGREGATE` 入边必须使用相同的 `all` 或 `any` 模式。
 - `AGGREGATE` 目标不能与其他类型的入边混用。
-- `image` 模式 Agent 必须引用启用了图片能力的 Profile，并且只能有一个 `FILE` 输出。
-- `image` 模式 Agent 不能同时启用 `json_output`。
 - 所有节点均可从 `start` 到达；不可达节点作为错误处理。
 - 工作流声明的输出引用存在。
 - SDL 中不能出现 `api_key`、`secret`、`password` 等敏感字段。
@@ -975,9 +729,7 @@ V0.2 使用批次感知的并行就绪队列：
 
 ### 8.3 Agent 调用
 
-#### Chat Agent 调用
-
-每个 Chat Agent 请求包含：
+每个 Agent 请求包含：
 
 - 全局背景 Prompt，按 `applies_to` 和 `injection` 配置注入。
 - Agent 自身 `system_prompt`。
@@ -1006,37 +758,6 @@ V0.2 使用批次感知的并行就绪队列：
 因此 `Port 'outline' does not satisfy schema_hint` 表示模型已经返回了 `outline`，但值不满足端口声明的 JSON Schema 子集，例如声明为 `object` 却返回了字符串，或 `score` 超出 `minimum/maximum`。
 
 超时和重试只覆盖网络错误、429 和 5xx。4xx 参数错误、JSON 解析失败和端口校验失败不做无限重试。
-
-#### 图片 Agent 调用
-
-`mode: image` 的 Agent 不调用 `/chat/completions`。运行时根据
-`profile.image_generation.protocol` 选择图片适配器；当前 OpenAI Images 和
-SiliconFlow 调用：
-
-```text
-POST {base_url}/images/generations
-```
-
-AUTOMATIC1111 / Forge 调用：
-
-```text
-POST {base_url}/sdapi/v1/txt2img
-```
-
-请求 Prompt 由全局背景 Prompt、Agent System Prompt 和当前输入 JSON 组成。当前输入中的 `TEXT`、`DATA` 会序列化为文字提示；`FILE` 只作为工作区内路径引用传入，不会自动上传或读取为二进制图片。因此 V0.2.5 是“根据工作流上下文生成图片”，不是图生图编辑。
-
-响应处理顺序：
-
-1. 校验 HTTP 状态与响应根对象。
-2. 适配器提取图片引用。OpenAI Images 读取 `data[0]`；SiliconFlow 优先读取 `images[0]`，并兼容 `data[0]` 响应；AUTOMATIC1111 解码 `images[0]` 中的裸 Base64。
-3. 图片项支持 `b64_json`、HTTP(S) URL 和 `data:image/...;base64,...`。外部 URL 必须解析到公网地址，并禁止重定向。
-4. 单张图片最大 `20 MB`。
-5. 通过文件头识别 PNG、JPEG 或 WebP，拒绝伪装成图片的任意二进制数据。
-6. 写入 `runs/{run_id}/workspace/generated/images/{agent_id}/{uuid}.{ext}`。
-7. 返回 `{ "path": "...", "media_type": "..." }` 给 Agent 的 `FILE` 输出端口。
-8. 现有 artifacts 逻辑继续把图片复制到端口配置的 `output_dir`，并发出 `artifact_written`。
-
-图片接口若返回 `usage`，运行时按 `prompt_tokens`、`completion_tokens`、`total_tokens` 累加，并受 Agent 与 Workflow 累计 Token 上限约束。网络错误、429 和 5xx 使用 Profile 的 `max_retries`；参数错误、非法图片和 URL 安全校验失败不重试。供应商差异只存在于“构造请求”和“提取图片引用”，其余行为由公共运行层统一实现。
 
 ### 8.4 子进程协议
 
@@ -1099,7 +820,6 @@ Agent 流生成物的位置分为三类：
 - 编译产物：`workspace/projects/{project_id}/generated/{compiler_key}/`，包含 `workflow.py`、`config.py`、Agent 配置和运行时模板。
 - 运行数据：`workspace/projects/{project_id}/runs/{run_id}/`，包含 `meta.json`、`input.json`、`events.jsonl`、`result.json`、`gates/` 和 `workspace/`。
 - Agent 产物：每个成功输出端口都会自动写入运行工作区，默认目录为 `artifacts/`，也可由 `agents[].output_dir` 指定相对目录。
-- 图片源文件：图片 Agent 先写入 `workspace/generated/images/{agent_id}/`，再由统一 artifacts 逻辑复制到目标产物目录。
 
 自动落盘规则：
 
@@ -1125,8 +845,6 @@ Agent 流生成物的位置分为三类：
 - 所有路径在写盘前解析并检查仍位于工作区根目录内。
 
 每次落盘会发出 `artifact_written` 事件，包含 `port`、`path`、`type`、`step`、`batch_id` 和 `bytes`。文件路径相对运行工作区，前端会显示为 `runs/{run_id}/workspace/{path}`。
-
-图片 Agent 的 `workflow_outputs.picture` 与 `agent_outputs.{agent_id}.picture` 指向 `generated/images/...` 下的图片源文件；`artifacts` 列表指向按 step、batch 命名后的最终产物副本。排查时两者都可以打开，前者是本次生成原图，后者是统一产物命名后的交付文件。
 
 `result.json` 的当前结构为：
 
@@ -1265,7 +983,7 @@ V0.2 只有一个实际工作界面：
 
 - 从节点库拖入 Agent 节点。
 - 节点间连线后选择边类型。
-- 点击节点编辑名称、Chat/Image 模式、Prompt、输入输出端口、API Profile 和 JSON 输出。
+- 点击节点编辑名称、Prompt、输入输出端口、API Profile 和 JSON 输出。
 - 点击边编辑类型、映射、通用条件、Feedback/Loop guard、Aggregate 模式和 Human Gate 策略。
 - 选中 Agent 或边后，可用 `Delete`/`Backspace` 或检查器中的删除按钮移除。
 - 删除 Agent 时，同时移除它的 `start` 引用、关联边、工作流输出和画布元素。
@@ -1318,16 +1036,7 @@ V0.2 只有一个实际工作界面：
 - 行 key 使用稳定的同级索引，而不是可编辑字段名，修复了输入一个字符后输入框失焦的问题。
 - 最外层键应与输出端口一致；`outline.sections` 需要在 UI 中分层填写，不能作为单层键名直接输入。
 
-### 10.7 图片配置界面
-
-- API 常用库和项目内 API Profile 都提供 `Image generation` 能力开关。
-- 启用后显示尺寸、质量、输出格式和 API 响应格式。质量与格式可以为空，表示使用供应商默认值。
-- Agent 模式切换为 `Image` 时，前端自动寻找兼容 Profile、关闭 JSON 输出，并把输出整理成单个 `FILE` 端口。
-- Image 模式的 Profile 下拉会禁用未启用图片能力的 Profile，并在当前选择不兼容或输出契约错误时显示行内提示。
-- 切回 `Chat` 时，如果当前只有一个 `FILE` 输出，会转换为 `TEXT`；其他端口结构保持不变。
-- 图片大小、质量和格式最终由目标服务校验，前端字段不会代替供应商能力表。
-
-### 10.8 运行态
+### 10.7 运行态
 
 节点状态：
 
@@ -1433,9 +1142,6 @@ POST   /api/runs/{run_id}/cancel
 - YAML 使用 `safe_load` 并设置输入大小上限。
 - 项目 ID、Gate ID 和产物路径都做格式与根目录校验；拒绝绝对路径、盘符路径、`..` 和解析后逃逸工作区的路径。
 - `FILE` 产物只允许复制运行工作区内的普通文件；目标目录 `output_dir` 必须是工作区内的相对路径。
-- 图片 URL 下载禁止重定向，拒绝内网、回环、链路本地和其他非公网地址，并忽略 URL 中的用户名密码。
-- 图片响应支持 PNG、JPEG、WebP，单张最大 `20 MB`；Base64 预览和解码后尺寸都会检查，避免无界内存占用。
-- 图片文件必须先写入运行工作区，再经过现有 `FILE` 路径检查和 artifacts 复制流程。
 - 子进程只继承必要环境变量。
 - 运行管理器最多保留 `10,000` 条事件，单条事件最多 `1,000,000` 字节，stderr 最多保留 `128,000` 字节。
 - 单次运行默认超时 `3,600` 秒，并受 SDL `limits.max_steps` 约束；子进程退出后统一收敛为成功、失败或取消状态。
@@ -1461,8 +1167,8 @@ pnpm --dir apps/web build
 | 项目 | 结果 |
 | --- | --- |
 | 后端 Python 编译检查 | 通过 |
-| 后端 pytest | 67 passed, 1 warning |
-| 前端 Vitest | 31 passed |
+| 后端 pytest | 35 passed, 1 warning |
+| 前端 Vitest | 23 passed |
 | 前端生产构建 | 通过 |
 | 浏览器检查 | 本轮未执行；当前仓库未安装 Playwright |
 
@@ -1481,11 +1187,6 @@ pnpm --dir apps/web build
 - `TEXT`、`DATA`、`FILE` 自动落盘、自定义输出目录和路径逃逸拒绝。
 - 系统凭据库、DPAPI 回退、原子写入、origin 绑定和删除行为。
 - 全局 API Profile CRUD、项目级/全局密钥、Profile 导入和删除行为。
-- 图片 Profile 的 `capabilities.image_generation`、`image_generation.protocol` 与供应商参数可通过 API 创建、读取和更新。
-- 图片 Agent 的校验规则、Base64 图片保存、非图片内容拒绝和非公网 URL 拒绝。
-- OpenAI Images、SiliconFlow 与 AUTOMATIC1111 适配器分别生成对应请求字段，均不误调用 `/chat/completions`，并生成 `FILE` artifacts。
-- SiliconFlow `images[0].url` 返回 data URL 时可解码、校验并落盘；OpenAI-only 参数不会泄漏到 SiliconFlow 请求。
-- AUTOMATIC1111 本地 `txt2img` 请求包含宽高、采样参数和批次参数，裸 Base64 响应可解码、校验并落盘，本地回环地址无需 API Key。
 - 项目创建、保存、revision、导入、生成、运行、运行列表、Gate 决策和删除 API。
 - 生成项目哈希稳定性和密钥不进入生成物。
 
@@ -1499,7 +1200,6 @@ pnpm --dir apps/web build
 - 事件回放的时间线裁剪、节点/边/Token/Gate/artifacts 同步重建和进度边界。
 - 关键类型转换和安全默认值。
 - JSON 模板编辑使用稳定行 key，避免字段重命名导致失焦。
-- 图片能力默认值仍保持 Chat 兼容，新增 Profile 和 Agent 数据结构不破坏既有工作流工具。
 
 ### 13.4 手工与后续测试
 
@@ -1513,10 +1213,10 @@ pnpm --dir apps/web build
 | 阶段 | 状态 | 已落地内容 |
 | --- | --- | --- |
 | A：契约和基础工程 | 已完成 | 前后端工程、SDL 模型、示例项目、校验器、测试基础 |
-| B：编译与无界面运行 | 已完成 | Jinja2 生成、OpenAI Chat/Image 调用、批次感知并行调度、Loop/Feedback guard、事件输出 |
+| B：编译与无界面运行 | 已完成 | Jinja2 生成、OpenAI 兼容调用、批次感知并行调度、Loop/Feedback guard、事件输出 |
 | C：API 与本地持久化 | 已完成 | 项目 CRUD、revision、原子写入、密钥存储、编译缓存、SSE、取消运行 |
-| D：可视化编辑器 | 已完成 | React Flow、七种边配置、三面板收纳/调整、条件树、JSON/Image 配置、Gate 待办、运行高亮、回放和 artifacts |
-| E：加固与文档 | 基本完成 | 路径与图片 URL 安全、Gate 文件锁、Token/事件上限、密钥隔离、测试、示例和故障排查；全流程 Playwright CI 留作后续 |
+| D：可视化编辑器 | 已完成 | React Flow、七种边配置、三面板收纳/调整、条件树、JSON 编辑器、Gate 待办、运行高亮、回放和 artifacts |
+| E：加固与文档 | 基本完成 | 路径安全、Gate 文件锁、Token/事件上限、密钥隔离、测试、示例和故障排查；全流程 Playwright CI 留作后续 |
 
 ## 15. 常见故障排查
 
@@ -1538,11 +1238,9 @@ pnpm --dir apps/web build
 
 1. 停止旧后端进程。
 2. 使用 `--reload` 重新启动：
-
    ```powershell
-   .\.venv\Scripts\python -m uvicorn loomlane.main:app --app-dir backend/src --reload-dir backend/src --port 8000
+    .\.venv\Scripts\python -m uvicorn loomlane.main:app --app-dir backend/src --reload --port 8000
    ```
-
 3. 刷新前端并重试保存。
 4. 必要时检查 OpenAPI 是否已包含 `AgentJsonOutput`。
 
@@ -1640,7 +1338,6 @@ Feedback 边已允许成功遍历 3 次，第 4 次仍满足条件时运行失�
 
 - 检查 `GET /api/runs/{run_id}` 返回的 `pending_gates`，其中会列出 Gate、来源边、提示文案和超时时间。
 - 申请人工确认：
-
   ```powershell
   Invoke-RestMethod `
     -Method Post `
@@ -1648,7 +1345,6 @@ Feedback 边已允许成功遍历 3 次，第 4 次仍满足条件时运行失�
     -ContentType application/json `
     -Body '{"decision":"approve","comment":"确认通过"}'
   ```
-
 - 多个 Gate 必须全部解决后运行才会继续。已决策 Gate 再次提交会返回 `409`，不存在的 Gate 返回 `404`。
 - 如果配置了 `timeout_seconds`，应检查 `on_timeout`。超时后运行时会写入默认决策，迟到的审批不会覆盖该决策。
 
@@ -1674,18 +1370,6 @@ Feedback 边已允许成功遍历 3 次，第 4 次仍满足条件时运行失�
 - 检查聚合 mapping 是否为目标必填输入提供了端口；当前校验器不检查 mapping 覆盖率。
 - 检查 Fan-out 的源 Agent、批次 ID 和聚合边是否属于同一逻辑分支。普通边与聚合边不能混用到同一个目标。
 
-### 15.12 图片生成失败
-
-- `/images/generations` 返回 404：确认 `base_url` 只写到 API 版本根路径，并确认供应商确实提供图片生成接口；DeepSeek 文本模型不能生成图片。
-- AUTOMATIC1111 返回 404：确认 WebUI 使用 `--api` 启动，Profile 的 `base_url` 是根地址，并且运行时可访问该地址。
-- AUTOMATIC1111 连接被拒绝或超时：确认 WebUI 正在运行、端口正确，并适当提高 `request.timeout_seconds`；本地服务默认允许不配置 API Key。
-- 返回模型或无权限错误：确认图片 Profile 的 `model`、API Key 和账号图片权限；图片 Key 与文本 Key 可以分开配置。
-- 提示 Profile 不支持图片：在 API Profile 中启用 `Image generation`，并确保 Agent 选择的是该 Profile。
-- 提示必须有一个 FILE 输出：Image Agent 只保留一个输出端口，类型设为 `FILE`。
-- 提示不是支持的图片：服务返回了 HTML、JSON 错误页或其他二进制内容；查看运行日志中的 HTTP 状态与供应商错误详情。
-- 提示非公网地址：图片服务返回了指向本机、内网或链路本地地址的 URL。当前安全策略不允许运行器下载这类 URL，可让服务改为返回 `b64_json`。
-- 图片超过 20 MB：降低尺寸或质量，或让供应商返回压缩格式；该限制不能通过 Profile 绕过。
-
 ## 16. V0.2 验收结果
 
 - [x] 工作流可以保存为可读 SDL，重新打开后语义和布局正确恢复。
@@ -1704,9 +1388,6 @@ Feedback 边已允许成功遍历 3 次，第 4 次仍满足条件时运行失�
 - [x] Agent、边、API Profile 和项目具有明确的删除及引用清理语义。
 - [x] 条件编辑器支持多谓词、嵌套、`AND`/`OR`/`NOT` 和高级 JSON。
 - [x] Agent 可独立启用层次化 JSON 输出，并发送 `json_object` 响应格式。
-- [x] Agent 可切换图片生成模式，并通过独立图片 Profile 调用 OpenAI 兼容图片接口或本地 AUTOMATIC1111 `txt2img`。
-- [x] 图片结果支持 Base64 与公网 URL，经过格式和大小校验后写入工作区并生成 FILE artifact。
-- [x] 图片 Profile 参数可通过 API CRUD 往返保存，Agent 模式与 Profile 能力不一致时校验失败。
 
 ## 17. 已知限制与 V0.3 演进
 
@@ -1716,8 +1397,6 @@ Feedback 边已允许成功遍历 3 次，第 4 次仍满足条件时运行失�
 - 并行只限单机生成项目内的线程池，不提供跨主机、持久队列或资源感知调度。
 - Token 限额在 usage 返回后检查，最后一次调用可能轻微超限。
 - Gate 审批与运行等待依赖当前本地进程和文件锁；进程异常退出后需要用户重新启动运行。
-- 图片服务目前只支持单图生成，多图数量、图生图、局部编辑和异步任务轮询尚未建模。
-- URL 图片下载在 DNS 解析后由 HTTP 客户端再次连接；完全消除 DNS rebinding 需要固定解析地址的自定义传输层，当前作为本地工具的后续加固项。
 - Playwright 全流程、窄屏视觉检查和产物下载/预览尚未纳入自动化验收。
 - V0.3 计划加入 Agent 内 Python 精细规则、沙箱、多 provider、能力路由和更强条件语言。
 
