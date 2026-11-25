@@ -1,0 +1,572 @@
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Callable
+
+
+class AgentRuleError(RuntimeError):
+    """Raised when an Agent rule cannot be safely evaluated."""
+
+
+class RuleValidationError(ValueError):
+    pass
+
+
+class _Missing:
+    pass
+
+
+MISSING = _Missing()
+
+MAX_EXPRESSION_LENGTH = 2_000
+MAX_AST_NODES = 200
+MAX_AST_DEPTH = 24
+MAX_CONTEXT_BYTES = 1_000_000
+MAX_STRING_LENGTH = 100_000
+MAX_COLLECTION_LENGTH = 10_000
+MAX_INTEGER_BITS = 512
+MAX_OPERATIONS = 1_000
+DEFAULT_EVALUATION_TIMEOUT = 2.0
+DEFAULT_ALLOWED_ROOTS = frozenset({"inputs", "outputs", "workflow", "edges", "run"})
+
+_SAFE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def _contains(values: Any, item: Any) -> bool:
+    if values is MISSING:
+        return False
+    try:
+        return item in values
+    except (TypeError, ValueError):
+        return False
+
+
+def _safe_contains(container: Any, item: Any) -> bool:
+    return _contains(container, item)
+
+
+def _safe_startswith(value: Any, prefix: Any) -> bool:
+    return isinstance(value, str) and isinstance(prefix, str) and value.startswith(prefix)
+
+
+def _safe_endswith(value: Any, suffix: Any) -> bool:
+    return isinstance(value, str) and isinstance(suffix, str) and value.endswith(suffix)
+
+
+def _safe_lower(value: Any) -> Any:
+    return value.lower() if isinstance(value, str) else MISSING
+
+
+def _safe_upper(value: Any) -> Any:
+    return value.upper() if isinstance(value, str) else MISSING
+
+
+def _safe_empty(value: Any) -> bool:
+    if value is MISSING or value is None:
+        return True
+    if isinstance(value, (str, list, tuple, set, frozenset, dict)):
+        return len(value) == 0
+    return False
+
+
+def _safe_not_empty(value: Any) -> bool:
+    return not _safe_empty(value)
+
+
+def _safe_length(value: Any) -> Any:
+    if isinstance(value, (str, list, tuple, set, frozenset, dict)):
+        return len(value)
+    return MISSING
+
+
+_HELPERS: dict[str, Callable[..., Any]] = {
+    "len": len,
+    "length": _safe_length,
+    "empty": _safe_empty,
+    "not_empty": _safe_not_empty,
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "min": min,
+    "max": max,
+    "any": any,
+    "all": all,
+    "startswith": _safe_startswith,
+    "endswith": _safe_endswith,
+    "contains": _safe_contains,
+    "lower": _safe_lower,
+    "upper": _safe_upper,
+}
+
+_ALLOWED_NODE_TYPES = (
+    ast.Expression,
+    ast.Constant,
+    ast.Name,
+    ast.Load,
+    ast.Attribute,
+    ast.Subscript,
+    ast.List,
+    ast.Tuple,
+    ast.Dict,
+    ast.Set,
+    ast.UnaryOp,
+    ast.BinOp,
+    ast.BoolOp,
+    ast.Compare,
+    ast.IfExp,
+    ast.Call,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.UAdd,
+    ast.USub,
+    ast.Not,
+    ast.And,
+    ast.Or,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.In,
+    ast.NotIn,
+)
+
+_ALLOWED_CONSTANTS = (str, int, float, bool, type(None))
+
+
+def _check_integer(value: int) -> None:
+    if value.bit_length() > MAX_INTEGER_BITS:
+        raise RuleValidationError("integer literal is too large")
+
+
+def _guard_value(value: Any) -> Any:
+    if isinstance(value, str) and len(value) > MAX_STRING_LENGTH:
+        raise AgentRuleError("rule result exceeded the string length limit")
+    if isinstance(value, (list, tuple, set, dict)):
+        if len(value) > MAX_COLLECTION_LENGTH:
+            raise AgentRuleError("rule result exceeded the collection length limit")
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value.bit_length() > MAX_INTEGER_BITS:
+            raise AgentRuleError("rule result exceeded the integer size limit")
+    return value
+
+
+def _validate_ast(expression: str, allowed_roots: frozenset[str]) -> ast.Expression:
+    if not expression.strip():
+        raise RuleValidationError("expression cannot be blank")
+    if len(expression) > MAX_EXPRESSION_LENGTH:
+        raise RuleValidationError(
+            f"expression exceeds {MAX_EXPRESSION_LENGTH} characters"
+        )
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as exc:
+        location = f" at column {exc.offset}" if exc.offset else ""
+        raise RuleValidationError(f"invalid Python expression{location}: {exc.msg}") from exc
+
+    node_count = 0
+
+    def visit(node: ast.AST, depth: int) -> None:
+        nonlocal node_count
+        node_count += 1
+        if node_count > MAX_AST_NODES:
+            raise RuleValidationError(
+                f"expression exceeds the {MAX_AST_NODES}-node limit"
+            )
+        if depth > MAX_AST_DEPTH:
+            raise RuleValidationError(
+                f"expression exceeds the depth limit of {MAX_AST_DEPTH}"
+            )
+        if not isinstance(node, _ALLOWED_NODE_TYPES):
+            raise RuleValidationError(
+                f"syntax '{node.__class__.__name__}' is not allowed"
+            )
+
+        if isinstance(node, ast.Constant):
+            if not isinstance(node.value, _ALLOWED_CONSTANTS):
+                raise RuleValidationError("constant type is not allowed")
+            if isinstance(node.value, int) and not isinstance(node.value, bool):
+                _check_integer(node.value)
+
+        if isinstance(node, ast.Name):
+            if node.id not in allowed_roots and node.id not in _HELPERS:
+                raise RuleValidationError(f"unknown name '{node.id}'")
+
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("_") or not _SAFE_NAME.fullmatch(node.attr):
+                raise RuleValidationError(f"attribute '{node.attr}' is not allowed")
+
+        if isinstance(node, ast.Dict) and any(
+            key is None for key in node.keys
+        ):
+            raise RuleValidationError("dictionary unpacking is not allowed")
+
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _HELPERS:
+                raise RuleValidationError(
+                    "only documented safe helper functions can be called"
+                )
+            if node.keywords:
+                raise RuleValidationError("keyword arguments are not allowed")
+            if any(isinstance(arg, ast.Starred) for arg in node.args):
+                raise RuleValidationError("starred arguments are not allowed")
+
+        for child in ast.iter_child_nodes(node):
+            visit(child, depth + 1)
+
+    visit(tree, 1)
+    return tree
+
+
+def validate_rule_expression(
+    expression: str,
+    *,
+    allowed_roots: frozenset[str] | set[str] = DEFAULT_ALLOWED_ROOTS,
+) -> list[str]:
+    try:
+        _validate_ast(expression, frozenset(allowed_roots))
+    except RuleValidationError as exc:
+        return [str(exc)]
+    return []
+
+
+def _truthy(value: Any) -> bool:
+    return False if value is MISSING else bool(value)
+
+
+def _compare(op: ast.cmpop, left: Any, right: Any) -> bool:
+    if left is MISSING or right is MISSING:
+        return False
+    try:
+        if isinstance(op, ast.Eq):
+            return left == right
+        if isinstance(op, ast.NotEq):
+            return left != right
+        if isinstance(op, ast.In):
+            return left in right
+        if isinstance(op, ast.NotIn):
+            return left not in right
+        if type(left) is type(right) or {
+            type(left),
+            type(right),
+        } <= {int, float}:
+            if isinstance(op, ast.Lt):
+                return left < right
+            if isinstance(op, ast.LtE):
+                return left <= right
+            if isinstance(op, ast.Gt):
+                return left > right
+            if isinstance(op, ast.GtE):
+                return left >= right
+    except (TypeError, ValueError):
+        return False
+    return False
+
+
+class _Interpreter:
+    def __init__(self, context: dict[str, Any]) -> None:
+        self.context = context
+        self.operations = 0
+
+    def evaluate(self, tree: ast.Expression) -> Any:
+        return self._visit(tree.body)
+
+    def _tick(self) -> None:
+        self.operations += 1
+        if self.operations > MAX_OPERATIONS:
+            raise AgentRuleError(
+                f"rule exceeded the {MAX_OPERATIONS}-operation limit"
+            )
+
+    def _visit(self, node: ast.AST) -> Any:
+        self._tick()
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id in self.context:
+                return self.context[node.id]
+            if node.id in _HELPERS:
+                return _HELPERS[node.id]
+            raise AgentRuleError(f"unknown name '{node.id}'")
+        if isinstance(node, ast.Attribute):
+            base = self._visit(node.value)
+            if isinstance(base, dict) and node.attr in base:
+                return _guard_value(base[node.attr])
+            return MISSING
+        if isinstance(node, ast.Subscript):
+            base = self._visit(node.value)
+            key = self._visit(node.slice)
+            try:
+                if isinstance(base, dict):
+                    return _guard_value(base.get(key, MISSING))
+                if isinstance(base, (list, tuple, str)):
+                    return _guard_value(base[key])
+            except (IndexError, KeyError, TypeError, ValueError):
+                return MISSING
+            return MISSING
+        if isinstance(node, ast.List):
+            return [_guard_value(self._visit(item)) for item in node.elts]
+        if isinstance(node, ast.Tuple):
+            return tuple(_guard_value(self._visit(item)) for item in node.elts)
+        if isinstance(node, ast.Set):
+            return {_guard_value(self._visit(item)) for item in node.elts}
+        if isinstance(node, ast.Dict):
+            result: dict[Any, Any] = {}
+            for key_node, value_node in zip(node.keys, node.values, strict=True):
+                if key_node is None:
+                    raise AgentRuleError("dictionary unpacking is not allowed")
+                result[_guard_value(self._visit(key_node))] = _guard_value(
+                    self._visit(value_node)
+                )
+            return result
+        if isinstance(node, ast.UnaryOp):
+            value = self._visit(node.operand)
+            if isinstance(node.op, ast.Not):
+                return not _truthy(value)
+            if value is MISSING:
+                return MISSING
+            try:
+                if isinstance(node.op, ast.UAdd):
+                    return _guard_value(+value)
+                if isinstance(node.op, ast.USub):
+                    return _guard_value(-value)
+            except (TypeError, ValueError) as exc:
+                raise AgentRuleError("invalid unary operation") from exc
+        if isinstance(node, ast.BoolOp):
+            if isinstance(node.op, ast.And):
+                result: Any = True
+                for value_node in node.values:
+                    result = self._visit(value_node)
+                    if not _truthy(result):
+                        return result
+                return result
+            result = False
+            for value_node in node.values:
+                result = self._visit(value_node)
+                if _truthy(result):
+                    return result
+            return result
+        if isinstance(node, ast.Compare):
+            left = self._visit(node.left)
+            for op, comparator in zip(node.ops, node.comparators, strict=True):
+                right = self._visit(comparator)
+                if not _compare(op, left, right):
+                    return False
+                left = right
+            return True
+        if isinstance(node, ast.IfExp):
+            return self._visit(
+                node.body if _truthy(self._visit(node.test)) else node.orelse
+            )
+        if isinstance(node, ast.BinOp):
+            return self._binary(node, self._visit(node.left), self._visit(node.right))
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise AgentRuleError("dynamic function calls are not allowed")
+            function = _HELPERS.get(node.func.id)
+            if function is None:
+                raise AgentRuleError(
+                    f"unknown helper function '{node.func.id}'"
+                )
+            args = [self._visit(arg) for arg in node.args]
+            if node.func.id in {"startswith", "endswith", "contains"} and any(
+                value is MISSING for value in args
+            ):
+                return False
+            if any(value is MISSING for value in args):
+                return MISSING
+            try:
+                return _guard_value(function(*args))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise AgentRuleError(
+                    f"helper '{node.func.id}' received invalid arguments"
+                ) from exc
+        raise AgentRuleError(
+            f"syntax '{node.__class__.__name__}' is not executable"
+        )
+
+    def _binary(self, node: ast.BinOp, left: Any, right: Any) -> Any:
+        if left is MISSING or right is MISSING:
+            return MISSING
+        if isinstance(node.op, ast.Mult):
+            if isinstance(left, (str, list, tuple)) and isinstance(right, int):
+                if right < 0 or right > MAX_COLLECTION_LENGTH:
+                    raise AgentRuleError("multiplication count is too large")
+            if isinstance(right, (str, list, tuple)) and isinstance(left, int):
+                if left < 0 or left > MAX_COLLECTION_LENGTH:
+                    raise AgentRuleError("multiplication count is too large")
+        try:
+            if isinstance(node.op, ast.Add):
+                if isinstance(left, str) and isinstance(right, str):
+                    if len(left) + len(right) > MAX_STRING_LENGTH:
+                        raise AgentRuleError("string concatenation is too large")
+                if isinstance(left, (list, tuple)) and isinstance(right, type(left)):
+                    if len(left) + len(right) > MAX_COLLECTION_LENGTH:
+                        raise AgentRuleError("collection concatenation is too large")
+                return _guard_value(left + right)
+            if isinstance(node.op, ast.Sub):
+                return _guard_value(left - right)
+            if isinstance(node.op, ast.Mult):
+                return _guard_value(left * right)
+            if isinstance(node.op, ast.Div):
+                return _guard_value(left / right)
+            if isinstance(node.op, ast.FloorDiv):
+                return _guard_value(left // right)
+            if isinstance(node.op, ast.Mod):
+                return _guard_value(left % right)
+        except (ArithmeticError, TypeError, ValueError, OverflowError) as exc:
+            raise AgentRuleError("invalid arithmetic operation") from exc
+        raise AgentRuleError("arithmetic operator is not allowed")
+
+
+def evaluate_expression(
+    expression: str,
+    context: dict[str, Any],
+    *,
+    allowed_roots: frozenset[str] | set[str] = DEFAULT_ALLOWED_ROOTS,
+) -> bool:
+    tree = _validate_ast(expression, frozenset(allowed_roots))
+    result = _Interpreter(context).evaluate(tree)
+    if type(result) is not bool:
+        raise AgentRuleError("Agent rule expression must return a boolean")
+    return result
+
+
+def _subprocess_environment() -> dict[str, str]:
+    environment = {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+    }
+    for name in ("SYSTEMROOT", "WINDIR"):
+        value = os.environ.get(name)
+        if value:
+            environment[name] = value
+    return environment
+
+
+def evaluate_rule_isolated(
+    expression: str,
+    context: dict[str, Any],
+    *,
+    timeout_seconds: float = DEFAULT_EVALUATION_TIMEOUT,
+    allowed_roots: frozenset[str] | set[str] = DEFAULT_ALLOWED_ROOTS,
+) -> bool:
+    payload = {
+        "expression": expression,
+        "context": context,
+        "allowed_roots": sorted(allowed_roots),
+    }
+    try:
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise AgentRuleError("rule context is not JSON serializable") from exc
+    if len(serialized.encode("utf-8")) > MAX_CONTEXT_BYTES:
+        raise AgentRuleError("rule context exceeds the size limit")
+
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    with tempfile.TemporaryDirectory(prefix="loomlane-rule-") as temporary:
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    str(Path(__file__).resolve()),
+                    "--evaluate",
+                ],
+                input=serialized,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=timeout_seconds,
+                cwd=temporary,
+                env=_subprocess_environment(),
+                creationflags=creation_flags,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AgentRuleError(
+                f"Agent rule exceeded the {timeout_seconds:g}s evaluation limit"
+            ) from exc
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        if len(detail) > 500:
+            detail = detail[:500] + "..."
+        raise AgentRuleError(
+            f"Agent rule sandbox exited with code {completed.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        response = json.loads(completed.stdout)
+    except ValueError as exc:
+        raise AgentRuleError("Agent rule sandbox returned invalid output") from exc
+    if not isinstance(response, dict) or not isinstance(response.get("ok"), bool):
+        raise AgentRuleError("Agent rule sandbox returned an invalid response")
+    if not response["ok"]:
+        raise AgentRuleError(str(response.get("error") or "Agent rule failed"))
+    result = response.get("result")
+    if type(result) is not bool:
+        raise AgentRuleError("Agent rule sandbox returned a non-boolean result")
+    return result
+
+
+def _run_evaluation_server() -> int:
+    payload: Any = None
+    try:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            raise AgentRuleError("sandbox payload must be an object")
+        expression = payload.get("expression")
+        context = payload.get("context")
+        roots = payload.get("allowed_roots")
+        if not isinstance(expression, str):
+            raise AgentRuleError("sandbox expression must be text")
+        if not isinstance(context, dict):
+            raise AgentRuleError("sandbox context must be an object")
+        if not isinstance(roots, list) or not all(
+            isinstance(item, str) for item in roots
+        ):
+            raise AgentRuleError("sandbox roots must be a string list")
+        result = evaluate_expression(
+            expression,
+            context,
+            allowed_roots=frozenset(roots),
+        )
+        response = {"ok": True, "result": result}
+    except Exception as exc:
+        response = {"ok": False, "error": str(exc)}
+    sys.stdout.write(json.dumps(response, ensure_ascii=False))
+    sys.stdout.flush()
+    return 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--evaluate", action="store_true")
+    args = parser.parse_args()
+    if args.evaluate:
+        raise SystemExit(_run_evaluation_server())
+    parser.error("no action selected")
+
+
+if __name__ == "__main__":
+    main()

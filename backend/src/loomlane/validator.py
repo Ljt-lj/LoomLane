@@ -12,11 +12,16 @@ from .condition import (
 )
 from .models import (
     AggregateConfig,
+    AgentRulePhase,
     EdgeType,
     HumanGateConfig,
     SDL,
     ValidationIssue,
     ValidationResponse,
+)
+from .rule_sandbox import (
+    DEFAULT_ALLOWED_ROOTS,
+    validate_rule_expression,
 )
 
 
@@ -240,6 +245,24 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
                     node_id=agent.id,
                 )
             )
+        for rule_index, rule in enumerate(agent.rules):
+            allowed_roots = (
+                frozenset({"inputs", "workflow", "edges", "run"})
+                if rule.phase == AgentRulePhase.INPUT
+                else DEFAULT_ALLOWED_ROOTS
+            )
+            for error in validate_rule_expression(
+                rule.expression,
+                allowed_roots=allowed_roots,
+            ):
+                issues.append(
+                    _issue(
+                        "invalid_agent_rule",
+                        error,
+                        f"agents.{agent.id}.rules[{rule_index}].expression",
+                        node_id=agent.id,
+                    )
+                )
         profile = profiles.get(agent.api_profile)
         if profile is None:
             issues.append(

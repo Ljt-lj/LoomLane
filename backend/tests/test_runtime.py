@@ -1823,3 +1823,180 @@ def test_file_artifact_rejects_workspace_escape(
     assert completed.returncode == 1
     result = json.loads(result_path.read_text(encoding="utf-8"))
     assert "escaped the run workspace" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_agent_rules_run_only_in_their_configured_phase(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, configure = scripted_openai
+    configure(lambda _: {"draft": "finished"})
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "worker",
+                "name": "Worker",
+                "system_prompt": "AGENT: worker",
+                "inputs": [{"name": "brief", "type": "TEXT", "required": True}],
+                "outputs": [{"name": "draft", "type": "TEXT"}],
+                "rules": [
+                    {
+                        "phase": "input",
+                        "expression": "not_empty(inputs.brief)",
+                    },
+                    {
+                        "phase": "output",
+                        "expression": "not_empty(outputs.draft)",
+                    },
+                ],
+            }
+        ],
+        edges=[],
+        start=["worker"],
+        workflow_inputs=[
+            {"name": "brief", "type": "TEXT", "required": True}
+        ],
+        workflow_outputs=[
+            {"name": "draft", "agent": "worker", "port": "draft"}
+        ],
+    )
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("rules", sdl)
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"brief": "write it"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "succeeded"
+    rule_events = [
+        (event["type"], event["data"]["phase"])
+        for event in detail.events
+        if event["type"] in {"rule_started", "rule_passed", "rule_failed"}
+    ]
+    assert rule_events == [
+        ("rule_started", "input"),
+        ("rule_passed", "input"),
+        ("rule_started", "output"),
+        ("rule_passed", "output"),
+    ]
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_input_rule_failure_prevents_model_call(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, configure = scripted_openai
+    configure(lambda _: {"draft": "should not run"})
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "worker",
+                "name": "Worker",
+                "system_prompt": "AGENT: worker",
+                "inputs": [{"name": "brief", "type": "TEXT", "required": True}],
+                "outputs": [{"name": "draft", "type": "TEXT"}],
+                "rules": [
+                    {
+                        "phase": "input",
+                        "expression": "not_empty(inputs.brief)",
+                        "message": "Brief is required",
+                    }
+                ],
+            }
+        ],
+        edges=[],
+        start=["worker"],
+        workflow_inputs=[
+            {"name": "brief", "type": "TEXT", "required": True}
+        ],
+        workflow_outputs=[
+            {"name": "draft", "agent": "worker", "port": "draft"}
+        ],
+    )
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("input rule failure", sdl)
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"brief": ""}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "failed"
+    assert detail.error is not None
+    assert "Brief is required" in detail.error
+    assert ScriptedOpenAIHandler.calls == []
+    assert any(
+        event["type"] == "rule_failed"
+        and event["data"]["phase"] == "input"
+        for event in detail.events
+    )
+    assert not any(event["type"] == "token_usage" for event in detail.events)
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_output_rule_failure_writes_no_artifacts_after_token_usage(
+    tmp_path: Path,
+    scripted_openai,
+) -> None:
+    base_url, configure = scripted_openai
+    configure(lambda _: {"draft": ""})
+    sdl = _graph_sdl(
+        base_url,
+        agents=[
+            {
+                "id": "worker",
+                "name": "Worker",
+                "system_prompt": "AGENT: worker",
+                "inputs": [{"name": "brief", "type": "TEXT", "required": True}],
+                "outputs": [{"name": "draft", "type": "TEXT"}],
+                "rules": [
+                    {
+                        "phase": "output",
+                        "expression": "not_empty(outputs.draft)",
+                        "message": "Draft is empty",
+                    }
+                ],
+            }
+        ],
+        edges=[],
+        start=["worker"],
+        workflow_inputs=[
+            {"name": "brief", "type": "TEXT", "required": True}
+        ],
+        workflow_outputs=[
+            {"name": "draft", "agent": "worker", "port": "draft"}
+        ],
+    )
+    store = ProjectStore(tmp_path / "projects")
+    project = store.create("output rule failure", sdl)
+    manager = RunManager(store, MemoryCredentials())
+
+    summary = await manager.start(
+        project.id,
+        RunStartRequest(inputs={"brief": "write it"}),
+    )
+    detail = await _wait_for_run(manager, summary.run_id)
+
+    assert detail.status == "failed"
+    assert detail.error is not None
+    assert "Draft is empty" in detail.error
+    assert len(ScriptedOpenAIHandler.calls) == 1
+    assert any(event["type"] == "token_usage" for event in detail.events)
+    assert not any(event["type"] == "artifact_written" for event in detail.events)
+    assert any(
+        event["type"] == "rule_failed"
+        and event["data"]["phase"] == "output"
+        for event in detail.events
+    )
+    await manager.shutdown()

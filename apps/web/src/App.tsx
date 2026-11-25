@@ -74,6 +74,7 @@ import {
   type AgentFlowNode,
   type NodeRunStatus,
 } from './AgentNode'
+import AgentRulesEditor from './AgentRulesEditor'
 import ConditionEditor from './ConditionEditor'
 import JsonOutputEditor from './JsonOutputEditor'
 import {
@@ -144,6 +145,9 @@ const EVENT_TYPES = [
   'node_exit',
   'edge_traversed',
   'token_usage',
+  'rule_started',
+  'rule_passed',
+  'rule_failed',
   'artifact_written',
   'human_gate_waiting',
   'human_gate_resolved',
@@ -2471,6 +2475,7 @@ function App() {
       outputs: [{ name: 'output', type: 'TEXT' }],
       limits: { max_tokens: null, max_total_tokens: null },
       json_output: { enabled: false, template: {} },
+      rules: [],
       output_dir: null,
     }
     updateDraft((current) => ({
@@ -2846,6 +2851,16 @@ function App() {
               }
             />
           )}
+          <AgentRulesEditor
+            key={agent.id}
+            value={agent.rules ?? []}
+            onChange={(rules) =>
+              updateAgent(agent.id, (current) => ({
+                ...current,
+                rules,
+              }))
+            }
+          />
           {renderPorts(agent, 'inputs')}
           {renderPorts(agent, 'outputs')}
         </div>

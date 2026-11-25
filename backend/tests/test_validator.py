@@ -9,6 +9,8 @@ from loomlane.condition import (
     validate_condition,
 )
 from loomlane.models import (
+    AgentRule,
+    AgentRulePhase,
     AggregateConfig,
     Condition,
     EdgeGuard,
@@ -236,6 +238,155 @@ def test_multi_predicate_condition_validates_and_evaluates() -> None:
     assert evaluate_condition(condition, root)
     root["edges"]["review-feedback"]["traversals"] = 3
     assert not evaluate_condition(condition, root)
+
+
+def test_agent_rules_validate_by_phase(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    sdl.agents[0].rules = [
+        AgentRule(
+            phase=AgentRulePhase.INPUT,
+            expression="not_empty(inputs.requirement)",
+        ),
+        AgentRule(
+            phase=AgentRulePhase.OUTPUT,
+            expression="not_empty(outputs.draft)",
+        ),
+    ]
+
+    result = validate_sdl(sdl)
+
+    assert result.valid
+    assert result.issues == []
+
+
+def test_agent_input_rules_cannot_reference_outputs(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    sdl.agents[0].rules = [
+        AgentRule(
+            phase=AgentRulePhase.INPUT,
+            expression="not_empty(outputs.draft)",
+        )
+    ]
+
+    result = validate_sdl(sdl)
+
+    assert not result.valid
+    assert "invalid_agent_rule" in {issue.code for issue in result.issues}
+    assert "unknown name 'outputs'" in result.issues[0].message
+
+
+def test_new_condition_operators_validate_and_evaluate() -> None:
+    references = ConditionReferences(
+        agents={"reviewer"},
+        agent_ports={
+            ("reviewer", "text"),
+            ("reviewer", "score"),
+            ("reviewer", "items"),
+            ("reviewer", "empty"),
+        },
+        workflow_inputs=set(),
+        edges=set(),
+        run_fields={"step"},
+    )
+    root = {
+        "agents": {
+            "reviewer": {
+                "outputs": {
+                    "text": "hello world",
+                    "score": 0.5,
+                    "items": ["alpha", "beta"],
+                    "empty": "",
+                }
+            }
+        }
+    }
+    conditions = [
+        Condition(
+            op="between",
+            left="$.agents.reviewer.outputs.score",
+            right=[0.1, 0.9],
+        ),
+        Condition(
+            op="starts_with",
+            left="$.agents.reviewer.outputs.text",
+            right="hello",
+        ),
+        Condition(
+            op="ends_with",
+            left="$.agents.reviewer.outputs.text",
+            right="world",
+        ),
+        Condition(
+            op="matches",
+            left="$.agents.reviewer.outputs.text",
+            right=r"^hello\s",
+        ),
+        Condition(op="empty", left="$.agents.reviewer.outputs.empty"),
+        Condition(op="not_empty", left="$.agents.reviewer.outputs.text"),
+        Condition(
+            op="length_eq",
+            left="$.agents.reviewer.outputs.items",
+            right=2,
+        ),
+        Condition(
+            op="contains_all",
+            left="$.agents.reviewer.outputs.items",
+            right=["alpha", "beta"],
+        ),
+        Condition(
+            op="contains_any",
+            left="$.agents.reviewer.outputs.items",
+            right=["missing", "beta"],
+        ),
+    ]
+
+    for condition in conditions:
+        assert validate_condition(condition, references) == []
+        assert evaluate_condition(condition, root)
+
+
+def test_condition_matches_rejects_unsafe_regex() -> None:
+    references = ConditionReferences(
+        agents={"reviewer"},
+        agent_ports={("reviewer", "text")},
+        workflow_inputs=set(),
+        edges=set(),
+        run_fields={"step"},
+    )
+    condition = Condition(
+        op="matches",
+        left="$.agents.reviewer.outputs.text",
+        right="(hello)",
+    )
+
+    errors = validate_condition(condition, references)
+
+    assert any("groups, lookarounds" in error for error in errors)
+
+
+def test_empty_condition_treats_missing_reference_as_empty() -> None:
+    references = ConditionReferences(
+        agents={"reviewer"},
+        agent_ports={("reviewer", "text")},
+        workflow_inputs=set(),
+        edges=set(),
+        run_fields={"step"},
+    )
+    empty = Condition(op="empty", left="$.agents.reviewer.outputs.text")
+    not_empty = Condition(
+        op="not_empty",
+        left="$.agents.reviewer.outputs.text",
+    )
+    root = {"agents": {"reviewer": {"outputs": {}}}}
+
+    assert validate_condition(empty, references) == []
+    assert validate_condition(not_empty, references) == []
+    assert evaluate_condition(empty, root)
+    assert not evaluate_condition(not_empty, root)
 
 
 def test_port_type_mismatch_is_rejected(

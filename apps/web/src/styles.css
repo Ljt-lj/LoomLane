@@ -1839,6 +1839,105 @@ pre {
   font-weight: 750;
 }
 
+.agent-rules-section {
+  display: grid;
+  gap: 7px;
+  padding-top: 2px;
+}
+
+.agent-rules-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.agent-rule-list {
+  display: grid;
+  gap: 6px;
+}
+
+.agent-rule-card {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--teal-soft);
+  border-radius: 5px;
+  background: #fbfcf8;
+}
+
+.agent-rule-card label {
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.agent-rule-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 92px 25px;
+  align-items: center;
+  gap: 5px;
+}
+
+.agent-rule-header select {
+  min-width: 0;
+  min-height: 27px;
+  padding: 3px 5px;
+  font-size: 9px;
+}
+
+.agent-rule-enabled {
+  display: inline-flex !important;
+  min-width: 0;
+  grid-template-columns: none !important;
+  align-items: center;
+  gap: 5px !important;
+  cursor: pointer;
+}
+
+.agent-rule-enabled input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
+.agent-rule-card textarea,
+.agent-rule-card input {
+  min-width: 0;
+  font-size: 9px;
+}
+
+.agent-rule-card textarea {
+  min-height: 58px;
+  resize: vertical;
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+
+.agent-rules-empty {
+  display: inline-flex;
+  width: fit-content;
+  min-height: 27px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border: 1px dashed #b8c9c1;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--teal-dark);
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.agent-rules-empty:hover {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+}
+
 .advanced-json {
   margin-top: 4px;
   border-top: 1px solid var(--line);

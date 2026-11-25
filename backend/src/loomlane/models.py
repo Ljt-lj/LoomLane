@@ -154,6 +154,26 @@ class AgentJsonOutput(StrictModel):
     template: dict[str, Any] = Field(default_factory=dict)
 
 
+class AgentRulePhase(StrEnum):
+    INPUT = "input"
+    OUTPUT = "output"
+
+
+class AgentRule(StrictModel):
+    phase: AgentRulePhase
+    expression: str = Field(min_length=1, max_length=2_000)
+    message: str | None = Field(default=None, max_length=500)
+    enabled: bool = True
+
+    @field_validator("expression")
+    @classmethod
+    def validate_expression_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("rule expression cannot be blank")
+        return normalized
+
+
 class Agent(StrictModel):
     id: str
     name: str
@@ -164,6 +184,7 @@ class Agent(StrictModel):
     outputs: list[Port] = Field(default_factory=list)
     limits: AgentLimits = Field(default_factory=AgentLimits)
     json_output: AgentJsonOutput = Field(default_factory=AgentJsonOutput)
+    rules: list[AgentRule] = Field(default_factory=list)
     output_dir: str | None = None
 
     @field_validator("output_dir")
@@ -196,6 +217,15 @@ class Condition(StrictModel):
         "in",
         "contains",
         "exists",
+        "between",
+        "starts_with",
+        "ends_with",
+        "matches",
+        "empty",
+        "not_empty",
+        "length_eq",
+        "contains_all",
+        "contains_any",
     ]
     args: list[Condition] = Field(default_factory=list)
     left: str | None = None
@@ -224,7 +254,7 @@ class Edge(StrictModel):
 
 
 class SDL(StrictModel):
-    sdl_version: Literal["0.1", "0.2"] = "0.2"
+    sdl_version: Literal["0.1", "0.2", "0.3"] = "0.3"
     workflow: WorkflowMeta
     start: list[str] = Field(default_factory=list)
     api_profiles: list[ApiProfile] = Field(default_factory=list)

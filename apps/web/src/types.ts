@@ -89,6 +89,15 @@ export interface AgentJsonOutput {
   template: Record<string, unknown>
 }
 
+export type AgentRulePhase = 'input' | 'output'
+
+export interface AgentRule {
+  phase: AgentRulePhase
+  expression: string
+  message?: string | null
+  enabled: boolean
+}
+
 export interface Agent {
   id: string
   name: string
@@ -102,6 +111,7 @@ export interface Agent {
     max_total_tokens: number | null
   }
   json_output: AgentJsonOutput
+  rules: AgentRule[]
   output_dir: string | null
 }
 
@@ -143,7 +153,7 @@ export interface WorkflowEdge {
 }
 
 export interface SDL {
-  sdl_version: '0.1' | '0.2'
+  sdl_version: '0.1' | '0.2' | '0.3'
   workflow: WorkflowMeta
   start: string[]
   api_profiles: ApiProfile[]

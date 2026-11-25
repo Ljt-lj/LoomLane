@@ -13,7 +13,7 @@ from .storage import InvalidWorkflow
 from .validator import validate_sdl
 
 
-COMPILER_VERSION = "0.2.8"
+COMPILER_VERSION = "0.3.0"
 
 
 def canonical_json(sdl: SDL) -> str:
@@ -88,6 +88,7 @@ class WorkflowCompiler:
             "workflow.py.j2": "workflow.py",
             "config.py.j2": "config.py",
             "runners/graph_runner.py.j2": "runners/graph_runner.py",
+            "runners/rule_sandbox.py.j2": "runners/rule_sandbox.py",
             "runners/__init__.py.j2": "runners/__init__.py",
             "agents/__init__.py.j2": "agents/__init__.py",
             "requirements.txt.j2": "requirements.txt",

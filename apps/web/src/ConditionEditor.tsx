@@ -13,7 +13,27 @@ const PREDICATE_OPERATORS = [
   'in',
   'contains',
   'exists',
+  'between',
+  'starts_with',
+  'ends_with',
+  'matches',
+  'empty',
+  'not_empty',
+  'length_eq',
+  'contains_all',
+  'contains_any',
 ] as const
+
+const WITHOUT_VALUE = new Set(['exists', 'empty', 'not_empty'])
+
+const VALUE_PLACEHOLDERS: Record<string, string> = {
+  between: '[最小值, 最大值]',
+  matches: '正则表达式',
+  length_eq: '长度',
+  contains_all: '["值1", "值2"]',
+  contains_any: '["值1", "值2"]',
+  in: '["候选值"]',
+}
 
 interface ConditionPathOption {
   value: string
@@ -56,9 +76,11 @@ function parseLiteral(text: string) {
 
 function LiteralValue({
   value,
+  placeholder,
   onChange,
 }: {
   value: unknown
+  placeholder: string
   onChange: (value: unknown) => void
 }) {
   const [text, setText] = useState(() => formatLiteral(value))
@@ -75,7 +97,7 @@ function LiteralValue({
         setText(next)
         onChange(parseLiteral(next))
       }}
-      placeholder="比较值"
+      placeholder={placeholder}
     />
   )
 }
@@ -117,7 +139,16 @@ function PredicateEditor({
   )
     ? [...PREDICATE_OPERATORS]
     : [value.op, ...PREDICATE_OPERATORS]
-  const hasValue = value.op !== 'exists'
+  const hasValue = !WITHOUT_VALUE.has(value.op)
+
+  function changeOperator(operator: string) {
+    const { right: preservedRight, ...rest } = value
+    onChange(
+      WITHOUT_VALUE.has(operator)
+        ? { ...rest, op: operator }
+        : { ...rest, op: operator, right: preservedRight },
+    )
+  }
 
   return (
     <div className="condition-leaf">
@@ -143,9 +174,7 @@ function PredicateEditor({
           运算符
           <select
             value={value.op}
-            onChange={(event) =>
-              onChange({ ...value, op: event.target.value })
-            }
+            onChange={(event) => changeOperator(event.target.value)}
           >
             {operators.map((operator) => (
               <option key={operator}>{operator}</option>
@@ -157,6 +186,7 @@ function PredicateEditor({
             比较值
             <LiteralValue
               value={value.right}
+              placeholder={VALUE_PLACEHOLDERS[value.op] ?? '比较值'}
               onChange={(right) => onChange({ ...value, right })}
             />
           </label>
