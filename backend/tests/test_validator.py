@@ -17,7 +17,10 @@ from loomlane.models import (
     EdgeType,
     ImageGenerationConfig,
     Port,
+    PortType,
     SDL,
+    TransformExpression,
+    TransformField,
     WorkflowOutput,
 )
 from loomlane.storage import default_sdl
@@ -277,6 +280,157 @@ def test_agent_input_rules_cannot_reference_outputs(
     assert not result.valid
     assert "invalid_agent_rule" in {issue.code for issue in result.issues}
     assert "unknown name 'outputs'" in result.issues[0].message
+
+
+def test_agent_and_edge_transforms_validate(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    drafter = sdl.agents[0]
+    drafter.input_transform = TransformExpression(
+        expression='{"requirement": str(inputs.requirement)}'
+    )
+    drafter.output_transform = TransformExpression(
+        expression=(
+            '{"draft": str(raw_outputs.draft), '
+            '"outline": raw_outputs.outline}'
+        )
+    )
+    sdl.edges[0].mappings[0].transform = TransformExpression(
+        expression='{"text": value}'
+    )
+
+    result = validate_sdl(sdl)
+
+    assert result.valid
+    assert result.issues == []
+
+
+def test_field_transforms_validate_and_report_field_paths(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    drafter = sdl.agents[0]
+    drafter.input_transform = TransformExpression(
+        mode="fields",
+        fields=[
+            TransformField(
+                path="requirement",
+                value="inputs.requirement",
+            ),
+            TransformField(
+                path="outline.sections",
+                value="inputs.outline.sections",
+            ),
+        ],
+    )
+
+    valid = validate_sdl(sdl)
+
+    assert valid.valid
+    assert valid.issues == []
+
+    drafter.input_transform = TransformExpression(
+        mode="fields",
+        fields=[
+            TransformField(
+                path="Requirement",
+                value="inputs.requirement",
+            ),
+            TransformField(
+                path="Requirement",
+                value="inputs.requirement",
+            ),
+        ],
+    )
+    invalid_paths = validate_sdl(sdl)
+
+    assert not invalid_paths.valid
+    issues_by_path = {issue.path: issue for issue in invalid_paths.issues}
+    assert (
+        issues_by_path[
+            "agents.drafter.input_transform.fields[0].path"
+        ].code
+        == "invalid_transform_field"
+    )
+    assert (
+        issues_by_path[
+            "agents.drafter.input_transform.fields[1].path"
+        ].code
+        == "invalid_transform_field"
+    )
+
+    drafter.input_transform = TransformExpression(
+        mode="fields",
+        fields=[
+            TransformField(
+                path="draft",
+                value="outputs.draft",
+            ),
+        ],
+    )
+    invalid_expression = validate_sdl(sdl)
+
+    assert not invalid_expression.valid
+    issues_by_path = {
+        issue.path: issue for issue in invalid_expression.issues
+    }
+    assert (
+        issues_by_path[
+            "agents.drafter.input_transform.fields[0].value"
+        ].code
+        == "invalid_agent_transform"
+    )
+
+
+def test_transform_roots_are_scoped_by_location(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    sdl.agents[0].input_transform = TransformExpression(
+        expression="outputs.draft"
+    )
+    sdl.agents[0].output_transform = TransformExpression(
+        expression="outputs.draft"
+    )
+    sdl.edges[0].mappings[0].transform = TransformExpression(
+        expression="inputs.requirement"
+    )
+
+    result = validate_sdl(sdl)
+
+    assert not result.valid
+    assert [issue.code for issue in result.issues] == [
+        "invalid_agent_transform",
+        "invalid_agent_transform",
+        "invalid_edge_transform",
+    ]
+    assert "unknown name 'outputs'" in result.issues[0].message
+    assert "unknown name 'outputs'" in result.issues[1].message
+    assert "unknown name 'inputs'" in result.issues[2].message
+
+
+def test_edge_transform_allows_cross_type_mapping(
+    legacy_workflow: Callable[[str], SDL],
+) -> None:
+    sdl = legacy_workflow()
+    reviewer = sdl.agents[1]
+    reviewer.inputs[0].type = PortType.DATA
+    mapping = sdl.edges[0].mappings[0]
+    mapping.transform = TransformExpression(expression='{"text": value}')
+
+    transformed = validate_sdl(sdl)
+
+    assert transformed.valid
+    assert transformed.issues == []
+
+    mapping.transform = None
+    untransformed = validate_sdl(sdl)
+
+    assert not untransformed.valid
+    assert "port_type_mismatch" in {
+        issue.code for issue in untransformed.issues
+    }
 
 
 def test_new_condition_operators_validate_and_evaluate() -> None:

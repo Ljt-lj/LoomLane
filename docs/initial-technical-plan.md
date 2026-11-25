@@ -30,6 +30,7 @@ LoomLane 是一个本地优先的多 Agent 流水线可视化编排与编译系�
 | Agent 与边 | Agent、端口及 `PIPE`、`CONDITIONAL`、`FEEDBACK`、`LOOP`、`FAN_OUT`、`AGGREGATE`、`HUMAN_GATE` 编辑 |
 | 条件 | 受限条件 AST，支持范围、前后缀、正则、空值、长度和集合谓词；前端支持 `AND`、`OR`、`NOT`、多谓词添加/删除/嵌套和高级 JSON 编辑 |
 | Agent Python 规则 | 每个 Agent 可配置输入前/输出后布尔规则；使用白名单 AST 解释器和独立 Python 进程沙箱执行 |
+| 数据变换 | Agent 输入前后与边映射支持受限 Python 表达式；表达式返回严格 JSON，可在模型前后清理、重组和跨端口类型转换数据 |
 | 面板 | 左、右、底部面板均可收纳；左右面板可调宽度，底部面板可调高度，偏好持久化到浏览器 |
 | API Profile | 增删改、密钥状态查询、密钥写入/删除；删除被引用 Profile 时自动迁移或阻止 |
 | 模型 JSON 输出 | 每个 Agent 可独立启用层次化 JSON 模板，并通过 `response_format={"type":"json_object"}` 请求 JSON |
@@ -66,6 +67,7 @@ LoomLane 是一个本地优先的多 Agent 流水线可视化编排与编译系�
 11. 支持图片生成 Agent，将图片服务的 Base64 或 URL 结果保存为运行工作区文件，并继续走统一 artifacts 流程。
 12. 支持 Agent 输入前/输出后 Python 精细规则，并对规则表达式实施语法白名单、进程隔离、资源上限和事件记录。
 13. 支持更强的声明式边条件，包括范围、前后缀、正则、空值、长度和多值集合判断。
+14. 支持 Agent 输入/输出变换与边映射变换，使用同一受限表达式语言完成数据清理、重组和跨端口类型转换。
 
 ### 2.2 V0.3 非目标
 
@@ -73,7 +75,7 @@ LoomLane 是一个本地优先的多 Agent 流水线可视化编排与编译系�
 - 不支持任意 Python、JavaScript 或 Jinja2 表达式执行。
 - 不做 token 级模型流式输出，只回传节点、边、用量和错误等运行事件。
 - 不提供第三方供应商插件热加载；V0.3 已内置 OpenAI Images、SiliconFlow 和 AUTOMATIC1111 / Forge 图片适配器，并默认使用本地 AUTOMATIC1111 / Forge。
-- 不执行任意 Python。Agent 规则只接受可枚举、可审计的表达式子集，不提供 import、函数定义、循环、推导式、赋值或任意方法调用。
+- 不执行任意 Python。Agent 规则和数据变换只接受可枚举、可审计的表达式子集，不提供 import、函数定义、循环、推导式、赋值、文件/网络访问或任意方法调用。
 - 不提供分布式执行或跨主机调度；并行仅限单个生成项目的本地线程池。
 - 不提供产物的在线编辑、版本管理或对象存储；产物文件由本地运行工作区管理。
 - 图片能力只做生成，不做图生图、局部重绘、蒙版编辑或视频生成；这些能力需要独立输入协议。
@@ -88,6 +90,7 @@ LoomLane 是一个本地优先的多 Agent 流水线可视化编排与编译系�
 | API Profile | 非密钥元数据写入 SDL；密钥单独存入系统凭据库 | 项目可移植，且密钥不进入 Git 或 SDL |
 | 条件表达式 | 自定义声明式 AST | 可校验、可序列化，比字符串 eval 安全，并支持更强的常用谓词 |
 | Agent Python 规则 | 白名单 AST 解释 + 独立子进程 | 允许在不开放任意 Python 的前提下表达精细业务规则，并通过进程和资源边界隔离失败 |
+| 数据变换 | 受限表达式返回严格 JSON，由运行时按固定阶段应用 | 让输入清理、输出重组和边级转换共享同一套可校验语义，避免引入脚本节点或隐式类型转换 |
 | Feedback | 只允许回注到上游节点，必须有遍历上限 | 保留核心语义，同时避免不可控的任意环 |
 | 调度模型 | 显式就绪队列和运行状态机 | 比拓扑排序更适合条件分支和有界反馈 |
 | 执行隔离 | 生成项目 + 独立 Python 子进程 | 崩溃、取消和日志边界清晰 |
@@ -314,6 +317,20 @@ agents:
         expression: "not_empty(outputs.draft) and len(outputs.draft) >= 100"
         message: 草稿内容不完整
         enabled: true
+    input_transform:
+      mode: fields
+      fields:
+        - path: requirement
+          value: inputs.requirement
+        - path: feedback
+          value: 'inputs.feedback if "feedback" in inputs else ""'
+    output_transform:
+      mode: fields
+      fields:
+        - path: draft
+          value: raw_outputs.draft
+        - path: outline
+          value: 'raw_outputs.outline if not_empty(raw_outputs.outline) else {"sections": []}'
     output_dir: artifacts/drafter
 
   - id: reviewer
@@ -943,6 +960,122 @@ DeepSeek 文本模型不能用于图片生成。即使接口形态兼容 OpenAI�
 
 文件下载、安全边界、Token 记录和 artifacts 写入不需要在供应商适配器中重复实现。
 
+### 6.11 数据变换配置
+
+数据变换用于在模型调用前后，以及一条边把值送达目标端口前，对 JSON 数据做确定性清理和重组。它复用 Agent 规则的白名单 AST、独立子进程和资源边界，但返回值不是布尔值，而是严格 JSON。
+
+项目 SDL 默认使用可读的 `fields` 模式。用户只填写输出路径和值表达式，不手写完整 JSON；后端在校验和编译时把字段表组装成安全沙箱可执行的 JSON 对象表达式。旧的 `expression` 写法继续支持，并作为需要任意 JSON 返回值时的兼容模式。
+
+支持三个位置。Agent 输入和输出推荐使用 `fields`：
+
+```yaml
+agents:
+  - id: writer
+    input_transform:
+      mode: fields
+      fields:
+        - path: brief
+          value: str(inputs.brief)
+        - path: feedback
+          value: 'inputs.feedback if "feedback" in inputs else ""'
+    output_transform:
+      mode: fields
+      fields:
+        - path: article
+          value: 'str(raw_outputs.title) + "\n\n" + str(raw_outputs.body)'
+        - path: outline.sections
+          value: raw_outputs.sections
+    inputs:
+      - name: brief
+        type: TEXT
+        required: true
+      - name: feedback
+        type: TEXT
+        required: false
+    outputs:
+      - name: article
+        type: TEXT
+
+edges:
+  - id: text-to-data
+    from: collector
+    to: analyzer
+    type: PIPE
+    mappings:
+      - from: payload
+        to: payload
+        transform:
+          expression: '{"text": value, "length": length(value)}'
+```
+
+上面的 Agent 字段表会在编译产物中分别组装为等价表达式：
+
+```python
+input_transform = '{"brief": str(inputs.brief), "feedback": inputs.feedback if "feedback" in inputs else ""}'
+output_transform = '{"article": str(raw_outputs.title) + "\n\n" + str(raw_outputs.body), "outline": {"sections": raw_outputs.sections}}'
+```
+
+项目文件、项目 GET/PUT API 和 SDL 仍保留 `mode: fields` 与字段表，便于阅读和编辑；只有转发给运行时的 `runtime_dict` 会替换为 `expression`。因此 API 数据可读，旧运行模板也不需要理解前端字段结构。
+
+字段表规则：
+
+- `path` 必须是小写标识符组成的点分隔路径，最多 8 段，例如 `brief`、`outline.sections`。
+- 单个变换最多 32 个字段；重复路径以及父字段与子字段同时出现会被拒绝，例如不能同时配置 `outline` 和 `outline.sections`。
+- `value` 是当前位置上下文中的安全表达式，不是 JSON 文本。写 `raw_outputs.sections`，不要写成 `"raw_outputs.sections"`。
+- `fields` 结果始终是 JSON 对象，符合 Agent 输入和输出变换的返回值要求。
+- Edge mapping 界面保留高级 `expression`，因为它允许返回对象、数组、字符串或其他严格 JSON 值；API 仍可对 mapping 使用 `fields` 模式。
+- 删除最后一个字段会清除整个变换项，不会提交空的 `fields` 配置。
+
+需要完整控制表达式、返回非对象 JSON 或迁移已有项目时，继续使用高级模式：
+
+```yaml
+input_transform:
+  expression: '{"brief": inputs.brief}'
+```
+
+未提供 `mode` 时，包含 `expression` 的旧配置自动按 `expression` 模式解释；新前端创建变换时默认使用 `fields` 模式。
+
+字段语义：
+
+- `agents[].input_transform`：在 Agent 已就绪并进入执行后，整体替换该次 Agent 的 `inputs`。返回值必须是 JSON 对象。
+- `agents[].output_transform`：在收到并解析模型 JSON 后、端口与 `schema_hint` 校验及输出规则之前，整体替换 `outputs`。返回值必须是 JSON 对象。
+- `edges[].mappings[].transform`：只变换当前 mapping 的来源端口值，再把结果写入该 mapping 的目标端口。返回值可以是任意严格 JSON 值，但随后必须满足目标端口类型和 `schema_hint`。
+- 未配置变换时保持原有行为；三个字段均为可选，不要求旧项目迁移。
+- Agent 变换不是“补字段”语法。调度器会先按实际已映射端口判断 Agent/批次是否就绪，然后才执行 `input_transform`；因此输入变换不能补齐从未送达的必填端口，但可以删除已有端口，随后由常规输入校验报错。
+
+上下文根按执行位置隔离：
+
+| 位置 | 可访问根 | 说明 |
+| --- | --- | --- |
+| Agent `input_transform` | `inputs`、`workflow`、`edges`、`run` | `inputs` 是进入 Agent 的当前端口对象 |
+| Agent `output_transform` | `raw_outputs`、`inputs`、`workflow`、`edges`、`run` | `raw_outputs` 是模型刚返回并解析出的原始端口对象 |
+| Edge mapping `transform` | `value`、`outputs`、`workflow`、`edges`、`run` | `value` 是当前来源端口值，`outputs` 是源 Agent 的完整输出 |
+
+固定执行顺序：
+
+1. 源 Agent 成功并满足出边条件后，逐条 mapping 执行 `transform`；结果写入目标批次端口。
+2. 目标 Agent/批次满足实际端口就绪条件并进入执行后，先应用 `input_transform`。
+3. 对变换后的输入执行必填、额外端口、类型和 `schema_hint` 校验，再执行 `input` 规则，最后调用模型。
+4. 模型响应解析为对象后应用 `output_transform`。
+5. 对变换后的输出执行端口、类型和 `schema_hint` 校验，再执行 `output` 规则，最后写入 artifacts 并传播出边。
+
+严格 JSON 规则：
+
+- 允许 `null`、布尔、数字、字符串、数组和字符串键对象；拒绝 tuple、set、非字符串键、`NaN`、`Infinity`、缺失值和自定义对象。
+- 结果必须可由标准 JSON 表示；运行时拒绝循环引用、超过 64 层的嵌套、超过 20000 个值节点、超过 10000 项的集合和超过 1 MiB 的序列化结果。
+- 字符串、整数、表达式长度、上下文大小、操作次数和超时继续使用 Agent 规则相同的资源上限。
+- Edge transform 只跳过保存时的“源端口类型必须等于目标端口类型”检查；目标端口仍会在运行时校验最终值，不能用变换绕过 `TEXT`、`DATA`、`FILE` 的契约。
+- 表达式不能执行任意方法。应使用 `str`、`int`、`float`、`length`、`upper`、`lower`、`contains` 等安全 helper；例如使用 `str(inputs.brief)`，不要写 `inputs.brief.strip()`。
+
+常见用途：
+
+- 输入清理：把可选字段补为空字符串，统一组合多个上游端口，或只保留模型需要的字段。
+- 输出重组：把模型偏好的扁平 JSON 字段组合成目标端口要求的结构。
+- 跨类型映射：把 `TEXT` 转换为结构化 `DATA`，或从 `DATA` 中提取一个字符串写入 `TEXT` 端口。
+- 可追溯元数据：在目标 DATA 中加入 `workflow.inputs` 中的业务标识、当前 `run.step` 或边遍历次数。
+
+每个实际执行的变换会发出 `transform_started`，成功时发出 `transform_passed`，失败时发出 `transform_failed`。事件数据包含 `scope`（`agent` 或 `edge`）、`phase`（`input`、`output` 或 `mapping`）、`expression`，边映射还包含从零开始的 `mapping_index`。
+
 ## 7. SDL 校验与编译
 
 ### 7.1 校验分两层
@@ -967,6 +1100,8 @@ DeepSeek 文本模型不能用于图片生成。即使接口形态兼容 OpenAI�
 - `image` 模式 Agent 必须引用启用了图片能力的 Profile，并且只能有一个 `FILE` 输出。
 - `image` 模式 Agent 不能同时启用 `json_output`。
 - Agent 规则阶段合法，表达式符合白名单 AST，且 `input` 规则不能引用 `outputs.*`。
+- Agent `input_transform`、`output_transform` 和边 mapping `transform` 必须符合各自的白名单上下文根；Agent 变换在运行时必须返回对象。
+- Edge mapping `transform` 只放宽保存阶段的源/目标端口同类型检查，变换结果仍必须在运行时满足目标端口类型和 `schema_hint`。
 - 正则类边条件通过长度、复杂度和危险语法检查。
 - 所有节点均可从 `start` 到达；不可达节点作为错误处理。
 - 工作流声明的输出引用存在。
@@ -1000,7 +1135,7 @@ generated/{compiler_key}/
 - 不生成任意代码执行入口。
 - Prompt、端口和条件都通过 JSON 安全序列化写入配置。
 - `graph_runner.py` 来自受控模板，不允许用户文本直接拼接到 Python 源码中。
-- `rule_sandbox.py` 与主运行器一同生成，负责规则 AST 校验、白名单解释和隔离子进程入口。
+- `rule_sandbox.py` 与主运行器一同生成，负责规则与数据变换的 AST 校验、白名单解释和隔离子进程入口；同一沙箱以 `boolean` 模式执行 Agent 规则，以 `json` 模式执行三类数据变换。
 - `manifest.json` 记录 SDL 哈希、编译器版本和生成文件列表，不写入运行时间等非确定性字段。
 - 生成项目只依赖 Python 标准库和 `httpx`。
 
@@ -1046,8 +1181,8 @@ V0.3 使用批次感知的并行就绪队列：
 1. 用 workflow inputs 初始化所有 `start` Agent 的 `batch-start` 输入。
 2. 调度器在 `pending` 队列非空时按 SDL Agent 顺序填充可运行任务，最多同时运行 `max_parallel` 个 Agent。
 3. 每次调度 Agent 时 `step` 加一并发送 `node_enter`；完成后保存输出、累计 Token、写产物，再发送 `node_exit`。
-4. Agent 成功后按 SDL 中的边顺序计算所有出边；每条边先判断通用条件，再按边类型传播。
-5. 普通边把映射写入当前批次；`FAN_OUT` 为本次源节点执行创建新的 `fanout-*` 批次；`FEEDBACK`/`LOOP` 创建新的 `loop-*` 批次。
+4. Agent 成功后按 SDL 中的边顺序计算所有出边；每条边先判断通用条件，再逐条 mapping 执行可选的边变换。
+5. 边变换成功后，普通边把转换结果写入当前批次；`FAN_OUT` 为本次源节点执行创建新的 `fanout-*` 批次；`FEEDBACK`/`LOOP` 创建新的 `loop-*` 批次。
 6. 目标 Agent/批次只有同时满足必填输入和聚合条件时才会进入 `pending`；`scheduled_batches` 保证同一 Agent 的同一批次只调度一次。
 7. `HUMAN_GATE` 不占用 Agent 执行槽位。它生成 Gate 文件、发出等待事件，并在独立 Gate 线程池中等待人工决定或超时。
 8. 没有运行中的 Agent、没有待决 Gate，且 `pending` 为空时，运行进入结果汇总。
@@ -1059,6 +1194,9 @@ V0.3 使用批次感知的并行就绪队列：
 - 可选输入不参与就绪判断。
 - 进入新批次时会复制目标 Agent 上一批次输入作为基线，再覆盖本边映射，因此 Loop/Feedback 重入可携带原始上下文。
 - 同一批次内同名端口再次收到值时，以最新值为准。
+- Edge mapping `transform` 在目标端口写入之前执行；变换失败时不调度下游，也不发出该边的 `edge_traversed`。
+- Edge mapping `transform` 可用于 `TEXT`、`DATA`、`FILE` 之间的显式转换，但目标 Agent 执行前仍会按目标端口类型与 `schema_hint` 校验。
+- Agent 就绪判断先于 `input_transform`；输入变换不能补齐从未被调度器映射的必填端口。
 - `FAN_OUT` 让多个下游 Agent 获得同一个新批次，从而可以并行执行。
 - `AGGREGATE all` 等待同一批次的所有聚合入边；`AGGREGATE any` 在第一条入边到达后调度，后续同批次入边不会再次启动目标 Agent。
 - 同一 Agent 在一次运行中可以有多次执行，例如不同 Fan-out 批次或 Loop/Feedback 批次。
@@ -1072,15 +1210,18 @@ V0.3 使用批次感知的并行就绪队列：
 单个 Agent 的执行顺序固定为：
 
 1. 发出 `node_enter`。
-2. 执行全部启用的 `input` 规则；失败时不发起模型请求。
-3. 调用 Chat 或 Image Agent。
-4. 发出 `token_usage`；该事件只表示模型服务已经返回 usage，不表示输出契约校验成功。
-5. 校验输出端口必须存在、没有额外端口，并执行 `TEXT`/`DATA`/`FILE`/`MIXED` 与 `schema_hint` 校验。
-6. 执行全部启用的 `output` 规则。
-7. 将输出作为 artifacts 落盘并发出 `artifact_written`。
-8. 发出成功的 `node_exit`。
+2. 若配置了 `input_transform`，以当前 `inputs`、工作流输入、边遍历计数和运行信息为上下文执行表达式，并整体替换输入；发出 `transform_started`、`transform_passed` 或 `transform_failed`。
+3. 对变换后的输入执行必填、额外端口、`TEXT`/`DATA`/`FILE`/`MIXED` 与 `schema_hint` 校验。
+4. 执行全部启用的 `input` 规则；失败时不发起模型请求。
+5. 调用 Chat 或 Image Agent。
+6. 模型服务返回 usage 后发出 `token_usage`；该事件不表示输出契约校验或输出变换成功。
+7. 若配置了 `output_transform`，以模型刚解析出的 `raw_outputs`、变换后的输入、工作流输入、边遍历计数和运行信息为上下文执行表达式，并整体替换输出。
+8. 校验输出端口必须存在、没有额外端口，并执行 `TEXT`/`DATA`/`FILE`/`MIXED` 与 `schema_hint` 校验。
+9. 执行全部启用的 `output` 规则。
+10. 将输出作为 artifacts 落盘并发出 `artifact_written`。
+11. 发出成功的 `node_exit`。
 
-因此输出规则失败时，日志中可能已经出现该 Agent 的 `token_usage`，但不会出现它的 artifacts；输入规则失败时则不会产生模型 Token。
+因此输入变换、输入校验或输入规则失败时不会产生模型 Token；模型调用成功后即使输出变换或输出规则失败，日志中仍会出现 `token_usage`，但不会出现该 Agent 的 artifacts。输入变换可以删除已有端口并触发后续必填校验，但不能让调度器重新判断一个从未满足就绪条件的批次。
 
 #### Chat Agent 调用
 
@@ -1105,10 +1246,11 @@ V0.3 使用批次感知的并行就绪队列：
 
 1. 读取 OpenAI 兼容响应中的 `choices[0].message.content`。
 2. 解析 JSON 对象。
-3. 校验最外层键与 Agent 输出端口完全一致。
-4. 校验每个端口的 `TEXT`、`DATA`、`FILE`、`MIXED` 类型。
-5. 校验端口上的 `schema_hint`。
-6. 执行 Agent 的输出规则并及时记录 `token_usage`，然后把输出写入运行时状态。
+3. 应用可选的 `output_transform`，用变换结果整体替换输出；未配置时保留解析结果。
+4. 校验最外层键与 Agent 输出端口完全一致。
+5. 校验每个端口的 `TEXT`、`DATA`、`FILE`、`MIXED` 类型。
+6. 校验端口上的 `schema_hint`。
+7. 执行 Agent 的输出规则并及时记录 `token_usage`，然后把输出写入运行时状态。
 
 因此 `Port 'outline' does not satisfy schema_hint` 表示模型已经返回了 `outline`，但值不满足端口声明的 JSON Schema 子集，例如声明为 `object` 却返回了字符串，或 `score` 超出 `minimum/maximum`。
 
@@ -1291,6 +1433,9 @@ Agent 流生成物的位置分为三类：
 - `rule_started`
 - `rule_passed`
 - `rule_failed`
+- `transform_started`
+- `transform_passed`
+- `transform_failed`
 - `artifact_written`
 - `human_gate_waiting`
 - `human_gate_resolved`
@@ -1306,6 +1451,8 @@ Agent 流生成物的位置分为三类：
 | `token_usage` | `prompt_tokens`、`completion_tokens`、`total_tokens` |
 | `rule_started` / `rule_passed` | `phase`、`rule_index`、`expression`，可选 `message` |
 | `rule_failed` | `phase`、`rule_index`、`expression`、`error`，可选 `message` |
+| `transform_started` / `transform_passed` | `scope`、`phase`、`expression`，Edge mapping 另含从零开始的 `mapping_index` |
+| `transform_failed` | `scope`、`phase`、`expression`、`error`，Edge mapping 另含 `mapping_index` |
 | `artifact_written` | `port`、`path`、`type`、`step`、`batch_id`、`bytes` |
 | `human_gate_waiting` | `gate_id`、`prompt`、`timeout_seconds` |
 | `human_gate_resolved` | `gate_id`、`decision`、`comment`、`timed_out` |
@@ -1356,6 +1503,8 @@ Agent 流生成物的位置分为三类：
 - `token_usage` -> 运行总量和节点分量累加
 - `rule_started` / `rule_passed` -> 保留在事件时间线，用于定位 Agent 已执行到哪条规则
 - `rule_failed` -> 事件时间线展示规则失败详情，节点最终由 `error` 收敛为失败
+- `transform_started` / `transform_passed` -> 保留在事件时间线，用于定位 Agent 或边已执行到哪个变换阶段
+- `transform_failed` -> 事件时间线展示变换表达式和错误，后续由运行错误收敛为失败
 - `artifact_written` -> artifacts 列表追加
 - `human_gate_waiting` -> Gate 进入 `waiting`
 - `human_gate_resolved` -> Gate 进入 `resolved`
@@ -1440,7 +1589,24 @@ V0.3 只有一个实际工作界面：
 - 编辑器只负责草稿保存；表达式是否合法在项目保存和运行时校验阶段判断。
 - 规则按数组顺序执行并生成 `rule_started`、`rule_passed`、`rule_failed` 事件。
 
-### 10.8 图片配置界面
+### 10.8 数据变换编辑器
+
+- Agent 检查器提供“输入变换”和“输出变换”两个可选编辑器；未添加时不改变原有行为。
+- 新增变换默认进入 `fields` 字段模式，以“输出路径 + 值表达式”的表格编辑，不再要求用户手写完整 JSON。
+- 字段模式支持任意数量的点分层级路径，例如 `outline.sections`；后端负责组装嵌套 JSON 对象。
+- 新建输入变换时根据 Agent 第一个输入端口生成 `inputs.<port>`，新建输出变换时根据第一个输出端口生成 `raw_outputs.<port>`。
+- 字段模式可一键转换为高级表达式；转换结果只用于继续精细编辑，不会删除原有字段模式能力。
+- 删除最后一个字段会清除整项变换，避免产生后端不接受的空字段表。
+- 输入变换提示可访问 `inputs`、`workflow`、`edges`、`run`；输出变换额外提供 `raw_outputs`。
+- Edge 检查器的每条 mapping 使用一个 `Braces` 图标入口添加或清除变换，避免和映射行操作重复。
+- Mapping 变换提示可访问 `value`、`outputs`、`workflow`、`edges`、`run`；同一个 mapping 只显示一个变换编辑区。
+- Edge mapping 默认进入高级表达式模式，并显式保存 `mode: expression`；这是为了保留任意严格 JSON 返回值的兼容能力。
+- 字段值默认直接引用端口，不调用字符串方法；需要字符串化时使用安全 helper `str(...)`。
+- 高级模式仍显示完整文本表达式，用于兼容已有项目和无法用对象字段表表达的 Edge 变换。
+- 编辑失败或保存失败时保留当前草稿；保存项目和运行项目时由后端执行白名单 AST 校验，运行期错误通过 `transform_*` 事件展示。
+- 复制 Agent 时深拷贝输入与输出变换，后续编辑副本不会修改原 Agent。
+
+### 10.9 图片配置界面
 
 - API 常用库和项目内 API Profile 都提供 `Image generation` 能力开关。
 - 启用后显示尺寸、质量、输出格式和 API 响应格式。质量与格式可以为空，表示使用供应商默认值。
@@ -1449,7 +1615,7 @@ V0.3 只有一个实际工作界面：
 - 切回 `Chat` 时，如果当前只有一个 `FILE` 输出，会转换为 `TEXT`；其他端口结构保持不变。
 - 图片大小、质量和格式最终由目标服务校验，前端字段不会代替供应商能力表。
 
-### 10.9 运行态
+### 10.10 运行态
 
 节点状态：
 
@@ -1587,8 +1753,8 @@ pnpm --dir apps/web build
 | 项目 | 结果 |
 | --- | --- |
 | 后端 Python 编译检查 | 通过 |
-| 后端 pytest | 99 passed, 1 warning |
-| 前端 Vitest | 32 passed |
+| 后端 pytest | 131 passed, 1 warning |
+| 前端 Vitest | 36 passed |
 | 前端生产构建 | 通过 |
 | 浏览器检查 | 本轮未执行；当前仓库未安装 Playwright |
 
@@ -1604,6 +1770,11 @@ pnpm --dir apps/web build
 - Agent 输入/输出规则的语法白名单、允许根、非布尔结果拒绝和资源上限。
 - 规则隔离子进程执行、超时处理，以及 `rule_started`/`rule_passed`/`rule_failed` 事件。
 - 输入规则失败阻止模型调用；输出规则失败发生在 Token 计量之后、产物落盘之前。
+- Agent 输入/输出变换与 Edge mapping 变换的上下文根隔离、严格 JSON 结果和跨端口转换。
+- 输入变换在校验和模型调用前执行；输出变换在 Token 计量之后、输出校验和 artifacts 之前执行。
+- Edge mapping 变换在目标端口写入前执行，失败时不调用下游且不发出 `edge_traversed`。
+- 严格 JSON 拒绝 tuple、set、非字符串键、`NaN`、`Infinity`、循环引用、`MISSING` 和超出资源上限的结果。
+- 编译模板生成的独立 `rule_sandbox.py` 可在 JSON 模式执行，保持源码模板与后端沙箱行为一致。
 - 输入 join、条件分支、Feedback/Loop 重入与 guard 超限。
 - Agent JSON 输出的 `response_format` 开关、端口校验和尾随文本提取。
 - Fan-out 分支并行执行、批次传播、Aggregate `all` 等待全部分支和 `any` 的批次级单次执行。
@@ -1627,6 +1798,7 @@ pnpm --dir apps/web build
 - 左、右、底部面板收纳、尺寸边界和 UI 状态持久化。
 - 条件谓词追加和多层组合。
 - Agent 输入/输出规则的新增、删除、启停和表达式编辑。
+- Agent 输入/输出变换编辑、Edge mapping 单入口变换编辑和复制 Agent 时的变换深拷贝。
 - 增强条件运算符及正则配置的类型映射。
 - 七种边的编辑器配置、删除确认和 Gate/回放相关状态映射。
 - 事件回放的时间线裁剪、节点/边/Token/Gate/artifacts 同步重建和进度边界。
@@ -1646,10 +1818,10 @@ pnpm --dir apps/web build
 | 阶段 | 状态 | 已落地内容 |
 | --- | --- | --- |
 | A：契约和基础工程 | 已完成 | 前后端工程、SDL 模型、示例项目、校验器、测试基础 |
-| B：编译与无界面运行 | 已完成 | Jinja2 生成、OpenAI Chat/Image 调用、批次感知并行调度、Loop/Feedback guard、事件输出 |
+| B：编译与无界面运行 | 已完成 | Jinja2 生成、OpenAI Chat/Image 调用、批次感知并行调度、Loop/Feedback guard、规则/变换沙箱、事件输出 |
 | C：API 与本地持久化 | 已完成 | 项目 CRUD、revision、原子写入、密钥存储、编译缓存、SSE、取消运行 |
-| D：可视化编辑器 | 已完成 | React Flow、七种边配置、三面板收纳/调整、条件树、JSON/Image 配置、Gate 待办、运行高亮、回放和 artifacts |
-| E：加固与文档 | 基本完成 | 路径与图片 URL 安全、Gate 文件锁、Token/事件上限、密钥隔离、测试、示例和故障排查；全流程 Playwright CI 留作后续 |
+| D：可视化编辑器 | 已完成 | React Flow、七种边配置、三面板收纳/调整、条件树、JSON/Image 配置、输入/输出与边 mapping 变换编辑、Gate 待办、运行高亮、回放和 artifacts |
+| E：加固与文档 | 基本完成 | 路径与图片 URL 安全、Gate 文件锁、Token/事件上限、密钥隔离、规则/变换资源边界、测试、示例和故障排查；全流程 Playwright CI 留作后续 |
 
 ## 15. 常见故障排查
 
@@ -1836,6 +2008,20 @@ Feedback 边已允许成功遍历 3 次，第 4 次仍满足条件时运行失�
 - 条件引用缺失或类型不匹配时，运行时谓词返回 `false`；保存时引用了不存在的 Agent、端口、工作流输入或边，仍会作为校验错误返回。
 - 前端结构化编辑器与高级 JSON 应保持同一种条件树。切换后出现字段丢失时，先展开高级 JSON 核对 `op`、`args`、`left` 和 `right`，不要混用旧版不支持的运算符名称。
 
+### 15.15 数据变换失败
+
+- `invalid_transform_field`：字段模式的 `path` 必须是小写标识符点分隔路径，最多 8 段；检查重复路径，以及 `outline` 与 `outline.sections` 这类父子冲突。
+- 字段模式的值只填写表达式，不要填写完整 JSON 对象。例如路径 `outline.sections` 对应值表达式 `raw_outputs.sections`，后端会负责生成 `{"outline": {"sections": ...}}`。
+- `input_transform must return an object` 或 `output_transform must return an object`：Agent 变换的结果必须是 JSON 对象；只返回字符串、数组或标量时会被拒绝。Edge mapping 变换可以使用任意严格 JSON 返回值。
+- `transform result type ... is not JSON-compatible`：删除 tuple、set、自定义对象或 `MISSING`。表达式中的 tuple/set 字面量可以被解释器构造，但不会被允许作为最终结果。
+- `transform result object keys must be strings`：所有对象键必须显式转换为字符串；当前沙箱不会像 JavaScript 一样自动转换数字键。
+- `transform result contains NaN or Infinity` 或 `contains a circular reference`：改为有限数字和普通树状数组/对象，不能返回递归结构。
+- 变换后提示缺少必填输入：调度器已在变换前判断 Agent/批次就绪，`input_transform` 只能保留、删除或重组已送达端口，不能补齐一条从未映射的必填端口。应修正边 mapping。
+- Edge 变换后提示目标端口类型或 `schema_hint` 不匹配：表达式必须返回目标端口契约需要的值；保存阶段放宽源/目标同类型检查，不代表运行时会跳过目标校验。
+- `invalid_agent_transform` 或 `invalid_edge_transform`：检查上下文根。输入变换不能引用 `outputs`/`raw_outputs`，输出变换不能引用 `outputs`，边 mapping 变换不能引用 `inputs`。
+- 表达式禁止任意方法调用。需要裁剪时可使用安全 helper 或组合表达式；不要写 `inputs.text.strip()`，应使用当前已支持的字符串 helper，或在输入进入工作流前完成清理。
+- 通过 `events.jsonl` 或回放中的 `transform_started`、`transform_passed`、`transform_failed` 定位失败阶段；`scope`、`phase` 和 Edge 的 `mapping_index` 会标明具体位置。
+
 ## 16. V0.3 验收结果
 
 - [x] 工作流可以保存为可读 SDL，重新打开后语义和布局正确恢复。
@@ -1861,9 +2047,14 @@ Feedback 边已允许成功遍历 3 次，第 4 次仍满足条件时运行失�
 - [x] 规则表达式禁止 import、赋值、lambda、推导式、循环、dunder、关键字/星号参数和任意函数调用。
 - [x] 规则上下文按阶段隔离，输入阶段不能提前读取 Agent 输出；规则必须返回严格布尔值。
 - [x] 每条执行规则产生 `rule_started`、`rule_passed` 或 `rule_failed` 事件，输入失败阻止模型调用，输出失败阻止产物落盘。
+- [x] Agent 可在模型调用前执行输入变换，并在模型返回后、端口校验和 artifacts 前执行输出变换；两类结果都必须为 JSON 对象。
+- [x] Agent 变换默认使用可读的字段模式，由后端组装 JSON 表达式，同时保留旧版高级表达式兼容。
+- [x] Edge mapping 可在目标端口写入前执行数据变换，并可用显式表达式完成 `TEXT`/`DATA`/`FILE` 之间的受控转换。
+- [x] 三类变换使用隔离上下文根和严格 JSON 结果，拒绝非 JSON 类型、循环引用、非有限数字和超出资源上限的结果。
+- [x] 变换按固定顺序执行并产生 `transform_started`、`transform_passed` 或 `transform_failed` 事件；失败不会越过当前阶段继续执行。
 - [x] 条件语言支持 `between`、`starts_with`、`ends_with`、`matches`、`empty`、`not_empty`、`length_eq`、`contains_all` 和 `contains_any`。
 - [x] 正则条件实施长度、重复次数和危险结构限制，不开放任意代码或动态求值。
-- [x] 生成项目包含独立 `runners/rule_sandbox.py`，其编译器版本记录为 `0.3.0`。
+- [x] 生成项目包含独立 `runners/rule_sandbox.py`，其编译器版本记录为 `0.3.2`。
 
 内置 V0.2 综合演示仍使用 SDL `0.2`，用于保留向后兼容样本；V0.3 新增的规则和条件字段均为可选，不要求已有项目批量迁移。
 
@@ -1878,7 +2069,7 @@ Feedback 边已允许成功遍历 3 次，第 4 次仍满足条件时运行失�
 - 图片服务目前只支持单图生成，多图数量、图生图、局部编辑和异步任务轮询尚未建模。
 - URL 图片下载在 DNS 解析后由 HTTP 客户端再次连接；完全消除 DNS rebinding 需要固定解析地址的自定义传输层，当前作为本地工具的后续加固项。
 - Playwright 全流程、窄屏视觉检查和产物下载/预览尚未纳入自动化验收。
-- Python 规则有意停留在布尔校验表达式，不提供脚本级副作用、文件访问、网络访问或持久变量。
+- Python 规则有意停留在布尔校验表达式；数据变换只提供无副作用表达式，不提供脚本级语句、文件访问、网络访问或持久变量。
 - 当前只实现 OpenAI 兼容 Chat/Image Provider；多 Provider 协议抽象和能力路由留待后续版本。
 - 条件正则使用 Python `re` 并限制 pattern/target 大小，但没有跨语言正则兼容层或完整的计算复杂度静态分析。
 

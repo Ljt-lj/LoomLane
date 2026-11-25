@@ -6,8 +6,11 @@ from loomlane.rule_sandbox import (
     AgentRuleError,
     RuleValidationError,
     evaluate_expression,
+    evaluate_json_expression,
     evaluate_rule_isolated,
+    evaluate_transform_isolated,
     validate_rule_expression,
+    validate_transform_expression,
 )
 
 
@@ -95,3 +98,86 @@ def test_isolated_sandbox_evaluates_boolean() -> None:
         {"inputs": {"brief": ""}},
         allowed_roots={"inputs"},
     )
+
+
+def test_isolated_transform_sandbox_returns_json_values() -> None:
+    context = {
+        "value": {"title": "A title", "items": ["alpha", "beta"]},
+        "workflow": {"inputs": {"brief": "source"}},
+    }
+    roots = {"value", "workflow"}
+
+    assert evaluate_transform_isolated(
+        '{"text": upper(value["title"])}',
+        context,
+        allowed_roots=roots,
+    ) == {"text": "A TITLE"}
+    assert evaluate_transform_isolated(
+        "value.items",
+        context,
+        allowed_roots=roots,
+    ) == ["alpha", "beta"]
+    assert evaluate_transform_isolated(
+        "length(value.items)",
+        context,
+        allowed_roots=roots,
+    ) == 2
+
+
+@pytest.mark.parametrize(
+    "expression, fragment",
+    [
+        ("(value,)", "tuple"),
+        ("{value}", "set"),
+        ("{1: value}", "keys must be strings"),
+        ('float("nan")', "NaN or Infinity"),
+        ('float("inf")', "NaN or Infinity"),
+        ('"x" * 10001', "multiplication count is too large"),
+        ('["x"] * 10001', "multiplication count is too large"),
+    ],
+)
+def test_transform_rejects_non_strict_json_results(
+    expression: str,
+    fragment: str,
+) -> None:
+    with pytest.raises(AgentRuleError, match=fragment):
+        evaluate_json_expression(
+            expression,
+            {"value": "payload"},
+            allowed_roots={"value"},
+        )
+
+
+def test_transform_rejects_oversized_json_strings_and_documents() -> None:
+    with pytest.raises(AgentRuleError, match="string length limit"):
+        evaluate_json_expression(
+            "value",
+            {"value": "x" * 100_001},
+            allowed_roots={"value"},
+        )
+
+    with pytest.raises(AgentRuleError, match="exceeds 1000000 bytes"):
+        evaluate_json_expression(
+            "value",
+            {"value": ["x" * 100_000] * 11},
+            allowed_roots={"value"},
+        )
+
+
+def test_transform_rejects_circular_results_and_unknown_roots() -> None:
+    circular: dict[str, object] = {}
+    circular["self"] = circular
+
+    with pytest.raises(AgentRuleError, match="circular reference"):
+        evaluate_json_expression(
+            "value",
+            {"value": circular},
+            allowed_roots={"value"},
+        )
+
+    errors = validate_transform_expression(
+        "outputs.draft",
+        allowed_roots={"value", "raw_outputs"},
+    )
+    assert errors
+    assert "unknown name 'outputs'" in errors[0]

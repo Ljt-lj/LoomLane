@@ -98,6 +98,19 @@ export interface AgentRule {
   enabled: boolean
 }
 
+export type TransformMode = 'fields' | 'expression'
+
+export interface TransformField {
+  path: string
+  value: string
+}
+
+export interface TransformExpression {
+  mode?: TransformMode
+  fields?: TransformField[]
+  expression?: string | null
+}
+
 export interface Agent {
   id: string
   name: string
@@ -112,6 +125,8 @@ export interface Agent {
   }
   json_output: AgentJsonOutput
   rules: AgentRule[]
+  input_transform?: TransformExpression | null
+  output_transform?: TransformExpression | null
   output_dir: string | null
 }
 
@@ -125,6 +140,7 @@ export interface ConditionNode {
 export interface EdgeMapping {
   from: string
   to: string
+  transform?: TransformExpression | null
 }
 
 export interface AggregateConfig {

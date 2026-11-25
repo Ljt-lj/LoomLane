@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import os
 import re
 import subprocess
@@ -34,8 +35,20 @@ MAX_STRING_LENGTH = 100_000
 MAX_COLLECTION_LENGTH = 10_000
 MAX_INTEGER_BITS = 512
 MAX_OPERATIONS = 1_000
+MAX_JSON_RESULT_BYTES = 1_000_000
+MAX_JSON_DEPTH = 64
+MAX_JSON_NODES = 20_000
 DEFAULT_EVALUATION_TIMEOUT = 2.0
 DEFAULT_ALLOWED_ROOTS = frozenset({"inputs", "outputs", "workflow", "edges", "run"})
+EDGE_TRANSFORM_ALLOWED_ROOTS = frozenset(
+    {"value", "outputs", "workflow", "edges", "run"}
+)
+AGENT_INPUT_TRANSFORM_ALLOWED_ROOTS = frozenset(
+    {"inputs", "workflow", "edges", "run"}
+)
+AGENT_OUTPUT_TRANSFORM_ALLOWED_ROOTS = frozenset(
+    {"raw_outputs", "inputs", "workflow", "edges", "run"}
+)
 
 _SAFE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
@@ -165,6 +178,112 @@ def _guard_value(value: Any) -> Any:
     return value
 
 
+def _guard_json_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+    nodes: list[int] | None = None,
+) -> Any:
+    """Validate that an expression result can be represented as strict JSON."""
+    if seen is None:
+        seen = set()
+    if nodes is None:
+        nodes = [0]
+    nodes[0] += 1
+    if nodes[0] > MAX_JSON_NODES:
+        raise AgentRuleError(
+            f"transform result exceeds the {MAX_JSON_NODES}-value limit"
+        )
+    if depth > MAX_JSON_DEPTH:
+        raise AgentRuleError(
+            f"transform result exceeds the depth limit of {MAX_JSON_DEPTH}"
+        )
+    if value is MISSING:
+        raise AgentRuleError("transform result contains an unavailable value")
+    if value is None or type(value) is bool:
+        return value
+    if isinstance(value, str):
+        _guard_value(value)
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        _guard_value(value)
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise AgentRuleError("transform result contains NaN or Infinity")
+        return value
+    if isinstance(value, list):
+        if len(value) > MAX_COLLECTION_LENGTH:
+            raise AgentRuleError(
+                "transform result exceeded the collection length limit"
+            )
+        identity = id(value)
+        if identity in seen:
+            raise AgentRuleError("transform result contains a circular reference")
+        seen.add(identity)
+        try:
+            for item in value:
+                _guard_json_value(
+                    item,
+                    depth=depth + 1,
+                    seen=seen,
+                    nodes=nodes,
+                )
+        finally:
+            seen.remove(identity)
+        return value
+    if isinstance(value, dict):
+        if len(value) > MAX_COLLECTION_LENGTH:
+            raise AgentRuleError(
+                "transform result exceeded the collection length limit"
+            )
+        identity = id(value)
+        if identity in seen:
+            raise AgentRuleError("transform result contains a circular reference")
+        seen.add(identity)
+        try:
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise AgentRuleError(
+                        "transform result object keys must be strings"
+                    )
+                _guard_json_value(
+                    key,
+                    depth=depth + 1,
+                    seen=seen,
+                    nodes=nodes,
+                )
+                _guard_json_value(
+                    item,
+                    depth=depth + 1,
+                    seen=seen,
+                    nodes=nodes,
+                )
+        finally:
+            seen.remove(identity)
+        return value
+    raise AgentRuleError(
+        f"transform result type '{type(value).__name__}' is not JSON-compatible"
+    )
+
+
+def _check_json_result_size(value: Any) -> None:
+    try:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise AgentRuleError("transform result is not strict JSON") from exc
+    if len(serialized.encode("utf-8")) > MAX_JSON_RESULT_BYTES:
+        raise AgentRuleError(
+            f"transform result exceeds {MAX_JSON_RESULT_BYTES} bytes"
+        )
+
+
 def _validate_ast(expression: str, allowed_roots: frozenset[str]) -> ast.Expression:
     if not expression.strip():
         raise RuleValidationError("expression cannot be blank")
@@ -250,6 +369,14 @@ def validate_rule_expression(
     except RuleValidationError as exc:
         return [str(exc)]
     return []
+
+
+def validate_transform_expression(
+    expression: str,
+    *,
+    allowed_roots: frozenset[str] | set[str],
+) -> list[str]:
+    return validate_rule_expression(expression, allowed_roots=allowed_roots)
 
 
 def _truthy(value: Any) -> bool:
@@ -454,6 +581,19 @@ def evaluate_expression(
     return result
 
 
+def evaluate_json_expression(
+    expression: str,
+    context: dict[str, Any],
+    *,
+    allowed_roots: frozenset[str] | set[str] = DEFAULT_ALLOWED_ROOTS,
+) -> Any:
+    tree = _validate_ast(expression, frozenset(allowed_roots))
+    result = _Interpreter(context).evaluate(tree)
+    _guard_json_value(result)
+    _check_json_result_size(result)
+    return result
+
+
 def _subprocess_environment() -> dict[str, str]:
     environment = {
         "PYTHONIOENCODING": "utf-8",
@@ -472,11 +612,15 @@ def evaluate_rule_isolated(
     *,
     timeout_seconds: float = DEFAULT_EVALUATION_TIMEOUT,
     allowed_roots: frozenset[str] | set[str] = DEFAULT_ALLOWED_ROOTS,
-) -> bool:
+    result_mode: str = "boolean",
+) -> Any:
+    if result_mode not in {"boolean", "json"}:
+        raise AgentRuleError(f"unknown sandbox result mode '{result_mode}'")
     payload = {
         "expression": expression,
         "context": context,
         "allowed_roots": sorted(allowed_roots),
+        "result_mode": result_mode,
     }
     try:
         serialized = json.dumps(
@@ -532,9 +676,25 @@ def evaluate_rule_isolated(
     if not response["ok"]:
         raise AgentRuleError(str(response.get("error") or "Agent rule failed"))
     result = response.get("result")
-    if type(result) is not bool:
+    if result_mode == "boolean" and type(result) is not bool:
         raise AgentRuleError("Agent rule sandbox returned a non-boolean result")
     return result
+
+
+def evaluate_transform_isolated(
+    expression: str,
+    context: dict[str, Any],
+    *,
+    timeout_seconds: float = DEFAULT_EVALUATION_TIMEOUT,
+    allowed_roots: frozenset[str] | set[str] = EDGE_TRANSFORM_ALLOWED_ROOTS,
+) -> Any:
+    return evaluate_rule_isolated(
+        expression,
+        context,
+        timeout_seconds=timeout_seconds,
+        allowed_roots=allowed_roots,
+        result_mode="json",
+    )
 
 
 def _run_evaluation_server() -> int:
@@ -546,6 +706,7 @@ def _run_evaluation_server() -> int:
         expression = payload.get("expression")
         context = payload.get("context")
         roots = payload.get("allowed_roots")
+        result_mode = payload.get("result_mode", "boolean")
         if not isinstance(expression, str):
             raise AgentRuleError("sandbox expression must be text")
         if not isinstance(context, dict):
@@ -554,7 +715,14 @@ def _run_evaluation_server() -> int:
             isinstance(item, str) for item in roots
         ):
             raise AgentRuleError("sandbox roots must be a string list")
-        result = evaluate_expression(
+        if result_mode not in {"boolean", "json"}:
+            raise AgentRuleError("sandbox result mode must be boolean or json")
+        evaluator = (
+            evaluate_expression
+            if result_mode == "boolean"
+            else evaluate_json_expression
+        )
+        result = evaluator(
             expression,
             context,
             allowed_roots=frozenset(roots),
@@ -562,7 +730,13 @@ def _run_evaluation_server() -> int:
         response = {"ok": True, "result": result}
     except Exception as exc:
         response = {"ok": False, "error": str(exc)}
-    sys.stdout.write(json.dumps(response, ensure_ascii=False))
+    sys.stdout.write(
+        json.dumps(
+            response,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
     sys.stdout.flush()
     return 0
 

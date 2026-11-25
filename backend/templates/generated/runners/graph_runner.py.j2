@@ -23,7 +23,14 @@ from urllib.parse import urlparse
 import httpx
 
 from config import SDL
-from runners.rule_sandbox import AgentRuleError, evaluate_rule_isolated
+from runners.rule_sandbox import (
+    AGENT_INPUT_TRANSFORM_ALLOWED_ROOTS,
+    AGENT_OUTPUT_TRANSFORM_ALLOWED_ROOTS,
+    AgentRuleError,
+    EDGE_TRANSFORM_ALLOWED_ROOTS,
+    evaluate_rule_isolated,
+    evaluate_transform_isolated,
+)
 
 
 class WorkflowError(RuntimeError):
@@ -974,6 +981,57 @@ def _evaluate_agent_rules(
         events.emit("rule_passed", node_id=agent["id"], data=base)
 
 
+def _apply_transform(
+    expression: str,
+    context: dict[str, Any],
+    *,
+    scope: str,
+    phase: str,
+    events: EventWriter,
+    allowed_roots: frozenset[str],
+    node_id: str | None = None,
+    edge_id: str | None = None,
+    mapping_index: int | None = None,
+    required_object_error: str | None = None,
+) -> Any:
+    data: dict[str, Any] = {
+        "scope": scope,
+        "phase": phase,
+        "expression": expression,
+    }
+    if mapping_index is not None:
+        data["mapping_index"] = mapping_index
+    events.emit(
+        "transform_started",
+        node_id=node_id,
+        edge_id=edge_id,
+        data=data,
+    )
+    try:
+        result = evaluate_transform_isolated(
+            expression,
+            context,
+            allowed_roots=allowed_roots,
+        )
+        if required_object_error and not isinstance(result, dict):
+            raise AgentRuleError(required_object_error)
+    except Exception as exc:
+        events.emit(
+            "transform_failed",
+            node_id=node_id,
+            edge_id=edge_id,
+            data={**data, "error": str(exc)},
+        )
+        raise
+    events.emit(
+        "transform_passed",
+        node_id=node_id,
+        edge_id=edge_id,
+        data=data,
+    )
+    return result
+
+
 def _write_artifacts(
     agent: dict[str, Any],
     outputs: dict[str, Any],
@@ -1421,9 +1479,10 @@ class WorkflowRuntime:
         execution: AgentExecution,
         step: int,
         outputs: dict[str, Any] | None = None,
+        inputs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
-            "inputs": execution.inputs,
+            "inputs": inputs if inputs is not None else execution.inputs,
             "outputs": outputs or {},
             "workflow": {"inputs": self.run_inputs},
             "edges": {
@@ -1436,6 +1495,52 @@ class WorkflowRuntime:
                 "batch_id": execution.batch_id,
             },
         }
+
+    def _transform_context(
+        self,
+        execution: AgentExecution,
+        step: int,
+        *,
+        inputs: dict[str, Any] | None = None,
+        raw_outputs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "inputs": inputs if inputs is not None else execution.inputs,
+            "raw_outputs": raw_outputs or {},
+            "workflow": {"inputs": self.run_inputs},
+            "edges": {
+                edge_id: {"traversals": count}
+                for edge_id, count in self.traversals.items()
+            },
+            "run": {
+                "step": step,
+                "agent_id": execution.agent_id,
+                "batch_id": execution.batch_id,
+            },
+        }
+
+    def _validate_agent_inputs(
+        self,
+        agent_id: str,
+        inputs: dict[str, Any],
+    ) -> None:
+        input_ports = {
+            port["name"]: port for port in self.agents[agent_id]["inputs"]
+        }
+        for port in input_ports.values():
+            if port.get("required", True) and port["name"] not in inputs:
+                raise WorkflowError(
+                    f"Agent '{agent_id}' is missing required input "
+                    f"port '{port['name']}'"
+                )
+        extra_keys = set(inputs) - set(input_ports)
+        if extra_keys:
+            raise WorkflowError(
+                f"Agent '{agent_id}' received unexpected inputs: "
+                + ", ".join(sorted(extra_keys))
+            )
+        for name, value in inputs.items():
+            _validate_value(value, input_ports[name], self.workspace)
 
     def _run_agent(self, execution: AgentExecution, step: int) -> dict[str, Any]:
         agent_id = execution.agent_id
@@ -1452,19 +1557,57 @@ class WorkflowRuntime:
             data={"batch_id": execution.batch_id, "step": step},
         )
         try:
+            inputs = dict(execution.inputs)
+            input_transform = agent.get("input_transform")
+            if input_transform:
+                transformed = _apply_transform(
+                    input_transform["expression"],
+                    self._transform_context(execution, step, inputs=inputs),
+                    scope="agent",
+                    phase="input",
+                    events=self.events,
+                    allowed_roots=AGENT_INPUT_TRANSFORM_ALLOWED_ROOTS,
+                    node_id=agent_id,
+                    required_object_error=(
+                        f"Agent '{agent_id}' input_transform must return an object"
+                    ),
+                )
+                inputs = transformed
+            self._validate_agent_inputs(agent_id, inputs)
             _evaluate_agent_rules(
                 agent,
                 "input",
-                self._rule_context(execution, step),
+                self._rule_context(execution, step, inputs=inputs),
                 self.events,
             )
-            outputs, usage = _call_agent(
+            raw_outputs, usage = _call_agent(
                 agent,
                 profile,
-                execution.inputs,
+                inputs,
                 self.events,
                 self.workspace,
             )
+            outputs = raw_outputs
+            output_transform = agent.get("output_transform")
+            if output_transform:
+                transformed = _apply_transform(
+                    output_transform["expression"],
+                    self._transform_context(
+                        execution,
+                        step,
+                        inputs=inputs,
+                        raw_outputs=raw_outputs,
+                    ),
+                    scope="agent",
+                    phase="output",
+                    events=self.events,
+                    allowed_roots=AGENT_OUTPUT_TRANSFORM_ALLOWED_ROOTS,
+                    node_id=agent_id,
+                    required_object_error=(
+                        f"Agent '{agent_id}' output_transform must return an object"
+                    ),
+                )
+                outputs = transformed
             for port in agent["outputs"]:
                 if port["name"] not in outputs:
                     raise WorkflowError(
@@ -1484,7 +1627,12 @@ class WorkflowRuntime:
             _evaluate_agent_rules(
                 agent,
                 "output",
-                self._rule_context(execution, step, outputs),
+                self._rule_context(
+                    execution,
+                    step,
+                    outputs,
+                    inputs=inputs,
+                ),
                 self.events,
             )
             artifacts = _write_artifacts(
@@ -1567,15 +1715,41 @@ class WorkflowRuntime:
         if target_batch_id != batch_id:
             self._seed_batch_inputs(edge["to"], target_batch_id)
         mapped: dict[str, Any] = {}
-        for mapping in edge["mappings"]:
+        for mapping_index, mapping in enumerate(edge["mappings"]):
             source_value = agent_outputs[mapping["from"]]
+            transform = mapping.get("transform")
+            if transform:
+                source_value = _apply_transform(
+                    transform["expression"],
+                    {
+                        "value": source_value,
+                        "outputs": agent_outputs,
+                        "workflow": {"inputs": self.run_inputs},
+                        "edges": {
+                            edge_id: {"traversals": count}
+                            for edge_id, count in self.traversals.items()
+                        },
+                        "run": {
+                            "step": self.step,
+                            "agent_id": edge["from"],
+                            "batch_id": batch_id,
+                        },
+                    },
+                    scope="edge",
+                    phase="mapping",
+                    events=self.events,
+                    allowed_roots=EDGE_TRANSFORM_ALLOWED_ROOTS,
+                    edge_id=edge["id"],
+                    mapping_index=mapping_index,
+                )
+            mapped[mapping["to"]] = source_value
+        for port_name, value in mapped.items():
             self._set_input(
                 edge["to"],
                 target_batch_id,
-                mapping["to"],
-                source_value,
+                port_name,
+                value,
             )
-            mapped[mapping["to"]] = source_value
         if edge["type"] == "AGGREGATE":
             self.aggregate_arrivals.setdefault(
                 (edge["to"], target_batch_id),
