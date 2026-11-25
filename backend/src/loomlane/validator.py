@@ -12,12 +12,24 @@ from .condition import (
 )
 from .models import (
     AggregateConfig,
+    AgentRulePhase,
     EdgeType,
     HumanGateConfig,
     SDL,
+    TransformExpression,
+    TransformMode,
     ValidationIssue,
     ValidationResponse,
 )
+from .rule_sandbox import (
+    AGENT_INPUT_TRANSFORM_ALLOWED_ROOTS,
+    AGENT_OUTPUT_TRANSFORM_ALLOWED_ROOTS,
+    DEFAULT_ALLOWED_ROOTS,
+    EDGE_TRANSFORM_ALLOWED_ROOTS,
+    validate_rule_expression,
+    validate_transform_expression,
+)
+from .transform_config import transform_field_layout_errors
 
 
 def _issue(
@@ -59,6 +71,101 @@ def _duplicates(values: list[str]) -> set[str]:
             duplicate_values.add(value)
         seen.add(value)
     return duplicate_values
+
+
+def _transform_issues(
+    transform: TransformExpression,
+    *,
+    allowed_roots: frozenset[str] | set[str],
+    code: str,
+    path: str,
+    node_id: str | None = None,
+    edge_id: str | None = None,
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    if transform.mode == TransformMode.EXPRESSION:
+        for error in validate_transform_expression(
+            transform.expression or "",
+            allowed_roots=allowed_roots,
+        ):
+            issues.append(
+                _issue(
+                    code,
+                    error,
+                    f"{path}.expression",
+                    node_id=node_id,
+                    edge_id=edge_id,
+                )
+            )
+        return issues
+
+    layout_errors = transform_field_layout_errors(transform.fields)
+    for field_index, error in layout_errors:
+        field_path = (
+            f"{path}.fields[{field_index}].path"
+            if field_index is not None
+            else f"{path}.fields"
+        )
+        issues.append(
+            _issue(
+                "invalid_transform_field",
+                error,
+                field_path,
+                node_id=node_id,
+                edge_id=edge_id,
+            )
+        )
+
+    field_expressions_valid = True
+    for field_index, field in enumerate(transform.fields):
+        expression_errors = validate_transform_expression(
+            field.value,
+            allowed_roots=allowed_roots,
+        )
+        if expression_errors:
+            field_expressions_valid = False
+        for error in expression_errors:
+            issues.append(
+                _issue(
+                    code,
+                    error,
+                    f"{path}.fields[{field_index}].value",
+                    node_id=node_id,
+                    edge_id=edge_id,
+                )
+            )
+
+    if layout_errors or not field_expressions_valid:
+        return issues
+
+    try:
+        expression = transform.compiled_expression()
+    except ValueError as exc:
+        issues.append(
+            _issue(
+                "invalid_transform_field",
+                str(exc),
+                f"{path}.fields",
+                node_id=node_id,
+                edge_id=edge_id,
+            )
+        )
+        return issues
+
+    for error in validate_transform_expression(
+        expression,
+        allowed_roots=allowed_roots,
+    ):
+        issues.append(
+            _issue(
+                code,
+                error,
+                f"{path}.fields",
+                node_id=node_id,
+                edge_id=edge_id,
+            )
+        )
+    return issues
 
 
 def _cyclic_nodes(adjacency: dict[str, set[str]]) -> list[str]:
@@ -238,6 +345,40 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
                     f"Duplicate output port '{duplicate}' on Agent '{agent.id}'",
                     f"agents.{agent.id}.outputs",
                     node_id=agent.id,
+                )
+            )
+        for rule_index, rule in enumerate(agent.rules):
+            allowed_roots = (
+                frozenset({"inputs", "workflow", "edges", "run"})
+                if rule.phase == AgentRulePhase.INPUT
+                else DEFAULT_ALLOWED_ROOTS
+            )
+            for error in validate_rule_expression(
+                rule.expression,
+                allowed_roots=allowed_roots,
+            ):
+                issues.append(
+                    _issue(
+                        "invalid_agent_rule",
+                        error,
+                        f"agents.{agent.id}.rules[{rule_index}].expression",
+                        node_id=agent.id,
+                    )
+                )
+        for attribute, allowed_roots in (
+            ("input_transform", AGENT_INPUT_TRANSFORM_ALLOWED_ROOTS),
+            ("output_transform", AGENT_OUTPUT_TRANSFORM_ALLOWED_ROOTS),
+        ):
+            transform = getattr(agent, attribute)
+            if transform is None:
+                continue
+            issues.extend(
+                _transform_issues(
+                    transform,
+                    code="invalid_agent_transform",
+                    path=f"agents.{agent.id}.{attribute}",
+                    node_id=agent.id,
+                    allowed_roots=allowed_roots,
                 )
             )
         profile = profiles.get(agent.api_profile)
@@ -456,7 +597,20 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
         if source_agent and target_agent:
             source_ports = {port.name: port for port in source_agent.outputs}
             target_ports = {port.name: port for port in target_agent.inputs}
-            for mapping in edge.mappings:
+            for mapping_index, mapping in enumerate(edge.mappings):
+                if mapping.transform is not None:
+                    issues.extend(
+                        _transform_issues(
+                            mapping.transform,
+                            code="invalid_edge_transform",
+                            path=(
+                                f"edges.{edge.id}.mappings"
+                                f"[{mapping_index}].transform"
+                            ),
+                            edge_id=edge.id,
+                            allowed_roots=EDGE_TRANSFORM_ALLOWED_ROOTS,
+                        )
+                    )
                 source_port = source_ports.get(mapping.from_)
                 target_port = target_ports.get(mapping.to)
                 if source_port is None:
@@ -484,7 +638,7 @@ def _semantic_issues(sdl: SDL) -> list[ValidationIssue]:
                         source_port.type.value == target_port.type.value
                         or "MIXED" in {source_port.type.value, target_port.type.value}
                     )
-                    if not compatible:
+                    if not compatible and mapping.transform is None:
                         issues.append(
                             _issue(
                                 "port_type_mismatch",

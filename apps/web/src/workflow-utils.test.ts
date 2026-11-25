@@ -27,6 +27,7 @@ function agent(
     outputs,
     limits: { max_tokens: null, max_total_tokens: null },
     json_output: { enabled: false, template: {} },
+    rules: [],
     output_dir: null,
   }
 }
@@ -74,6 +75,21 @@ describe('workflow utilities', () => {
       enabled: true,
       template: { outline: { sections: [] } },
     }
+    original.rules = [
+      {
+        phase: 'output',
+        expression: 'not_empty(outputs.draft)',
+        message: '草稿不能为空',
+        enabled: true,
+      },
+    ]
+    original.input_transform = {
+      mode: 'fields',
+      fields: [{ path: 'brief', value: 'inputs.brief' }],
+    }
+    original.output_transform = {
+      expression: '{"draft": str(raw_outputs.draft)}',
+    }
     original.output_dir = 'artifacts/drafter'
 
     const copy = cloneAgent(original, ['drafter', 'drafter-copy'])
@@ -88,6 +104,21 @@ describe('workflow utilities', () => {
         enabled: true,
         template: { outline: { sections: [] } },
       },
+      rules: [
+        {
+          phase: 'output',
+          expression: 'not_empty(outputs.draft)',
+          message: '草稿不能为空',
+          enabled: true,
+        },
+      ],
+      input_transform: {
+        mode: 'fields',
+        fields: [{ path: 'brief', value: 'inputs.brief' }],
+      },
+      output_transform: {
+        expression: '{"draft": str(raw_outputs.draft)}',
+      },
       output_dir: null,
     })
     expect(copy.inputs).not.toBe(original.inputs)
@@ -95,12 +126,32 @@ describe('workflow utilities', () => {
       original.inputs[0].schema_hint,
     )
     expect(copy.json_output.template).not.toBe(original.json_output.template)
+    expect(copy.rules).not.toBe(original.rules)
+    expect(copy.rules[0]).not.toBe(original.rules[0])
+    expect(copy.input_transform).not.toBe(original.input_transform)
+    expect(copy.input_transform!.fields).not.toBe(
+      original.input_transform!.fields,
+    )
+    expect(copy.input_transform!.fields![0]).not.toBe(
+      original.input_transform!.fields![0],
+    )
+    expect(copy.output_transform).not.toBe(original.output_transform)
 
     copy.inputs[0].name = 'source_brief'
     copy.json_output.template.outline = { sections: ['intro'] }
+    copy.rules[0].message = '已修改'
+    copy.input_transform!.fields![0].value = 'inputs.copy'
+    copy.output_transform!.expression = '{"draft": "copy"}'
 
     expect(original.inputs[0].name).toBe('brief')
     expect(original.json_output.template.outline).toEqual({ sections: [] })
+    expect(original.rules[0].message).toBe('草稿不能为空')
+    expect(original.input_transform?.fields).toEqual([
+      { path: 'brief', value: 'inputs.brief' },
+    ])
+    expect(original.output_transform?.expression).toBe(
+      '{"draft": str(raw_outputs.draft)}',
+    )
   })
 
   it('allows exact and mixed port matches only', () => {

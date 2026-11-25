@@ -6,7 +6,13 @@ from enum import StrEnum
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class StrictModel(BaseModel):
@@ -154,6 +160,112 @@ class AgentJsonOutput(StrictModel):
     template: dict[str, Any] = Field(default_factory=dict)
 
 
+class AgentRulePhase(StrEnum):
+    INPUT = "input"
+    OUTPUT = "output"
+
+
+class AgentRule(StrictModel):
+    phase: AgentRulePhase
+    expression: str = Field(min_length=1, max_length=2_000)
+    message: str | None = Field(default=None, max_length=500)
+    enabled: bool = True
+
+    @field_validator("expression")
+    @classmethod
+    def validate_expression_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("rule expression cannot be blank")
+        return normalized
+
+
+class TransformMode(StrEnum):
+    FIELDS = "fields"
+    EXPRESSION = "expression"
+
+
+class TransformField(StrictModel):
+    path: str = Field(min_length=1, max_length=600)
+    value: str = Field(min_length=1, max_length=1_000)
+
+    @field_validator("path")
+    @classmethod
+    def validate_path_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("transform field path cannot be blank")
+        return normalized
+
+    @field_validator("value")
+    @classmethod
+    def validate_value_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("transform field value cannot be blank")
+        return normalized
+
+
+class TransformExpression(StrictModel):
+    mode: TransformMode | None = None
+    fields: list[TransformField] = Field(default_factory=list, max_length=32)
+    expression: str | None = Field(default=None, max_length=2_000)
+
+    @model_validator(mode="after")
+    def validate_config_shape(self) -> TransformExpression:
+        if self.mode is None:
+            if self.expression is not None and self.fields:
+                raise ValueError(
+                    "transform cannot define both fields and expression"
+                )
+            self.mode = (
+                TransformMode.EXPRESSION
+                if self.expression is not None
+                else TransformMode.FIELDS
+            )
+        if self.mode == TransformMode.FIELDS:
+            if not self.fields:
+                raise ValueError(
+                    "fields transform mode requires at least one field"
+                )
+            if self.expression is not None:
+                raise ValueError(
+                    "fields transform mode cannot define expression"
+                )
+        else:
+            if self.expression is None:
+                raise ValueError(
+                    "expression transform mode requires expression"
+                )
+            if self.fields:
+                raise ValueError(
+                    "expression transform mode cannot define fields"
+                )
+        return self
+
+    @field_validator("expression")
+    @classmethod
+    def validate_expression_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("transform expression cannot be blank")
+        return normalized
+
+    def compiled_expression(self) -> str:
+        if self.mode == TransformMode.EXPRESSION:
+            assert self.expression is not None
+            return self.expression
+
+        from .transform_config import build_transform_expression
+
+        return build_transform_expression(self.fields)
+
+    def runtime_dict(self) -> dict[str, str]:
+        return {"expression": self.compiled_expression()}
+
+
 class Agent(StrictModel):
     id: str
     name: str
@@ -164,6 +276,9 @@ class Agent(StrictModel):
     outputs: list[Port] = Field(default_factory=list)
     limits: AgentLimits = Field(default_factory=AgentLimits)
     json_output: AgentJsonOutput = Field(default_factory=AgentJsonOutput)
+    rules: list[AgentRule] = Field(default_factory=list)
+    input_transform: TransformExpression | None = None
+    output_transform: TransformExpression | None = None
     output_dir: str | None = None
 
     @field_validator("output_dir")
@@ -196,6 +311,15 @@ class Condition(StrictModel):
         "in",
         "contains",
         "exists",
+        "between",
+        "starts_with",
+        "ends_with",
+        "matches",
+        "empty",
+        "not_empty",
+        "length_eq",
+        "contains_all",
+        "contains_any",
     ]
     args: list[Condition] = Field(default_factory=list)
     left: str | None = None
@@ -205,6 +329,7 @@ class Condition(StrictModel):
 class EdgeMapping(StrictModel):
     from_: str = Field(alias="from")
     to: str
+    transform: TransformExpression | None = None
 
 
 class EdgeGuard(StrictModel):
@@ -224,7 +349,7 @@ class Edge(StrictModel):
 
 
 class SDL(StrictModel):
-    sdl_version: Literal["0.1", "0.2"] = "0.2"
+    sdl_version: Literal["0.1", "0.2", "0.3"] = "0.3"
     workflow: WorkflowMeta
     start: list[str] = Field(default_factory=list)
     api_profiles: list[ApiProfile] = Field(default_factory=list)
@@ -233,6 +358,21 @@ class SDL(StrictModel):
 
     def canonical_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+    def runtime_dict(self) -> dict[str, Any]:
+        data = self.canonical_dict()
+        for index, agent in enumerate(self.agents):
+            for attribute in ("input_transform", "output_transform"):
+                transform = getattr(agent, attribute)
+                if transform is not None:
+                    data["agents"][index][attribute] = transform.runtime_dict()
+        for index, edge in enumerate(self.edges):
+            for mapping_index, mapping in enumerate(edge.mappings):
+                if mapping.transform is not None:
+                    data["edges"][index]["mappings"][mapping_index][
+                        "transform"
+                    ] = mapping.transform.runtime_dict()
+        return data
 
 
 class CanvasPoint(StrictModel):

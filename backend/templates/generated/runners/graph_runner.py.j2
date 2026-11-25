@@ -23,6 +23,14 @@ from urllib.parse import urlparse
 import httpx
 
 from config import SDL
+from runners.rule_sandbox import (
+    AGENT_INPUT_TRANSFORM_ALLOWED_ROOTS,
+    AGENT_OUTPUT_TRANSFORM_ALLOWED_ROOTS,
+    AgentRuleError,
+    EDGE_TRANSFORM_ALLOWED_ROOTS,
+    evaluate_rule_isolated,
+    evaluate_transform_isolated,
+)
 
 
 class WorkflowError(RuntimeError):
@@ -133,6 +141,159 @@ def _resolve(root: dict[str, Any], path: str) -> Any:
     return current
 
 
+MAX_REGEX_PATTERN_LENGTH = 256
+MAX_REGEX_TARGET_LENGTH = 4_096
+MAX_REGEX_REPEAT = 1_000
+
+
+def _regex_pattern_errors(pattern: str) -> list[str]:
+    errors: list[str] = []
+    if len(pattern) > MAX_REGEX_PATTERN_LENGTH:
+        return [
+            f"regex pattern exceeds {MAX_REGEX_PATTERN_LENGTH} characters"
+        ]
+    index = 0
+    in_character_class = False
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "\\":
+            if index + 1 >= len(pattern):
+                errors.append("regex pattern ends with an incomplete escape")
+                break
+            escaped = pattern[index + 1]
+            if escaped in "123456789gk":
+                errors.append("regex backreferences are not allowed")
+            index += 2
+            continue
+        if in_character_class:
+            if character == "]":
+                in_character_class = False
+            index += 1
+            continue
+        if character == "[":
+            in_character_class = True
+            index += 1
+            continue
+        if character == "(":
+            errors.append(
+                "regex groups, lookarounds, and inline flags are not allowed"
+            )
+            break
+        if character == "{":
+            closing = pattern.find("}", index + 1)
+            if closing == -1:
+                errors.append("regex repeat is missing a closing brace")
+                break
+            body = pattern[index + 1 : closing]
+            values = body.split(",")
+            if len(values) > 2 or not values:
+                errors.append("regex repeat is invalid")
+                break
+            for value in values:
+                if value and (
+                    not value.isdigit() or int(value) > MAX_REGEX_REPEAT
+                ):
+                    errors.append(
+                        f"regex repeats must be at most {MAX_REGEX_REPEAT}"
+                    )
+                    break
+            index = closing + 1
+            continue
+        index += 1
+    if in_character_class:
+        errors.append("regex character class is missing a closing bracket")
+    if errors:
+        return errors
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        return [f"invalid regex pattern: {exc}"]
+    return []
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _safe_equal(left: Any, right: Any) -> bool:
+    if left is MISSING or right is MISSING:
+        return False
+    if _is_number(left) and _is_number(right):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _safe_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _safe_equal(left[key], right[key]) for key in left
+        )
+    return left == right
+
+
+def _safe_order(operator: str, left: Any, right: Any) -> bool:
+    if left is MISSING or right is MISSING:
+        return False
+    if not (
+        (_is_number(left) and _is_number(right))
+        or (isinstance(left, str) and isinstance(right, str))
+    ):
+        return False
+    try:
+        if operator == "lt":
+            return left < right
+        if operator == "lte":
+            return left <= right
+        if operator == "gt":
+            return left > right
+        return left >= right
+    except (TypeError, ValueError):
+        return False
+
+
+def _safe_member(container: Any, item: Any) -> bool:
+    if container is MISSING or item is MISSING:
+        return False
+    if isinstance(container, str):
+        return isinstance(item, str) and item in container
+    if isinstance(container, dict):
+        return any(_safe_equal(key, item) for key in container)
+    if isinstance(container, (list, tuple, set, frozenset)):
+        return any(_safe_equal(candidate, item) for candidate in container)
+    return False
+
+
+def _safe_length(value: Any) -> int | None:
+    if isinstance(value, (str, list, tuple, dict, set, frozenset)):
+        return len(value)
+    return None
+
+
+def _is_empty(value: Any) -> bool:
+    if value is MISSING:
+        return True
+    if value is None:
+        return True
+    length = _safe_length(value)
+    return length == 0 if length is not None else False
+
+
+def _regex_matches(value: Any, pattern: Any) -> bool:
+    if (
+        not isinstance(value, str)
+        or not isinstance(pattern, str)
+        or len(value) > MAX_REGEX_TARGET_LENGTH
+        or _regex_pattern_errors(pattern)
+    ):
+        return False
+    try:
+        return re.search(pattern, value) is not None
+    except re.error:
+        return False
+
+
 def evaluate_condition(condition: dict[str, Any], root: dict[str, Any]) -> bool:
     op = condition["op"]
     if op == "and":
@@ -146,24 +307,50 @@ def evaluate_condition(condition: dict[str, Any], root: dict[str, Any]) -> bool:
     right = condition.get("right")
     if op == "exists":
         return left is not MISSING
-    if left is MISSING:
+    if left is MISSING and op not in {"empty", "not_empty"}:
         return False
     if op == "eq":
-        return left == right
+        return _safe_equal(left, right)
     if op == "ne":
-        return left != right
-    if op == "lt":
-        return left < right
-    if op == "lte":
-        return left <= right
-    if op == "gt":
-        return left > right
-    if op == "gte":
-        return left >= right
+        return not _safe_equal(left, right)
+    if op in {"lt", "lte", "gt", "gte"}:
+        return _safe_order(op, left, right)
     if op == "in":
-        return left in right
+        return _safe_member(right, left)
     if op == "contains":
-        return right in left
+        return _safe_member(left, right)
+    if op == "between":
+        if not isinstance(right, (list, tuple)) or len(right) != 2:
+            return False
+        return _safe_order("gte", left, right[0]) and _safe_order(
+            "lte", left, right[1]
+        )
+    if op == "starts_with":
+        return isinstance(left, str) and isinstance(right, str) and left.startswith(
+            right
+        )
+    if op == "ends_with":
+        return isinstance(left, str) and isinstance(right, str) and left.endswith(
+            right
+        )
+    if op == "matches":
+        return _regex_matches(left, right)
+    if op == "empty":
+        return _is_empty(left)
+    if op == "not_empty":
+        return not _is_empty(left)
+    if op == "length_eq":
+        return (
+            isinstance(right, int)
+            and not isinstance(right, bool)
+            and right >= 0
+            and _safe_length(left) == right
+        )
+    if op in {"contains_all", "contains_any"}:
+        if not isinstance(right, (list, tuple)):
+            return False
+        matches = (_safe_member(left, item) for item in right)
+        return all(matches) if op == "contains_all" else any(matches)
     raise WorkflowError(f"Unsupported condition operator: {op}")
 
 
@@ -734,6 +921,117 @@ def _call_agent(
     return _call_chat_agent(agent, profile, inputs, events)
 
 
+def _evaluate_agent_rules(
+    agent: dict[str, Any],
+    phase: str,
+    context: dict[str, Any],
+    events: EventWriter,
+) -> None:
+    allowed_roots = (
+        frozenset({"inputs", "workflow", "edges", "run"})
+        if phase == "input"
+        else frozenset({"inputs", "outputs", "workflow", "edges", "run"})
+    )
+    for index, rule in enumerate(agent.get("rules") or []):
+        if rule.get("phase") != phase:
+            continue
+        if not rule.get("enabled", True):
+            continue
+        expression = rule.get("expression")
+        message = rule.get("message")
+        base = {
+            "phase": phase,
+            "rule_index": index,
+            "expression": expression,
+        }
+        if message:
+            base["message"] = message
+        events.emit("rule_started", node_id=agent["id"], data=base)
+        try:
+            if not isinstance(expression, str):
+                raise AgentRuleError("rule expression must be text")
+            passed = evaluate_rule_isolated(
+                expression,
+                context,
+                allowed_roots=allowed_roots,
+            )
+        except AgentRuleError as exc:
+            error = str(exc)
+            events.emit(
+                "rule_failed",
+                node_id=agent["id"],
+                data={**base, "error": error},
+            )
+            detail = f"{message}: {error}" if message else error
+            raise AgentRuleError(
+                f"Agent '{agent['id']}' {phase} rule {index + 1} failed: "
+                f"{detail}"
+            ) from exc
+        if not passed:
+            error = message or "condition evaluated to false"
+            events.emit(
+                "rule_failed",
+                node_id=agent["id"],
+                data={**base, "error": error},
+            )
+            raise AgentRuleError(
+                f"Agent '{agent['id']}' {phase} rule {index + 1} failed: "
+                f"{error}"
+            )
+        events.emit("rule_passed", node_id=agent["id"], data=base)
+
+
+def _apply_transform(
+    expression: str,
+    context: dict[str, Any],
+    *,
+    scope: str,
+    phase: str,
+    events: EventWriter,
+    allowed_roots: frozenset[str],
+    node_id: str | None = None,
+    edge_id: str | None = None,
+    mapping_index: int | None = None,
+    required_object_error: str | None = None,
+) -> Any:
+    data: dict[str, Any] = {
+        "scope": scope,
+        "phase": phase,
+        "expression": expression,
+    }
+    if mapping_index is not None:
+        data["mapping_index"] = mapping_index
+    events.emit(
+        "transform_started",
+        node_id=node_id,
+        edge_id=edge_id,
+        data=data,
+    )
+    try:
+        result = evaluate_transform_isolated(
+            expression,
+            context,
+            allowed_roots=allowed_roots,
+        )
+        if required_object_error and not isinstance(result, dict):
+            raise AgentRuleError(required_object_error)
+    except Exception as exc:
+        events.emit(
+            "transform_failed",
+            node_id=node_id,
+            edge_id=edge_id,
+            data={**data, "error": str(exc)},
+        )
+        raise
+    events.emit(
+        "transform_passed",
+        node_id=node_id,
+        edge_id=edge_id,
+        data=data,
+    )
+    return result
+
+
 def _write_artifacts(
     agent: dict[str, Any],
     outputs: dict[str, Any],
@@ -1176,23 +1474,140 @@ class WorkflowRuntime:
             "run": {"step": self.step},
         }
 
+    def _rule_context(
+        self,
+        execution: AgentExecution,
+        step: int,
+        outputs: dict[str, Any] | None = None,
+        inputs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "inputs": inputs if inputs is not None else execution.inputs,
+            "outputs": outputs or {},
+            "workflow": {"inputs": self.run_inputs},
+            "edges": {
+                edge_id: {"traversals": count}
+                for edge_id, count in self.traversals.items()
+            },
+            "run": {
+                "step": step,
+                "agent_id": execution.agent_id,
+                "batch_id": execution.batch_id,
+            },
+        }
+
+    def _transform_context(
+        self,
+        execution: AgentExecution,
+        step: int,
+        *,
+        inputs: dict[str, Any] | None = None,
+        raw_outputs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "inputs": inputs if inputs is not None else execution.inputs,
+            "raw_outputs": raw_outputs or {},
+            "workflow": {"inputs": self.run_inputs},
+            "edges": {
+                edge_id: {"traversals": count}
+                for edge_id, count in self.traversals.items()
+            },
+            "run": {
+                "step": step,
+                "agent_id": execution.agent_id,
+                "batch_id": execution.batch_id,
+            },
+        }
+
+    def _validate_agent_inputs(
+        self,
+        agent_id: str,
+        inputs: dict[str, Any],
+    ) -> None:
+        input_ports = {
+            port["name"]: port for port in self.agents[agent_id]["inputs"]
+        }
+        for port in input_ports.values():
+            if port.get("required", True) and port["name"] not in inputs:
+                raise WorkflowError(
+                    f"Agent '{agent_id}' is missing required input "
+                    f"port '{port['name']}'"
+                )
+        extra_keys = set(inputs) - set(input_ports)
+        if extra_keys:
+            raise WorkflowError(
+                f"Agent '{agent_id}' received unexpected inputs: "
+                + ", ".join(sorted(extra_keys))
+            )
+        for name, value in inputs.items():
+            _validate_value(value, input_ports[name], self.workspace)
+
     def _run_agent(self, execution: AgentExecution, step: int) -> dict[str, Any]:
         agent_id = execution.agent_id
         agent = self.agents[agent_id]
         profile = self.profiles[agent["api_profile"]]
+        usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
         self.events.emit(
             "node_enter",
             node_id=agent_id,
             data={"batch_id": execution.batch_id, "step": step},
         )
         try:
-            outputs, usage = _call_agent(
+            inputs = dict(execution.inputs)
+            input_transform = agent.get("input_transform")
+            if input_transform:
+                transformed = _apply_transform(
+                    input_transform["expression"],
+                    self._transform_context(execution, step, inputs=inputs),
+                    scope="agent",
+                    phase="input",
+                    events=self.events,
+                    allowed_roots=AGENT_INPUT_TRANSFORM_ALLOWED_ROOTS,
+                    node_id=agent_id,
+                    required_object_error=(
+                        f"Agent '{agent_id}' input_transform must return an object"
+                    ),
+                )
+                inputs = transformed
+            self._validate_agent_inputs(agent_id, inputs)
+            _evaluate_agent_rules(
+                agent,
+                "input",
+                self._rule_context(execution, step, inputs=inputs),
+                self.events,
+            )
+            raw_outputs, usage = _call_agent(
                 agent,
                 profile,
-                execution.inputs,
+                inputs,
                 self.events,
                 self.workspace,
             )
+            outputs = raw_outputs
+            output_transform = agent.get("output_transform")
+            if output_transform:
+                transformed = _apply_transform(
+                    output_transform["expression"],
+                    self._transform_context(
+                        execution,
+                        step,
+                        inputs=inputs,
+                        raw_outputs=raw_outputs,
+                    ),
+                    scope="agent",
+                    phase="output",
+                    events=self.events,
+                    allowed_roots=AGENT_OUTPUT_TRANSFORM_ALLOWED_ROOTS,
+                    node_id=agent_id,
+                    required_object_error=(
+                        f"Agent '{agent_id}' output_transform must return an object"
+                    ),
+                )
+                outputs = transformed
             for port in agent["outputs"]:
                 if port["name"] not in outputs:
                     raise WorkflowError(
@@ -1209,6 +1624,17 @@ class WorkflowRuntime:
                     f"Agent '{agent_id}' returned unexpected ports: "
                     + ", ".join(sorted(extra_keys))
                 )
+            _evaluate_agent_rules(
+                agent,
+                "output",
+                self._rule_context(
+                    execution,
+                    step,
+                    outputs,
+                    inputs=inputs,
+                ),
+                self.events,
+            )
             artifacts = _write_artifacts(
                 agent,
                 outputs,
@@ -1233,8 +1659,11 @@ class WorkflowRuntime:
                 exc.agent_id = agent_id
             raise
         except Exception as exc:
-            usage = getattr(exc, "usage", None)
-            raise AgentCallError(str(exc), usage, agent_id) from exc
+            raise AgentCallError(
+                str(exc),
+                getattr(exc, "usage", None) or usage,
+                agent_id,
+            ) from exc
 
     def _merge_usage(
         self,
@@ -1286,15 +1715,41 @@ class WorkflowRuntime:
         if target_batch_id != batch_id:
             self._seed_batch_inputs(edge["to"], target_batch_id)
         mapped: dict[str, Any] = {}
-        for mapping in edge["mappings"]:
+        for mapping_index, mapping in enumerate(edge["mappings"]):
             source_value = agent_outputs[mapping["from"]]
+            transform = mapping.get("transform")
+            if transform:
+                source_value = _apply_transform(
+                    transform["expression"],
+                    {
+                        "value": source_value,
+                        "outputs": agent_outputs,
+                        "workflow": {"inputs": self.run_inputs},
+                        "edges": {
+                            edge_id: {"traversals": count}
+                            for edge_id, count in self.traversals.items()
+                        },
+                        "run": {
+                            "step": self.step,
+                            "agent_id": edge["from"],
+                            "batch_id": batch_id,
+                        },
+                    },
+                    scope="edge",
+                    phase="mapping",
+                    events=self.events,
+                    allowed_roots=EDGE_TRANSFORM_ALLOWED_ROOTS,
+                    edge_id=edge["id"],
+                    mapping_index=mapping_index,
+                )
+            mapped[mapping["to"]] = source_value
+        for port_name, value in mapped.items():
             self._set_input(
                 edge["to"],
                 target_batch_id,
-                mapping["to"],
-                source_value,
+                port_name,
+                value,
             )
-            mapped[mapping["to"]] = source_value
         if edge["type"] == "AGGREGATE":
             self.aggregate_arrivals.setdefault(
                 (edge["to"], target_batch_id),

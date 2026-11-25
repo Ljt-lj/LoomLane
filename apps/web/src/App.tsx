@@ -74,8 +74,10 @@ import {
   type AgentFlowNode,
   type NodeRunStatus,
 } from './AgentNode'
+import AgentRulesEditor from './AgentRulesEditor'
 import ConditionEditor from './ConditionEditor'
 import JsonOutputEditor from './JsonOutputEditor'
+import TransformEditor from './TransformEditor'
 import {
   dedupeAndSortRunEvents,
   nextReplaySeq,
@@ -102,6 +104,7 @@ import type {
   RunSummary,
   SDL,
   SecretStatus,
+  TransformField,
   ValidationIssue,
   WorkflowEdge,
 } from './types'
@@ -144,6 +147,12 @@ const EVENT_TYPES = [
   'node_exit',
   'edge_traversed',
   'token_usage',
+  'rule_started',
+  'rule_passed',
+  'rule_failed',
+  'transform_started',
+  'transform_passed',
+  'transform_failed',
   'artifact_written',
   'human_gate_waiting',
   'human_gate_resolved',
@@ -179,6 +188,19 @@ interface RunArtifact {
 
 function classNames(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(' ')
+}
+
+function transformFieldForPort(
+  portName: string | undefined,
+  fallback: string,
+  root: 'inputs' | 'raw_outputs',
+): TransformField {
+  const name = portName || fallback
+  const path = /^[a-z][a-z0-9_]{0,63}$/.test(name) ? name : fallback
+  const access = /^[A-Za-z_][A-Za-z0-9_]*$/.test(name)
+    ? `${root}.${name}`
+    : `${root}[${JSON.stringify(name)}]`
+  return { path, value: access }
 }
 
 function ImageGenerationFields({
@@ -2471,6 +2493,9 @@ function App() {
       outputs: [{ name: 'output', type: 'TEXT' }],
       limits: { max_tokens: null, max_total_tokens: null },
       json_output: { enabled: false, template: {} },
+      rules: [],
+      input_transform: null,
+      output_transform: null,
       output_dir: null,
     }
     updateDraft((current) => ({
@@ -2642,6 +2667,16 @@ function App() {
       const imageContractInvalid =
         agent.mode === 'image' &&
         (agent.outputs.length !== 1 || agent.outputs[0]?.type !== 'FILE')
+      const inputField = transformFieldForPort(
+        agent.inputs[0]?.name,
+        'input',
+        'inputs',
+      )
+      const outputField = transformFieldForPort(
+        agent.outputs[0]?.name,
+        'output',
+        'raw_outputs',
+      )
       return (
         <div className="inspector-body">
           <div className="inspector-heading">
@@ -2846,6 +2881,58 @@ function App() {
               }
             />
           )}
+          <AgentRulesEditor
+            key={agent.id}
+            value={agent.rules ?? []}
+            onChange={(rules) =>
+              updateAgent(agent.id, (current) => ({
+                ...current,
+                rules,
+              }))
+            }
+          />
+          <TransformEditor
+            title="输入变换"
+            value={agent.input_transform ?? null}
+            defaultValue={{
+              mode: 'fields',
+              fields: [inputField],
+            }}
+            defaultAdvancedValue={{
+              mode: 'expression',
+              expression: `{${JSON.stringify(inputField.path)}: ${inputField.value}}`,
+            }}
+            defaultField={inputField}
+            placeholder={inputField.value}
+            hint="每个字段会由后端组装为 JSON 对象，并整体替换当前 Agent 的输入。"
+            onChange={(inputTransform) =>
+              updateAgent(agent.id, (current) => ({
+                ...current,
+                input_transform: inputTransform,
+              }))
+            }
+          />
+          <TransformEditor
+            title="输出变换"
+            value={agent.output_transform ?? null}
+            defaultValue={{
+              mode: 'fields',
+              fields: [outputField],
+            }}
+            defaultAdvancedValue={{
+              mode: 'expression',
+              expression: `{${JSON.stringify(outputField.path)}: ${outputField.value}}`,
+            }}
+            defaultField={outputField}
+            placeholder={outputField.value}
+            hint="raw_outputs 是模型原始输出；每个字段会组装为 JSON 对象并整体替换输出。"
+            onChange={(outputTransform) =>
+              updateAgent(agent.id, (current) => ({
+                ...current,
+                output_transform: outputTransform,
+              }))
+            }
+          />
           {renderPorts(agent, 'inputs')}
           {renderPorts(agent, 'outputs')}
         </div>
@@ -2957,56 +3044,116 @@ function App() {
               </button>
             </div>
             {edge.mappings.map((mapping, index) => (
-              <div className="mapping-row" key={`${edge.id}-map-${index}`}>
-                <select
-                  value={mapping.from}
-                  onChange={(event) =>
+              <div
+                className="mapping-block"
+                key={`${edge.id}-map-${index}`}
+              >
+                <div className="mapping-row">
+                  <select
+                    value={mapping.from}
+                    onChange={(event) =>
+                      updateEdge(edge.id, (current) => ({
+                        ...current,
+                        mappings: current.mappings.map((item, itemIndex) =>
+                          itemIndex === index
+                            ? { ...item, from: event.target.value }
+                            : item,
+                        ),
+                      }))
+                    }
+                  >
+                    {source?.outputs.map((port) => (
+                      <option key={port.name}>{port.name}</option>
+                    ))}
+                  </select>
+                  <span>→</span>
+                  <select
+                    value={mapping.to}
+                    onChange={(event) =>
+                      updateEdge(edge.id, (current) => ({
+                        ...current,
+                        mappings: current.mappings.map((item, itemIndex) =>
+                          itemIndex === index
+                            ? { ...item, to: event.target.value }
+                            : item,
+                        ),
+                      }))
+                    }
+                  >
+                    {target?.inputs.map((port) => (
+                      <option key={port.name}>{port.name}</option>
+                    ))}
+                  </select>
+                  <button
+                    className={`icon-button ${
+                      mapping.transform ? 'active' : ''
+                    }`}
+                    onClick={() =>
+                      updateEdge(edge.id, (current) => ({
+                        ...current,
+                        mappings: current.mappings.map((item, itemIndex) =>
+                          itemIndex === index
+                            ? {
+                                ...item,
+                                transform: item.transform
+                                  ? null
+                                  : {
+                                      mode: 'expression',
+                                      expression: 'value',
+                                    },
+                              }
+                            : item,
+                        ),
+                      }))
+                    }
+                    title={
+                      mapping.transform ? '清除映射变换' : '添加映射变换'
+                    }
+                    aria-label={
+                      mapping.transform ? '清除映射变换' : '添加映射变换'
+                    }
+                  >
+                    <Braces size={13} />
+                  </button>
+                  <button
+                    className="icon-button danger"
+                    onClick={() =>
+                      updateEdge(edge.id, (current) => ({
+                        ...current,
+                        mappings: current.mappings.filter(
+                          (_, itemIndex) => itemIndex !== index,
+                        ),
+                      }))
+                    }
+                    title="删除映射"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+                <TransformEditor
+                  title="映射变换"
+                  value={mapping.transform}
+                  defaultValue={{
+                    mode: 'expression',
+                    expression: 'value',
+                  }}
+                  defaultAdvancedValue={{
+                    mode: 'expression',
+                    expression: 'value',
+                  }}
+                  defaultField={{ path: 'value', value: 'value' }}
+                  placeholder={'{"text": value}'}
+                  hint="value 是当前来源端口的值；返回值会写入目标输入端口。"
+                  showToggle={false}
+                  onChange={(transform) =>
                     updateEdge(edge.id, (current) => ({
                       ...current,
                       mappings: current.mappings.map((item, itemIndex) =>
-                        itemIndex === index
-                          ? { ...item, from: event.target.value }
-                          : item,
+                        itemIndex === index ? { ...item, transform } : item,
                       ),
                     }))
                   }
-                >
-                  {source?.outputs.map((port) => (
-                    <option key={port.name}>{port.name}</option>
-                  ))}
-                </select>
-                <span>→</span>
-                <select
-                  value={mapping.to}
-                  onChange={(event) =>
-                    updateEdge(edge.id, (current) => ({
-                      ...current,
-                      mappings: current.mappings.map((item, itemIndex) =>
-                        itemIndex === index
-                          ? { ...item, to: event.target.value }
-                          : item,
-                      ),
-                    }))
-                  }
-                >
-                  {target?.inputs.map((port) => (
-                    <option key={port.name}>{port.name}</option>
-                  ))}
-                </select>
-                <button
-                  className="icon-button danger"
-                  onClick={() =>
-                    updateEdge(edge.id, (current) => ({
-                      ...current,
-                      mappings: current.mappings.filter(
-                        (_, itemIndex) => itemIndex !== index,
-                      ),
-                    }))
-                  }
-                  title="删除映射"
-                >
-                  <X size={13} />
-                </button>
+                />
               </div>
             ))}
           </div>

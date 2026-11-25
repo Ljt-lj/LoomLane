@@ -13,7 +13,7 @@ from .storage import InvalidWorkflow
 from .validator import validate_sdl
 
 
-COMPILER_VERSION = "0.2.8"
+COMPILER_VERSION = "0.3.2"
 
 
 def canonical_json(sdl: SDL) -> str:
@@ -55,6 +55,7 @@ class WorkflowCompiler:
             )
         normalized = SDL.model_validate(validation.normalized_sdl)
         key = compiler_key(normalized)
+        runtime_sdl = normalized.runtime_dict()
         output_dir = (project_dir / "generated" / key).resolve()
         generated_root = (project_dir / "generated").resolve()
         if output_dir.parent != generated_root:
@@ -74,7 +75,7 @@ class WorkflowCompiler:
         context: dict[str, Any] = {
             "sdl_json_literal": json.dumps(
                 json.dumps(
-                    normalized.canonical_dict(),
+                    runtime_sdl,
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
@@ -88,6 +89,7 @@ class WorkflowCompiler:
             "workflow.py.j2": "workflow.py",
             "config.py.j2": "config.py",
             "runners/graph_runner.py.j2": "runners/graph_runner.py",
+            "runners/rule_sandbox.py.j2": "runners/rule_sandbox.py",
             "runners/__init__.py.j2": "runners/__init__.py",
             "agents/__init__.py.j2": "agents/__init__.py",
             "requirements.txt.j2": "requirements.txt",
@@ -97,13 +99,13 @@ class WorkflowCompiler:
             _write(output_dir / relative_path, content)
             files.append(relative_path)
 
-        for agent in normalized.agents:
+        for agent in runtime_sdl["agents"]:
             agent_literal = json.dumps(
-                agent.model_dump(mode="json", by_alias=True, exclude_none=True),
+                agent,
                 ensure_ascii=False,
                 indent=2,
             )
-            relative_path = f"agents/{agent.id}.py"
+            relative_path = f"agents/{agent['id']}.py"
             _write(
                 output_dir / relative_path,
                 "from __future__ import annotations\n\n"

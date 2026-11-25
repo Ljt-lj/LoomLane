@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import compileall
 import hashlib
+import json
+import subprocess
+import sys
 from pathlib import Path
 
-from loomlane.compiler import WorkflowCompiler, compiler_key
+from loomlane.compiler import COMPILER_VERSION, WorkflowCompiler, compiler_key
 from loomlane.storage import default_sdl
 
 
@@ -19,6 +22,7 @@ def _generated_digest(root: Path) -> str:
 def test_generated_project_is_deterministic_and_standalone(tmp_path: Path) -> None:
     compiler = WorkflowCompiler()
     sdl = default_sdl()
+    assert COMPILER_VERSION == "0.3.2"
     first = compiler.compile(sdl, tmp_path / "first")
     second = compiler.compile(sdl, tmp_path / "second")
 
@@ -34,6 +38,60 @@ def test_generated_project_is_deterministic_and_standalone(tmp_path: Path) -> No
     )
     assert "import loomlane" not in source
     assert "sk-" not in source.lower()
+    sandbox_path = Path(first.generated_path) / "runners" / "rule_sandbox.py"
+    assert sandbox_path.is_file()
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(sandbox_path),
+            "--evaluate",
+        ],
+        input=json.dumps(
+            {
+                "expression": "not_empty(inputs.brief)",
+                "context": {"inputs": {"brief": "ready"}},
+                "allowed_roots": ["inputs"],
+            }
+        ),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout) == {"ok": True, "result": True}
+
+    transformed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(sandbox_path),
+            "--evaluate",
+        ],
+        input=json.dumps(
+            {
+                "expression": '{"text": upper(value)}',
+                "context": {"value": "ready"},
+                "allowed_roots": ["value"],
+                "result_mode": "json",
+            }
+        ),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=10,
+        check=False,
+    )
+    assert transformed.returncode == 0
+    assert json.loads(transformed.stdout) == {
+        "ok": True,
+        "result": {"text": "READY"},
+    }
 
 
 def test_compile_cache_reuses_manifest(tmp_path: Path) -> None:
